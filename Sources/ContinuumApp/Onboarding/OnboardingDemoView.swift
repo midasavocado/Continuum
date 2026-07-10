@@ -165,7 +165,7 @@ struct OnboardingDemoView: View {
         case .rewound:
             "The original text is back, and the changed version is waiting in an automatic safety snapshot."
         case .undone:
-            "Undo Rewind restored the changed future. A real rewind follows the same preserve-first rule."
+            "Undo Rewind restored the changed future. A future certified rewind follows the same preserve-first rule."
         }
     }
 }

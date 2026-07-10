@@ -13,7 +13,8 @@ let package = Package(
         .library(name: "ContinuumSystem", targets: ["ContinuumSystem"]),
         .library(name: "ContinuumRuntime", targets: ["ContinuumRuntime"]),
         .executable(name: "Continuum", targets: ["ContinuumApp"]),
-        .executable(name: "ContinuumHarness", targets: ["ContinuumHarness"])
+        .executable(name: "ContinuumHarness", targets: ["ContinuumHarness"]),
+        .executable(name: "ContinuumExternalTarget", targets: ["ContinuumExternalTarget"])
     ],
     targets: [
         .target(name: "ContinuumCore"),
@@ -42,6 +43,7 @@ let package = Package(
             name: "ContinuumHarness",
             dependencies: ["ContinuumCore", "ContinuumStore", "ContinuumSystem", "ContinuumRuntime"]
         ),
+        .executableTarget(name: "ContinuumExternalTarget"),
         .testTarget(name: "ContinuumCoreTests", dependencies: ["ContinuumCore"]),
         .testTarget(name: "ContinuumStoreTests", dependencies: ["ContinuumCore", "ContinuumStore"]),
         .testTarget(name: "ContinuumSystemTests", dependencies: ["ContinuumCore", "ContinuumSystem"]),

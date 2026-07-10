@@ -45,7 +45,7 @@ struct StorageSetupView: View {
 
             OnboardingCallout(
                 title: "The certified scheduler will keep a reserve",
-                message: "When rolling capture is enabled, it will pause before free space falls below \(format(bytes: reserveBytes)). This policy is not active in the metadata-only build.",
+                message: "When rolling capture is enabled, it will pause before free space falls below \(format(bytes: reserveBytes)). This policy is not active until a restore backend is certified.",
                 tone: budgetExceedsSafeSpace ? .warning : .information
             )
 

@@ -21,6 +21,15 @@ public protocol AppInventoryProviding: Sendable {
     func compatibility(for app: AppIdentity) async -> CompatibilityReport
 }
 
+public protocol AppSetupCoordinating: Sendable {
+    func records() async throws -> [AppSetupRecord]
+    func probe(_ app: AppIdentity) async throws -> AppSetupRecord
+    func setup(_ app: AppIdentity) async throws -> AppSetupRecord
+    func revalidate(_ setupID: AppSetupID) async throws -> AppSetupRecord
+    func rollback(_ setupID: AppSetupID) async throws
+    func recoverInterruptedSetups() async throws
+}
+
 public protocol PermissionProviding: Sendable {
     func statuses() async -> [PermissionStatus]
     func request(_ permission: PermissionKind) async -> PermissionStatus

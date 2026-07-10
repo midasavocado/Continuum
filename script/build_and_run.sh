@@ -64,9 +64,15 @@ STAGED_RESOURCES="$STAGED_CONTENTS/Resources"
 STAGED_BINARY="$STAGED_MACOS/$APP_NAME"
 INFO_PLIST="$STAGED_CONTENTS/Info.plist"
 APP_ICON="$ROOT_DIR/Assets/Continuum.icns"
+APP_ENTITLEMENTS="$ROOT_DIR/Configuration/Continuum.entitlements"
 
 if [[ ! -f "$APP_ICON" ]]; then
   echo "error: missing app icon at $APP_ICON" >&2
+  exit 1
+fi
+
+if [[ ! -f "$APP_ENTITLEMENTS" ]]; then
+  echo "error: missing app entitlements at $APP_ENTITLEMENTS" >&2
   exit 1
 fi
 
@@ -84,8 +90,8 @@ chmod +x "$STAGED_BINARY"
 /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$INFO_PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.1.2" "$INFO_PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 3" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.2.0" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 4" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string public.app-category.utilities" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MIN_SYSTEM_VERSION" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :NSAccessibilityUsageDescription string Continuum uses Accessibility only when you ask it to identify and coordinate the app you are capturing." "$INFO_PLIST"
@@ -96,12 +102,31 @@ chmod +x "$STAGED_BINARY"
 /usr/libexec/PlistBuddy -c "Add :NSScreenCaptureUsageDescription string Continuum uses Screen Recording to build a private visual timeline for apps you select." "$INFO_PLIST"
 /usr/bin/plutil -lint "$INFO_PLIST"
 
-# A development SwiftPM bundle has no distribution identity. Ad-hoc signing gives
-# Launch Services a consistent local bundle without creating a false release build.
+# Prefer an available Apple Development identity so TCC and the debugger
+# entitlement see a stable local signer. Contributors without one still get an
+# ad-hoc development build, although external-process setup cannot be certified.
 # File-provider workspaces may stamp Finder metadata onto newly created bundles;
 # codesign correctly rejects those extended attributes as unsealed detritus.
 /usr/bin/xattr -cr "$STAGED_BUNDLE"
-/usr/bin/codesign --force --deep --sign - --timestamp=none "$STAGED_BUNDLE"
+SIGNING_IDENTITY="${CONTINUUM_SIGNING_IDENTITY:-}"
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+  SIGNING_IDENTITY="$(
+    /usr/bin/security find-identity -v -p codesigning 2>/dev/null \
+      | /usr/bin/sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' \
+      | /usr/bin/head -1
+  )"
+fi
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+  SIGNING_IDENTITY="-"
+fi
+
+/usr/bin/codesign \
+  --force \
+  --sign "$SIGNING_IDENTITY" \
+  --options runtime \
+  --entitlements "$APP_ENTITLEMENTS" \
+  --timestamp=none \
+  "$STAGED_BUNDLE"
 /usr/bin/codesign --verify --deep --strict "$STAGED_BUNDLE"
 
 # Keep the signed bundle in the external SwiftPM scratch tree and expose it at

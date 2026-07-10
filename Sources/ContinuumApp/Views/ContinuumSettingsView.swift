@@ -50,7 +50,7 @@ private struct InteractionSettingsView: View {
                     status: .active
                 )
             } footer: {
-                Text("These shortcuts work in any app while Continuum is running. Safe presets include Control so they do not replace common app commands such as Reload.")
+                Text("These global shortcuts are detected over any app while Continuum is running; that does not make the frontmost app rewindable. Safe presets include Control so they do not replace common commands such as Reload.")
             }
 
             Section {
@@ -75,7 +75,7 @@ private struct InteractionSettingsView: View {
                     status: .active
                 )
             } footer: {
-                Text("Use Left and Right Arrow to move through the timeline, then press Return to play from the selected moment.")
+                Text("Use Left and Right Arrow to move through the timeline. Return plays only a state that a restore backend has validated.")
             }
 
             Section("Setup") {
@@ -157,7 +157,7 @@ private struct CaptureSettingsView: View {
                     status: .requiresCertifiedBackend
                 )
             } footer: {
-                Text("Manual and Before Rewind snapshots remain pinned until you delete them. Continuum saves these preferences, but v0.1 does not yet enforce automatic rolling-history eviction.")
+                Text("Manual and Before Rewind snapshots remain pinned until you delete them. Continuum saves these preferences, but this build does not yet enforce automatic rolling-history eviction.")
             }
         }
         .formStyle(.grouped)
@@ -172,9 +172,9 @@ private struct PermissionSettingsView: View {
             Section {
                 Label {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Not requested by this build")
+                        Text("Requested only when you ask")
                             .fontWeight(.semibold)
-                        Text("The metadata-only v0.1 prototype does not need Accessibility, Screen Recording, Automation, or Full Disk Access.")
+                        Text("Onboarding can show the native Accessibility and Screen Recording prompts. Automation and Full Disk Access remain feature-specific.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -184,9 +184,9 @@ private struct PermissionSettingsView: View {
                 }
             }
 
-            Section("Future restore backends") {
+            Section("Permission status") {
                 if statuses.isEmpty {
-                    Text("System status is not available yet. No permission prompt will appear.")
+                    Text("System status is not available yet. Run onboarding again to request or review access.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -206,9 +206,9 @@ private struct PermissionSettingsView: View {
 
                             Spacer()
 
-                            Text(status.state == .granted ? "Already allowed" : "Not requested")
+                            Text(status.state.continuumTitle)
                                 .font(.caption.weight(.medium))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(status.state.continuumTint)
                         }
                     }
                 }

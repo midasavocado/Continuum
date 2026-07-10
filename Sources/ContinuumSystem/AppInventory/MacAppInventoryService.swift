@@ -5,18 +5,25 @@ import ContinuumCore
 
 public struct MacAppInventoryService: AppInventoryProviding, Sendable {
     private let applicationDirectories: [URL]
+    private let includesSpotlightApplications: Bool
 
     public init(applicationDirectories: [URL]? = nil) {
         self.applicationDirectories = applicationDirectories ?? Self.defaultApplicationDirectories
+        self.includesSpotlightApplications = applicationDirectories == nil
     }
 
     public func runningApplications() async -> [ProcessDescriptor] {
+        let visibleWindowOwners = await Task.detached(priority: .utility) {
+            Self.visibleWindowOwnerProcessIdentifiers()
+        }.value
+
         let seeds = await MainActor.run {
             NSWorkspace.shared.runningApplications.compactMap { application -> RunningApplicationSeed? in
                 guard
-                    application.activationPolicy != .prohibited,
                     !application.isTerminated,
-                    let executableURL = application.executableURL
+                    let executableURL = application.executableURL,
+                    application.activationPolicy != .prohibited
+                        || visibleWindowOwners.contains(application.processIdentifier)
                 else {
                     return nil
                 }
@@ -70,12 +77,18 @@ public struct MacAppInventoryService: AppInventoryProviding, Sendable {
 
     public func installedApplications() async -> [AppIdentity] {
         let directories = applicationDirectories
+        let includesSpotlightApplications = includesSpotlightApplications
         return await Task.detached(priority: .utility) {
             let inspector = AppBundleInspector()
             var seenPaths = Set<String>()
             var apps: [AppIdentity] = []
 
-            for bundleURL in Self.applicationBundleURLs(in: directories) {
+            var bundleURLs = Self.applicationBundleURLs(in: directories)
+            if includesSpotlightApplications {
+                bundleURLs.append(contentsOf: Self.spotlightApplicationBundleURLs())
+            }
+
+            for bundleURL in bundleURLs {
                 let path = bundleURL.standardizedFileURL.path
                 guard seenPaths.insert(path).inserted,
                       let app = inspector.inspect(bundleURL: bundleURL)?.identity else {
@@ -133,6 +146,34 @@ public struct MacAppInventoryService: AppInventoryProviding, Sendable {
             isFrontmost: true,
             isTerminated: seed.isTerminated
         )
+    }
+
+    public func application(at url: URL) async -> AppIdentity? {
+        await Task.detached(priority: .utility) {
+            let inspector = AppBundleInspector()
+            let standardizedURL = url.standardizedFileURL
+
+            if let bundleURL = Self.enclosingApplicationBundleURL(for: standardizedURL),
+               let identity = inspector.inspect(bundleURL: bundleURL)?.identity {
+                return identity
+            }
+
+            guard FileManager.default.isExecutableFile(atPath: standardizedURL.path) else {
+                return nil
+            }
+
+            let signature = inspector.signatureMetadata(for: standardizedURL)
+            return AppIdentity(
+                bundleIdentifier: nil,
+                displayName: standardizedURL.deletingPathExtension().lastPathComponent,
+                bundleURL: nil,
+                executableURL: standardizedURL,
+                version: nil,
+                signingIdentifier: signature.signingIdentifier,
+                teamIdentifier: signature.teamIdentifier,
+                isApplePlatformBinary: signature.isApplePlatformBinary
+            )
+        }.value
     }
 
     public func compatibility(for app: AppIdentity) async -> CompatibilityReport {
@@ -211,6 +252,66 @@ public struct MacAppInventoryService: AppInventoryProviding, Sendable {
         }
 
         return results
+    }
+
+    private static func spotlightApplicationBundleURLs() -> [URL] {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
+        process.arguments = ["kMDItemContentType == \"com.apple.application-bundle\""]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return []
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return [] }
+
+        return String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter(isTopLevelApplicationBundlePath)
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
+
+    private static func isTopLevelApplicationBundlePath(_ path: String) -> Bool {
+        guard path.hasSuffix(".app") else { return false }
+
+        let components = URL(fileURLWithPath: path).pathComponents.dropLast()
+        return !components.contains { $0.lowercased().hasSuffix(".app") }
+    }
+
+    private static func enclosingApplicationBundleURL(for url: URL) -> URL? {
+        var candidate = url
+        while candidate.path != "/" {
+            if candidate.pathExtension.lowercased() == "app" {
+                return candidate
+            }
+            candidate.deleteLastPathComponent()
+        }
+        return nil
+    }
+
+    private static func visibleWindowOwnerProcessIdentifiers() -> Set<Int32> {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID)
+            as? [[CFString: Any]] else {
+            return []
+        }
+
+        return Set(windows.compactMap { window in
+            guard let processIdentifier = window[kCGWindowOwnerPID] as? NSNumber,
+                  let layer = window[kCGWindowLayer] as? NSNumber,
+                  layer.intValue == 0 else {
+                return nil
+            }
+            return processIdentifier.int32Value
+        })
     }
 
     private static func parentProcessIdentifier(for processIdentifier: Int32) -> Int32 {

@@ -38,7 +38,7 @@ struct ReadyOnboardingView: View {
 
             OnboardingCallout(
                 title: "Expect Restore unavailable",
-                message: "This v0.1 build deliberately marks scanned apps unavailable. It will not pretend a screenshot or metadata record is restored app state."
+                message: "This build deliberately marks scanned apps unavailable until restore certification passes. It will not pretend a screenshot or metadata record is restored app state."
             )
         }
     }

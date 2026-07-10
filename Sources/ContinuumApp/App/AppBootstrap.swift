@@ -17,7 +17,10 @@ enum AppBootstrap {
             repository: repository,
             inventory: MacAppInventoryService(),
             permissionProvider: MacPermissionService(),
-            checkpointCapturer: LocalMetadataCheckpointService()
+            checkpointCapturer: LocalMetadataCheckpointService(),
+            appSetupCoordinator: MacAppSetupCoordinator(
+                rootDirectory: try? appSetupStoreURL()
+            )
         )
     }
 
@@ -31,6 +34,18 @@ enum AppBootstrap {
         return base
             .appendingPathComponent("Continuum", isDirectory: true)
             .appendingPathComponent("SnapshotStore", isDirectory: true)
+    }
+
+    static func appSetupStoreURL() throws -> URL {
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        return base
+            .appendingPathComponent("Continuum", isDirectory: true)
+            .appendingPathComponent("AppSetups", isDirectory: true)
     }
 }
 

@@ -2,15 +2,33 @@ import Foundation
 import Observation
 import ContinuumCore
 
+enum AppSetupOperation: String, Sendable {
+    case checking
+    case settingUp
+    case rechecking
+    case removing
+
+    var title: String {
+        switch self {
+        case .checking: "Checking setup…"
+        case .settingUp: "Setting up managed copy…"
+        case .rechecking: "Rechecking setup…"
+        case .removing: "Removing setup…"
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class ContinuumModel {
     private static let onboardingDefaultsKey = "continuum.onboarding.completed"
+    private static let explicitApplicationPathsKey = "continuum.apps.explicitTargetPaths"
 
     @ObservationIgnored private let repository: any SnapshotRepository
     @ObservationIgnored private let inventory: any AppInventoryProviding
     @ObservationIgnored private let permissionProvider: any PermissionProviding
     @ObservationIgnored private let checkpointCapturer: any CheckpointCapturing
+    @ObservationIgnored private let appSetupCoordinator: any AppSetupCoordinating
     @ObservationIgnored private let defaults: UserDefaults
 
     private(set) var snapshots: [SnapshotRecord] = []
@@ -19,6 +37,9 @@ final class ContinuumModel {
     private(set) var runningProcesses: [ProcessDescriptor] = []
     private(set) var installedApps: [AppIdentity] = []
     private(set) var permissionStatuses: [PermissionStatus] = []
+    private(set) var setupRecords: [AppSetupRecord] = []
+    private(set) var setupOperations: [String: AppSetupOperation] = [:]
+    private(set) var isBatchSetupInProgress = false
 
     var selectedSnapshotID: SnapshotID?
     var selectedBranchID: BranchID?
@@ -50,12 +71,14 @@ final class ContinuumModel {
         inventory: any AppInventoryProviding,
         permissionProvider: any PermissionProviding,
         checkpointCapturer: any CheckpointCapturing,
+        appSetupCoordinator: any AppSetupCoordinating,
         defaults: UserDefaults = .standard
     ) {
         self.repository = repository
         self.inventory = inventory
         self.permissionProvider = permissionProvider
         self.checkpointCapturer = checkpointCapturer
+        self.appSetupCoordinator = appSetupCoordinator
         self.defaults = defaults
         self.isOnboardingComplete = defaults.bool(forKey: Self.onboardingDefaultsKey)
     }
@@ -80,8 +103,47 @@ final class ContinuumModel {
             && activeProvisional == nil
     }
 
+    var appSetupIssueCount: Int {
+        let recordsBySource = Dictionary(
+            setupRecords.map { ($0.sourceURL.standardizedFileURL.path, $0) },
+            uniquingKeysWith: { current, candidate in
+                candidate.updatedAt > current.updatedAt ? candidate : current
+            }
+        )
+        let reportsBySource = Dictionary(
+            appReports.map { (Self.sourceKey(for: $0.app), $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+
+        return installedApps.reduce(into: 0) { count, app in
+            let key = Self.sourceKey(for: app)
+            if let record = recordsBySource[key] {
+                switch record.state {
+                case .prepared, .blocked:
+                    break
+                case .discovered, .preparing, .stale, .rolledBack, .failed:
+                    count += 1
+                }
+            } else if !app.isApplePlatformBinary,
+                      reportsBySource[key]?.tier != .protectedBridge,
+                      reportsBySource[key]?.tier != .unsupported {
+                count += 1
+            }
+        }
+    }
+
     func load() async {
-        await refresh()
+        guard !isLoading, !isPerformingAction else { return }
+        isLoading = true
+        presentedError = nil
+        defer { isLoading = false }
+
+        do {
+            try await appSetupCoordinator.recoverInterruptedSetups()
+            try await refreshAllState()
+        } catch {
+            presentedError = ErrorPresentation.message(for: error)
+        }
     }
 
     func refresh() async {
@@ -244,6 +306,156 @@ final class ContinuumModel {
                 .first(where: { $0.id == branchID })?
                 .tipSnapshotID
         }
+    }
+
+    func addApplicationTarget(at url: URL) async {
+        guard !isPerformingAction else {
+            presentedError = ContinuumError.transactionInProgress.localizedDescription
+            return
+        }
+        guard let resolver = inventory as? any ApplicationTargetResolving else {
+            presentedError = "This build cannot inspect an app or executable selected from disk."
+            return
+        }
+
+        let standardizedURL = url.standardizedFileURL
+        guard let app = await resolver.application(at: standardizedURL) else {
+            presentedError = "Continuum could not find a runnable macOS app or executable at \(standardizedURL.path)."
+            return
+        }
+
+        persistExplicitApplicationURL(standardizedURL)
+        upsertInstalledApplication(app)
+        upsertCompatibilityReport(await inventory.compatibility(for: app))
+        await checkSetup(for: app)
+    }
+
+    func checkSetup(for app: AppIdentity) async {
+        await performSetupAction(for: app, operation: .checking) {
+            try await self.appSetupCoordinator.probe(app)
+        }
+    }
+
+    func setUpManagedCopy(for app: AppIdentity) async {
+        await performSetupAction(for: app, operation: .settingUp) {
+            try await self.appSetupCoordinator.setup(app)
+        }
+    }
+
+    func recheckSetup(_ record: AppSetupRecord) async {
+        await performSetupAction(for: record.app, operation: .rechecking) {
+            try await self.appSetupCoordinator.revalidate(record.id)
+        }
+    }
+
+    func removeSetup(_ record: AppSetupRecord) async {
+        let app = record.app
+        let key = Self.sourceKey(for: app)
+        guard !isPerformingAction, setupOperations[key] == nil else {
+            presentedError = ContinuumError.transactionInProgress.localizedDescription
+            return
+        }
+
+        isPerformingAction = true
+        setupOperations[key] = .removing
+        presentedError = nil
+        defer {
+            setupOperations[key] = nil
+            isPerformingAction = false
+        }
+
+        do {
+            try await appSetupCoordinator.rollback(record.id)
+            setupRecords.removeAll { $0.id == record.id }
+            setupRecords = try await appSetupCoordinator.records()
+                .sorted(by: Self.setupRecordSort)
+        } catch {
+            presentedError = ErrorPresentation.message(for: error)
+            if let refreshedRecords = try? await appSetupCoordinator.records() {
+                setupRecords = refreshedRecords.sorted(by: Self.setupRecordSort)
+            }
+        }
+    }
+
+    func setUpEligibleApps() async {
+        guard !isPerformingAction, !isBatchSetupInProgress else {
+            presentedError = ContinuumError.transactionInProgress.localizedDescription
+            return
+        }
+
+        isPerformingAction = true
+        isBatchSetupInProgress = true
+        presentedError = nil
+        defer {
+            setupOperations.removeAll()
+            isBatchSetupInProgress = false
+            isPerformingAction = false
+        }
+
+        var failures: [String] = []
+        for app in installedApps.sorted(by: Self.appSort) {
+            let key = Self.sourceKey(for: app)
+            var record = setupRecord(for: app)
+
+            if let record {
+                switch record.state {
+                case .prepared, .blocked, .preparing, .stale, .failed, .rolledBack:
+                    continue
+                case .discovered:
+                    break
+                }
+            } else {
+                setupOperations[key] = .checking
+                do {
+                    let probed = try await appSetupCoordinator.probe(app)
+                    upsertSetupRecord(probed)
+                    record = probed
+                } catch {
+                    failures.append("\(app.displayName): \(ErrorPresentation.message(for: error))")
+                    setupOperations[key] = nil
+                    continue
+                }
+            }
+
+            guard let record, case .discovered = record.state else {
+                setupOperations[key] = nil
+                continue
+            }
+
+            setupOperations[key] = .settingUp
+            do {
+                upsertSetupRecord(try await appSetupCoordinator.setup(app))
+            } catch {
+                failures.append("\(app.displayName): \(ErrorPresentation.message(for: error))")
+            }
+            setupOperations[key] = nil
+        }
+
+        do {
+            setupRecords = try await appSetupCoordinator.records()
+                .sorted(by: Self.setupRecordSort)
+        } catch {
+            failures.append(ErrorPresentation.message(for: error))
+        }
+
+        if !failures.isEmpty {
+            let shown = failures.prefix(3).joined(separator: "\n")
+            let remaining = max(failures.count - 3, 0)
+            presentedError = remaining == 0
+                ? shown
+                : "\(shown)\n…and \(remaining) more setup issue\(remaining == 1 ? "" : "s")."
+        }
+    }
+
+    func setupRecord(for app: AppIdentity) -> AppSetupRecord? {
+        let key = Self.sourceKey(for: app)
+        return setupRecords
+            .filter { $0.sourceURL.standardizedFileURL.path == key }
+            .max { $0.updatedAt < $1.updatedAt }
+    }
+
+    func setupOperation(for app: AppIdentity) -> AppSetupOperation? {
+        setupOperations[Self.sourceKey(for: app)]
     }
 
     func requestPermission(_ permission: PermissionKind) async {
@@ -493,22 +705,64 @@ final class ContinuumModel {
         }
     }
 
+    private func performSetupAction(
+        for app: AppIdentity,
+        operation: AppSetupOperation,
+        _ action: @MainActor () async throws -> AppSetupRecord
+    ) async {
+        let key = Self.sourceKey(for: app)
+        guard !isPerformingAction, setupOperations[key] == nil else {
+            presentedError = ContinuumError.transactionInProgress.localizedDescription
+            return
+        }
+
+        isPerformingAction = true
+        setupOperations[key] = operation
+        presentedError = nil
+        defer {
+            setupOperations[key] = nil
+            isPerformingAction = false
+        }
+
+        do {
+            upsertSetupRecord(try await action())
+        } catch {
+            presentedError = ErrorPresentation.message(for: error)
+            if let refreshedRecords = try? await appSetupCoordinator.records() {
+                setupRecords = refreshedRecords.sorted(by: Self.setupRecordSort)
+            }
+        }
+    }
+
     private func refreshAllState() async throws {
         let repository = repository
         let inventory = inventory
         let permissionProvider = permissionProvider
+        let appSetupCoordinator = appSetupCoordinator
 
         async let index = repository.loadIndex()
         async let processes = inventory.runningApplications()
         async let applications = inventory.installedApplications()
         async let permissions = permissionProvider.statuses()
+        async let setups = appSetupCoordinator.records()
 
-        let (loadedIndex, loadedProcesses, loadedApplications, loadedPermissions) =
-            try await (index, processes, applications, permissions)
+        let (
+            loadedIndex,
+            loadedProcesses,
+            discoveredApplications,
+            loadedPermissions,
+            loadedSetups
+        ) = try await (index, processes, applications, permissions, setups)
+
+        let explicitApplications = await resolveExplicitApplications()
+        let loadedApplications = Self.mergingApplications(
+            discoveredApplications + explicitApplications + loadedSetups.map(\.app)
+        )
 
         apply(index: loadedIndex)
         runningProcesses = loadedProcesses.sorted(by: Self.processSort)
         installedApps = loadedApplications.sorted(by: Self.appSort)
+        setupRecords = loadedSetups.sorted(by: Self.setupRecordSort)
         permissionStatuses = loadedPermissions.sorted {
             $0.kind.rawValue < $1.kind.rawValue
         }
@@ -522,6 +776,67 @@ final class ContinuumModel {
             activeProvisional = storedProvisional
             rewindPhase = .previewing(storedProvisional.id)
         }
+    }
+
+    private func resolveExplicitApplications() async -> [AppIdentity] {
+        guard let resolver = inventory as? any ApplicationTargetResolving else {
+            return []
+        }
+
+        let paths = defaults.stringArray(
+            forKey: Self.explicitApplicationPathsKey
+        ) ?? []
+
+        return await withTaskGroup(of: AppIdentity?.self) { group in
+            for path in paths {
+                group.addTask {
+                    await resolver.application(at: URL(fileURLWithPath: path))
+                }
+            }
+
+            var applications: [AppIdentity] = []
+            for await application in group {
+                if let application {
+                    applications.append(application)
+                }
+            }
+            return applications
+        }
+    }
+
+    private func persistExplicitApplicationURL(_ url: URL) {
+        var paths = defaults.stringArray(
+            forKey: Self.explicitApplicationPathsKey
+        ) ?? []
+        let path = url.standardizedFileURL.path
+        if !paths.contains(path) {
+            paths.append(path)
+            defaults.set(paths.sorted(), forKey: Self.explicitApplicationPathsKey)
+        }
+    }
+
+    private func upsertInstalledApplication(_ app: AppIdentity) {
+        let key = Self.sourceKey(for: app)
+        installedApps.removeAll { Self.sourceKey(for: $0) == key }
+        installedApps.append(app)
+        installedApps.sort(by: Self.appSort)
+    }
+
+    private func upsertCompatibilityReport(_ report: CompatibilityReport) {
+        let key = Self.sourceKey(for: report.app)
+        appReports.removeAll { Self.sourceKey(for: $0.app) == key }
+        appReports.append(report)
+        appReports.sort {
+            $0.app.displayName.localizedCaseInsensitiveCompare(
+                $1.app.displayName
+            ) == .orderedAscending
+        }
+    }
+
+    private func upsertSetupRecord(_ record: AppSetupRecord) {
+        setupRecords.removeAll { $0.id == record.id }
+        setupRecords.append(record)
+        setupRecords.sort(by: Self.setupRecordSort)
     }
 
     private func refreshIndex() async throws {
@@ -671,7 +986,35 @@ final class ContinuumModel {
     }
 
     private static func appSort(_ lhs: AppIdentity, _ rhs: AppIdentity) -> Bool {
-        lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
-            == .orderedAscending
+        let nameOrder = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+        if nameOrder != .orderedSame {
+            return nameOrder == .orderedAscending
+        }
+        return sourceKey(for: lhs) < sourceKey(for: rhs)
+    }
+
+    private static func setupRecordSort(
+        _ lhs: AppSetupRecord,
+        _ rhs: AppSetupRecord
+    ) -> Bool {
+        let nameOrder = lhs.app.displayName.localizedCaseInsensitiveCompare(
+            rhs.app.displayName
+        )
+        if nameOrder != .orderedSame {
+            return nameOrder == .orderedAscending
+        }
+        return lhs.updatedAt > rhs.updatedAt
+    }
+
+    private static func sourceKey(for app: AppIdentity) -> String {
+        (app.bundleURL ?? app.executableURL).standardizedFileURL.path
+    }
+
+    private static func mergingApplications(_ applications: [AppIdentity]) -> [AppIdentity] {
+        var bySource: [String: AppIdentity] = [:]
+        for application in applications {
+            bySource[sourceKey(for: application)] = application
+        }
+        return Array(bySource.values)
     }
 }

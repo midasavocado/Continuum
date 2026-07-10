@@ -9,7 +9,7 @@ struct ContinuumMainView: View {
             ContinuumSidebarView(
                 selection: $model.selectedSection,
                 snapshotCount: model.snapshots.count,
-                appIssueCount: 0
+                appIssueCount: model.appSetupIssueCount
             )
             .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 270)
         } detail: {
@@ -91,7 +91,28 @@ struct ContinuumMainView: View {
         case .apps:
             AppsCompatibilityView(
                 reports: model.appReports,
-                runningProcesses: model.runningProcesses
+                setupRecords: model.setupRecords,
+                runningProcesses: model.runningProcesses,
+                isBatchSetupInProgress: model.isBatchSetupInProgress,
+                setupOperation: { model.setupOperation(for: $0) },
+                onCheckSetup: { app in
+                    Task { await model.checkSetup(for: app) }
+                },
+                onSetupManagedCopy: { app in
+                    Task { await model.setUpManagedCopy(for: app) }
+                },
+                onRecheckSetup: { record in
+                    Task { await model.recheckSetup(record) }
+                },
+                onRemoveSetup: { record in
+                    Task { await model.removeSetup(record) }
+                },
+                onSetupEligibleApps: {
+                    Task { await model.setUpEligibleApps() }
+                },
+                onAddTarget: { url in
+                    Task { await model.addApplicationTarget(at: url) }
+                }
             )
 
         case .storage:

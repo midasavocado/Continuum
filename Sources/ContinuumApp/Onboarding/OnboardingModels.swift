@@ -287,7 +287,7 @@ extension CompatibilityTier {
     var onboardingExplanation: String {
         switch self {
         case .directPlugin:
-            "An existing extension loader may be useful, but no backend is certified in v0.1."
+            "An existing extension loader may be useful, but no restore backend is certified for this route yet."
         case .launchInjection:
             "Its signature may permit launch-time research; restoration is not implemented yet."
         case .managedInstrumentation:

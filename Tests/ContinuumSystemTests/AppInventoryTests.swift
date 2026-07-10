@@ -60,6 +60,29 @@ struct AppInventoryTests {
         #expect(apps.first?.bundleURL == link)
     }
 
+    @Test("Resolves an explicitly selected app or standalone executable")
+    func resolvesExplicitWindowTarget() async throws {
+        let fixture = try FixtureApp(displayName: "Window Target")
+        defer { fixture.remove() }
+        let service = MacAppInventoryService(applicationDirectories: [])
+
+        let bundled = await service.application(at: fixture.executableURL)
+        #expect(bundled?.bundleURL == fixture.bundleURL)
+        #expect(bundled?.displayName == "Window Target")
+
+        let executable = fixture.parentDirectory.appendingPathComponent("Standalone Window")
+        #expect(FileManager.default.createFile(atPath: executable.path, contents: Data([0])))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+
+        let standalone = await service.application(at: executable)
+        #expect(standalone?.bundleURL == nil)
+        #expect(standalone?.displayName == "Standalone Window")
+        #expect(standalone?.executableURL == executable)
+    }
+
     @Test("Classifies a bundle-adjacent plug-in directory generically")
     func detectsPluginOpportunity() throws {
         let fixture = try FixtureApp(displayName: "Physics Game")
