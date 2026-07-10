@@ -33,4 +33,22 @@ struct PermissionTests {
         #expect(MacPermissionService.systemSettingsURL(for: .automation)?.absoluteString.hasSuffix("Privacy_Automation") == true)
         #expect(MacPermissionService.systemSettingsURL(for: .fullDiskAccess)?.absoluteString.hasSuffix("Privacy_AllFiles") == true)
     }
+
+    @Test("Invokes the native request hooks for interactive permissions")
+    func requestsInteractivePermissions() async {
+        let environment = PermissionEnvironment(
+            accessibilityPreflight: { false },
+            accessibilityRequest: { true },
+            screenRecordingPreflight: { false },
+            screenRecordingRequest: { true },
+            openURL: { _ in Issue.record("Interactive requests must not open Settings directly") }
+        )
+        let service = MacPermissionService(environment: environment)
+
+        let accessibility = await service.request(.accessibility)
+        let screenRecording = await service.request(.screenRecording)
+
+        #expect(accessibility.state == .granted)
+        #expect(screenRecording.state == .granted)
+    }
 }

@@ -52,7 +52,8 @@ struct ContinuumRootView: View {
             progress: onboardingProgress,
             storageBudgetGigabytes: $storageBudgetGigabytes,
             permissionStatuses: model.permissionStatuses,
-            isRefreshingPermissions: model.isLoading,
+            isRefreshingPermissions: model.isRefreshingPermissions,
+            requestingPermission: model.requestingPermission,
             compatibilityReports: model.appReports,
             isScanningCompatibility: model.isLoading,
             freeDiskSpaceBytes: availableDiskSpace,
@@ -60,8 +61,11 @@ struct ContinuumRootView: View {
                 requestPermission: { permission in
                     Task { await model.requestPermission(permission) }
                 },
+                openPermissionSettings: { permission in
+                    Task { await model.openSystemSettings(for: permission) }
+                },
                 refreshPermissions: {
-                    Task { await model.refresh() }
+                    Task { await model.refreshPermissions() }
                 },
                 runCompatibilityScan: {
                     Task { await model.refresh() }

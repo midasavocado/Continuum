@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="160" y1="120" x2="850" y2="910" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#171a3a"/>
+      <stop offset="0.52" stop-color="#24215a"/>
+      <stop offset="1" stop-color="#14172f"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="176" y1="100" x2="830" y2="930" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7779ff" stop-opacity="0.8"/>
+      <stop offset="0.48" stop-color="#5364dc" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#0a0c20" stop-opacity="0.8"/>
+    </linearGradient>
+    <linearGradient id="time" x1="248" y1="244" x2="808" y2="760" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#79f3ff"/>
+      <stop offset="0.48" stop-color="#5ba8ff"/>
+      <stop offset="1" stop-color="#806cff"/>
+    </linearGradient>
+    <linearGradient id="branch" x1="490" y1="410" x2="738" y2="655" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#b8d4ff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="48%" r="50%">
+      <stop offset="0" stop-color="#576cff" stop-opacity="0.32"/>
+      <stop offset="0.68" stop-color="#2d3dba" stop-opacity="0.1"/>
+      <stop offset="1" stop-color="#1a1b3a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="tileShadow" x="-25%" y="-25%" width="150%" height="165%">
+      <feDropShadow dx="0" dy="28" stdDeviation="28" flood-color="#050611" flood-opacity="0.52"/>
+    </filter>
+    <filter id="symbolGlow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="13" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect x="74" y="58" width="876" height="876" rx="202" fill="#090a18" opacity="0.46" filter="url(#tileShadow)"/>
+  <rect x="72" y="54" width="880" height="880" rx="202" fill="url(#tile)"/>
+  <rect x="73" y="55" width="878" height="878" rx="201" fill="none" stroke="url(#edge)" stroke-width="5"/>
+  <path d="M155 144 C302 77 694 71 858 176" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="512" cy="500" r="350" fill="url(#glow)"/>
+
+  <g opacity="0.24">
+    <circle cx="512" cy="506" r="290" fill="none" stroke="#8c92ff" stroke-width="2" stroke-dasharray="4 20"/>
+    <circle cx="512" cy="506" r="232" fill="none" stroke="#9fa7ff" stroke-width="2" stroke-dasharray="3 25"/>
+  </g>
+
+  <path d="M700 267 C794 331 835 446 810 556 C779 695 655 799 509 805 C363 811 232 717 199 577 C169 449 218 318 323 243"
+        fill="none" stroke="#172044" stroke-opacity="0.9" stroke-width="98" stroke-linecap="round"/>
+  <path d="M700 267 C794 331 835 446 810 556 C779 695 655 799 509 805 C363 811 232 717 199 577 C169 449 218 318 323 243"
+        fill="none" stroke="url(#time)" stroke-width="68" stroke-linecap="round" filter="url(#symbolGlow)"/>
+
+  <path d="M363 150 L207 226 C186 236 186 266 207 276 L357 350 C378 360 401 341 394 318 L374 259 L433 231 C452 222 449 194 429 190 L371 181 C368 170 365 160 363 150 Z"
+        fill="#79f3ff"/>
+  <path d="M356 171 L229 233 C220 238 220 250 229 255 L366 322 L346 257 L414 225 L354 216 Z"
+        fill="url(#time)"/>
+
+  <g filter="url(#symbolGlow)">
+    <path d="M492 511 C567 511 598 466 655 417 C678 397 699 384 724 376"
+          fill="none" stroke="#172044" stroke-width="55" stroke-linecap="round"/>
+    <path d="M492 511 C567 511 598 466 655 417 C678 397 699 384 724 376"
+          fill="none" stroke="url(#branch)" stroke-width="30" stroke-linecap="round"/>
+    <path d="M492 511 C567 511 604 561 658 613 C678 633 700 647 726 655"
+          fill="none" stroke="#172044" stroke-width="55" stroke-linecap="round"/>
+    <path d="M492 511 C567 511 604 561 658 613 C678 633 700 647 726 655"
+          fill="none" stroke="url(#branch)" stroke-width="30" stroke-linecap="round"/>
+  </g>
+
+  <circle cx="485" cy="511" r="61" fill="#18204a"/>
+  <circle cx="485" cy="511" r="43" fill="#f8fbff"/>
+  <circle cx="485" cy="511" r="21" fill="#668cff"/>
+
+  <circle cx="734" cy="373" r="49" fill="#18204a"/>
+  <circle cx="734" cy="373" r="33" fill="#7af0ff"/>
+  <circle cx="734" cy="659" r="49" fill="#18204a"/>
+  <circle cx="734" cy="659" r="33" fill="#8976ff"/>
+
+  <circle cx="260" cy="705" r="13" fill="#ffffff" opacity="0.62"/>
+  <circle cx="783" cy="295" r="10" fill="#ffffff" opacity="0.7"/>
+</svg>

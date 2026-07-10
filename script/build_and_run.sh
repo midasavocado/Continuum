@@ -13,14 +13,14 @@ APP_BINARY="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 TMP_BASE="${TMPDIR:-/tmp}"
 SCRATCH_ROOT="${TMP_BASE%/}/com.midas.continuum-swiftpm"
 SWIFTPM_OPTIONS=(--scratch-path "$SCRATCH_ROOT")
-SWIFTC_OPTIONS=()
+SWIFT_BUILD_OPTIONS=(--scratch-path "$SCRATCH_ROOT")
 
 # Some outer CI/Codex sandboxes prohibit SwiftPM and the Swift macro server
 # from nesting Apple's sandbox-exec. Opt in only for those already-sandboxed
 # environments; ordinary local builds retain SwiftPM's default sandbox.
 if [[ "${CONTINUUM_DISABLE_SWIFTPM_SANDBOX:-0}" == "1" ]]; then
   SWIFTPM_OPTIONS+=(--disable-sandbox)
-  SWIFTC_OPTIONS+=(-Xswiftc -disable-sandbox)
+  SWIFT_BUILD_OPTIONS+=(--disable-sandbox -Xswiftc -disable-sandbox)
 fi
 
 usage() {
@@ -48,7 +48,7 @@ rm -rf "$SCRATCH_ROOT"
 mkdir -p "$SCRATCH_ROOT/ClangModuleCache" "$SCRATCH_ROOT/SwiftPMModuleCache"
 export CLANG_MODULE_CACHE_PATH="$SCRATCH_ROOT/ClangModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$SCRATCH_ROOT/SwiftPMModuleCache"
-swift build "${SWIFTPM_OPTIONS[@]}" "${SWIFTC_OPTIONS[@]}" --product "$APP_NAME"
+swift build "${SWIFT_BUILD_OPTIONS[@]}" --product "$APP_NAME"
 BUILD_DIR="$(swift build "${SWIFTPM_OPTIONS[@]}" --show-bin-path)"
 BUILD_BINARY="$BUILD_DIR/$APP_NAME"
 
@@ -60,23 +60,32 @@ fi
 STAGED_BUNDLE="$SCRATCH_ROOT/Staged/$APP_NAME.app"
 STAGED_CONTENTS="$STAGED_BUNDLE/Contents"
 STAGED_MACOS="$STAGED_CONTENTS/MacOS"
+STAGED_RESOURCES="$STAGED_CONTENTS/Resources"
 STAGED_BINARY="$STAGED_MACOS/$APP_NAME"
 INFO_PLIST="$STAGED_CONTENTS/Info.plist"
+APP_ICON="$ROOT_DIR/Assets/Continuum.icns"
 
-mkdir -p "$STAGED_MACOS"
+if [[ ! -f "$APP_ICON" ]]; then
+  echo "error: missing app icon at $APP_ICON" >&2
+  exit 1
+fi
+
+mkdir -p "$STAGED_MACOS" "$STAGED_RESOURCES"
 cp "$BUILD_BINARY" "$STAGED_BINARY"
+cp "$APP_ICON" "$STAGED_RESOURCES/Continuum.icns"
 chmod +x "$STAGED_BINARY"
 
 /usr/libexec/PlistBuddy -c "Clear dict" "$INFO_PLIST" >/dev/null 2>&1 || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDevelopmentRegion string en" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_NAME" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $APP_NAME" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string Continuum.icns" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$INFO_PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.1.0" "$INFO_PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.1.2" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 3" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string public.app-category.utilities" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MIN_SYSTEM_VERSION" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :NSAccessibilityUsageDescription string Continuum uses Accessibility only when you ask it to identify and coordinate the app you are capturing." "$INFO_PLIST"

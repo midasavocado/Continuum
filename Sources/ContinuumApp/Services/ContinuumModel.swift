@@ -27,6 +27,8 @@ final class ContinuumModel {
 
     private(set) var isLoading = false
     private(set) var isPerformingAction = false
+    private(set) var isRefreshingPermissions = false
+    private(set) var requestingPermission: PermissionKind?
     var presentedError: String?
     var onlineWarning: [ExternalEffect]?
     private(set) var rewindPhase: RewindPhase = .idle
@@ -245,9 +247,22 @@ final class ContinuumModel {
     }
 
     func requestPermission(_ permission: PermissionKind) async {
-        await performAction {
-            let status = await self.permissionProvider.request(permission)
-            self.upsertPermissionStatus(status)
+        guard requestingPermission == nil, !isRefreshingPermissions else { return }
+        requestingPermission = permission
+        defer { requestingPermission = nil }
+
+        let status = await permissionProvider.request(permission)
+        upsertPermissionStatus(status)
+    }
+
+    func refreshPermissions() async {
+        guard !isRefreshingPermissions, requestingPermission == nil else { return }
+        isRefreshingPermissions = true
+        defer { isRefreshingPermissions = false }
+
+        let statuses = await permissionProvider.statuses()
+        permissionStatuses = statuses.sorted {
+            $0.kind.rawValue < $1.kind.rawValue
         }
     }
 

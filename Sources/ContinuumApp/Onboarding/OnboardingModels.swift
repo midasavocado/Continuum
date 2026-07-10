@@ -179,6 +179,7 @@ final class OnboardingProgress: ObservableObject {
 
 struct ContinuumOnboardingActions {
     var requestPermission: (PermissionKind) -> Void
+    var openPermissionSettings: (PermissionKind) -> Void
     var refreshPermissions: () -> Void
     var runCompatibilityScan: () -> Void
     var refreshStorage: () -> Void
@@ -187,6 +188,7 @@ struct ContinuumOnboardingActions {
 
     init(
         requestPermission: @escaping (PermissionKind) -> Void = { _ in },
+        openPermissionSettings: @escaping (PermissionKind) -> Void = { _ in },
         refreshPermissions: @escaping () -> Void = {},
         runCompatibilityScan: @escaping () -> Void = {},
         refreshStorage: @escaping () -> Void = {},
@@ -194,6 +196,7 @@ struct ContinuumOnboardingActions {
         finish: @escaping () -> Void = {}
     ) {
         self.requestPermission = requestPermission
+        self.openPermissionSettings = openPermissionSettings
         self.refreshPermissions = refreshPermissions
         self.runCompatibilityScan = runCompatibilityScan
         self.refreshStorage = refreshStorage
@@ -227,19 +230,23 @@ extension PermissionKind {
     }
 
     var onboardingRequirement: String {
-        "Future runtime"
+        switch self {
+        case .accessibility, .screenRecording: "Recommended"
+        case .automation: "Per app"
+        case .fullDiskAccess: "Optional"
+        }
     }
 
     var onboardingPurpose: String {
         switch self {
         case .accessibility:
-            "A certified runtime may use this to coordinate supported restore actions. v0.1 does not request it."
+            "Helps Continuum identify windows and coordinate supported app controls."
         case .screenRecording:
-            "A future visual timeline may use this for thumbnails. Images never count as restored state."
+            "Creates private timeline previews. Images never count as restored app state."
         case .automation:
-            "A future protected-app bridge may request this only for an app that exposes useful restore actions."
+            "Requested separately for an app only when a supported bridge actually uses it."
         case .fullDiskAccess:
-            "A future file virtualizer may need this. The metadata-only prototype does not request it."
+            "May be needed later to version protected app files and databases."
         }
     }
 }

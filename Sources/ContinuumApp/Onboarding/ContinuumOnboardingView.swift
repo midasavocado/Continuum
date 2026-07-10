@@ -7,6 +7,7 @@ struct ContinuumOnboardingView: View {
 
     let permissionStatuses: [PermissionStatus]
     let isRefreshingPermissions: Bool
+    let requestingPermission: PermissionKind?
     let permissionError: OnboardingErrorState?
     let compatibilityReports: [CompatibilityReport]
     let isScanningCompatibility: Bool
@@ -16,11 +17,14 @@ struct ContinuumOnboardingView: View {
     let storageError: OnboardingErrorState?
     let actions: ContinuumOnboardingActions
 
+    @State private var navigationDirection: NavigationDirection = .forward
+
     init(
         progress: OnboardingProgress,
         storageBudgetGigabytes: Binding<Int>,
         permissionStatuses: [PermissionStatus] = [],
         isRefreshingPermissions: Bool = false,
+        requestingPermission: PermissionKind? = nil,
         permissionError: OnboardingErrorState? = nil,
         compatibilityReports: [CompatibilityReport] = [],
         isScanningCompatibility: Bool = false,
@@ -34,6 +38,7 @@ struct ContinuumOnboardingView: View {
         _storageBudgetGigabytes = storageBudgetGigabytes
         self.permissionStatuses = permissionStatuses
         self.isRefreshingPermissions = isRefreshingPermissions
+        self.requestingPermission = requestingPermission
         self.permissionError = permissionError
         self.compatibilityReports = compatibilityReports
         self.isScanningCompatibility = isScanningCompatibility
@@ -48,8 +53,13 @@ struct ContinuumOnboardingView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            currentPage
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ZStack {
+                currentPage
+                    .id(progress.currentStep)
+                    .transition(pageTransition)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
             Divider()
             footer
         }
@@ -71,7 +81,13 @@ struct ContinuumOnboardingView: View {
             OnboardingStepIndicator(
                 currentStep: progress.currentStep,
                 completedSteps: progress.completedSteps,
-                select: progress.jump
+                select: { step in
+                    navigate(
+                        step.rawValue < progress.currentStep.rawValue ? .backward : .forward
+                    ) {
+                        progress.jump(to: step)
+                    }
+                }
             )
 
             Spacer()
@@ -96,8 +112,10 @@ struct ContinuumOnboardingView: View {
             PermissionChecklistView(
                 statuses: permissionStatuses,
                 isRefreshing: isRefreshingPermissions,
+                requestingPermission: requestingPermission,
                 error: permissionError,
                 request: actions.requestPermission,
+                openSettings: actions.openPermissionSettings,
                 refresh: actions.refreshPermissions
             )
         case .compatibility:
@@ -125,12 +143,14 @@ struct ContinuumOnboardingView: View {
     private var footer: some View {
         HStack(spacing: 12) {
             if progress.canGoBack {
-                Button("Back", action: progress.goBack)
+                Button("Back") {
+                    navigate(.backward, action: progress.goBack)
+                }
                     .keyboardShortcut(.leftArrow, modifiers: [.command])
                     .accessibilityHint("Returns to \(progress.currentStep.previous?.title ?? "the previous step")")
             }
 
-            Button("Skip Prototype Setup") {
+            Button("Skip for Now") {
                 progress.skip()
                 actions.skip()
             }
@@ -186,7 +206,34 @@ struct ContinuumOnboardingView: View {
             progress.finish()
             actions.finish()
         } else {
-            progress.advance()
+            navigate(.forward, action: progress.advance)
         }
     }
+
+    private var pageTransition: AnyTransition {
+        switch navigationDirection {
+        case .forward:
+            .asymmetric(
+                insertion: .move(edge: .trailing).combined(with: .opacity),
+                removal: .move(edge: .leading).combined(with: .opacity)
+            )
+        case .backward:
+            .asymmetric(
+                insertion: .move(edge: .leading).combined(with: .opacity),
+                removal: .move(edge: .trailing).combined(with: .opacity)
+            )
+        }
+    }
+
+    private func navigate(_ direction: NavigationDirection, action: () -> Void) {
+        navigationDirection = direction
+        withAnimation(.snappy(duration: 0.32)) {
+            action()
+        }
+    }
+}
+
+private enum NavigationDirection {
+    case forward
+    case backward
 }
