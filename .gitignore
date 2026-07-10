@@ -1,0 +1,12 @@
+.DS_Store
+/.build/
+/dist/
+/outputs/
+/work/
+/*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+
+# Continuum snapshot stores may contain private screen and app-state data.
+/ContinuumData/
+*.continuum-snapshot

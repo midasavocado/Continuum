@@ -1,0 +1,148 @@
+import Foundation
+
+public enum SnapshotKind: String, Codable, CaseIterable, Sendable {
+    case manual
+    case beforeRewind
+    case crashRecovery
+    case automatic
+
+    public var displayName: String {
+        switch self {
+        case .manual: "Manual"
+        case .beforeRewind: "Before Rewind"
+        case .crashRecovery: "Crash Recovery"
+        case .automatic: "Automatic"
+        }
+    }
+}
+
+public enum RestoreAvailability: String, Codable, CaseIterable, Sendable {
+    case instant
+    case replayRequired
+    case unavailable
+
+    public var displayName: String {
+        switch self {
+        case .instant: "Instant"
+        case .replayRequired: "Replay required"
+        case .unavailable: "Unavailable"
+        }
+    }
+}
+
+public enum CheckpointValidation: String, Codable, Sendable {
+    case provisional
+    case validating
+    case valid
+    case invalid
+}
+
+public enum CapturedArtifactKind: String, Codable, Sendable {
+    case memoryPage
+    case threadState
+    case fileBlock
+    case descriptorState
+    case graphicsState
+    case inputEvent
+    case nondeterminismEvent
+    case metadata
+}
+
+public struct CapturedArtifact: Codable, Hashable, Sendable {
+    public let kind: CapturedArtifactKind
+    public let logicalName: String
+    public let data: Data
+
+    public init(kind: CapturedArtifactKind, logicalName: String, data: Data) {
+        self.kind = kind
+        self.logicalName = logicalName
+        self.data = data
+    }
+}
+
+public struct CheckpointRecord: Codable, Hashable, Identifiable, Sendable {
+    public let id: CheckpointID
+    public let capturedAt: Date
+    public let monotonicNanoseconds: UInt64
+    public let processIdentifiers: [Int32]
+    public let memoryRegionCount: Int
+    public let threadCount: Int
+    public var validation: CheckpointValidation
+
+    public init(
+        id: CheckpointID = UUID(),
+        capturedAt: Date = .now,
+        monotonicNanoseconds: UInt64,
+        processIdentifiers: [Int32],
+        memoryRegionCount: Int,
+        threadCount: Int,
+        validation: CheckpointValidation
+    ) {
+        self.id = id
+        self.capturedAt = capturedAt
+        self.monotonicNanoseconds = monotonicNanoseconds
+        self.processIdentifiers = processIdentifiers
+        self.memoryRegionCount = memoryRegionCount
+        self.threadCount = threadCount
+        self.validation = validation
+    }
+}
+
+public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
+    public let id: SnapshotID
+    public var name: String
+    public var note: String
+    public let kind: SnapshotKind
+    public let app: AppIdentity
+    public let checkpoint: CheckpointRecord
+    public let branchID: BranchID
+    public let createdAt: Date
+    public var availability: RestoreAvailability
+    public var chunkHashes: [String]
+    public var logicalBytes: Int64
+    public var uniqueBytes: Int64
+    public var isPinned: Bool
+    public var externalEffects: [ExternalEffect]
+
+    public init(
+        id: SnapshotID = UUID(),
+        name: String,
+        note: String = "",
+        kind: SnapshotKind,
+        app: AppIdentity,
+        checkpoint: CheckpointRecord,
+        branchID: BranchID,
+        createdAt: Date = .now,
+        availability: RestoreAvailability,
+        chunkHashes: [String] = [],
+        logicalBytes: Int64 = 0,
+        uniqueBytes: Int64 = 0,
+        isPinned: Bool = true,
+        externalEffects: [ExternalEffect] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.note = note
+        self.kind = kind
+        self.app = app
+        self.checkpoint = checkpoint
+        self.branchID = branchID
+        self.createdAt = createdAt
+        self.availability = availability
+        self.chunkHashes = chunkHashes
+        self.logicalBytes = logicalBytes
+        self.uniqueBytes = uniqueBytes
+        self.isPinned = isPinned
+        self.externalEffects = externalEffects
+    }
+}
+
+public struct SnapshotCapture: Sendable {
+    public let snapshot: SnapshotRecord
+    public let artifacts: [CapturedArtifact]
+
+    public init(snapshot: SnapshotRecord, artifacts: [CapturedArtifact]) {
+        self.snapshot = snapshot
+        self.artifacts = artifacts
+    }
+}
