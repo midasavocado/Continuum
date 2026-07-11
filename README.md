@@ -2,11 +2,11 @@
 
 Continuum is a native macOS research prototype for safe, branching app snapshots: save a moment, preserve the current future before rewinding, and never label a screenshot as restorable state.
 
-> **Current status: v0.2 research build.** Continuum can now prepare eligible app bundles through one generic managed-copy pipeline and repeatedly restore one explicitly registered memory arena in its signed external proof target. It still does **not** rewind an arbitrary complete app or game. It cannot currently restore a crashed KSP flight, Safari, an IDE, or another process's full RAM and kernel/resource state. The tiny time machine has graduated from cardboard to one real gear—not the whole DeLorean.
+> **Current status: v0.3 research build.** Continuum now captures every readable+writable private/COW mapping plus ARM64 register state in its signed external target, creates an automatic safety cut, and restores changed page runs in place. Its validated target currently completes a full coherent snapshot in about 50 ms and one A→B→A process-state cycle in about 65–70 ms per restore. It also has a real APFS per-file COW checkpoint layer that restores bytes without replacing the live inode. It still does **not** certify arbitrary apps or games because shared VM topology, descriptors, IPC, graphics, and other kernel resources are not yet restored. The tiny time machine has an engine now; several important hoses are still on the garage floor.
 
-Continuum requires macOS 15 or later and keeps System Integrity Protection enabled.
+Continuum requires macOS 15 or later. The cooperative signed proof works through explicit development entitlements and verifies that it never changes SIP state. Testing unmodified third-party processes on this development Mac currently relies on the user's SIP-disabled configuration; that is not a consumer distribution plan or proof of universal compatibility.
 
-## What v0.2 implements
+## What v0.3 implements
 
 - A native SwiftUI consumer shell with resumable onboarding, plain-language limits, real opt-in Accessibility and Screen Recording request actions, storage selection, and a self-contained rewind demo.
 - A broad inventory of running window owners and installed `.app` bundles, plus explicit selection of an app or executable anywhere on disk.
@@ -17,17 +17,20 @@ Continuum requires macOS 15 or later and keeps System Integrity Protection enabl
 - A metadata-only capture fallback that records the selected process tree's identity and resource counts, explicitly marks the snapshot `Unavailable`, and refuses fake restoration.
 - Typed snapshot, checkpoint, branch, compatibility, storage, and external-effect models shared by the app, store, and test harness.
 - An encrypted, content-addressed snapshot-store implementation with immutable manual snapshots, provisional pre-rewind safety snapshots, atomic branch creation, deduplication, and integrity verification.
-- A signed cross-process Mach proof that suspends the included cooperative target, captures one registered private/COW arena plus ARM64 thread-state evidence, restores and readback-verifies that arena, and alternates two target-owned states for 100 cycles.
-- Emergency rollback bytes, PID/start-time/executable-inode pinning, mapping/protection/thread-set validation, bounded protocol timeouts, and balanced target suspend/resume handling in that proof.
+- A signed cross-process Mach proof that suspends the included target, walks its complete nested VM map, retains kernel COW views for every readable+writable private/COW region, captures ARM64 general/NEON registers, and restores coalesced changed-page runs plus registers in place.
+- An automatic pre-restore safety snapshot, full readback validation, rollback on partial failure, PID/start-time/executable-inode pinning, strict VM-layout/thread-set validation, bounded protocol timeouts, and balanced target suspend/resume handling.
+- A per-app APFS local-file checkpoint layer that creates cheap COW clones, verifies live device/inode identity, restores bytes through the existing vnode, fsyncs the result, and refuses a replaced path rather than silently breaking open descriptors.
+- Snapshot metadata and UI language for per-app capture groups, exact **App + Local Files** rewind, and a future **App Only — Keep Current Files** choice that remains disabled unless old memory with newer files is explicitly certified safe.
 - Command-line setup, memory, external-target, and transaction proofs, plus tests for models, storage, setup recovery, app inventory, permissions, hotkeys, and runtime primitives.
 
 The app deliberately distinguishes **Managed Copy Prepared** from rewind certification. Preparation makes an eligible copy attachable for the next runtime gate; it does not enable **Play from Here**.
 
-## What v0.2 does not implement
+## What v0.3 does not implement
 
 - Continuous visual history or ScreenCaptureKit recording.
-- General capture or restoration of arbitrary memory regions in an external process.
-- Thread-register restoration, or complete file-descriptor, Mach-port, XPC, socket, helper-process, WindowServer, GPU, audio, device, or input rollback.
+- VM-map topology restoration when an app allocates, frees, splits, or replaces a captured mapping. The runtime fails closed when topology changes, including when private memory becomes a live shared mapping.
+- Complete file-descriptor, Mach-port, XPC, socket, pipe, kqueue, helper-process, WindowServer, GPU, audio, device, or input rollback.
+- File discovery/attribution, namespace journaling, SQLite WAL/SHM lock restoration, or automatic connection of the APFS byte layer to arbitrary apps.
 - Deterministic replay, outbound-effect suppression, crash interception, or cold restore after reboot.
 - Runtime injection or launch of prepared managed copies, a privileged helper, or app-specific bridges.
 - A certified KSP, browser, IDE, Apple-app, DRM, or anti-cheat integration.
@@ -86,7 +89,7 @@ Run the signed cooperative external-memory proof with:
 ./script/run_external_hot_proof.sh
 ```
 
-That script requires a local Apple Development signing identity, verifies the controller/target entitlements and SIP status, performs at least 100 A↔B cycles, and deletes its temporary products. It proves only the target's registered arena—not whole-app rewind.
+That script requires a local Apple Development signing identity, verifies the controller/target entitlements and SIP status, performs one validated full-process A↔B cycle plus at least 100 registered-arena cycles, and deletes its temporary products. The one-cycle limit is deliberate: the target later replaces a private allocator mapping with shared state, which the runtime detects and refuses rather than overwriting blindly.
 
 ## Onboarding and permissions
 
@@ -120,6 +123,10 @@ Continuum never grants itself access. Every prompt follows a user click, and onb
 - Settings includes **Delete All Snapshot Data**, which atomically clears snapshots, branches, manifests, and content chunks when no rewind transaction is active.
 - `Unavailable` snapshots may be inspected but cannot be played. Only a validated runtime may publish `Instant` or `Replay required`.
 - Local restoration can never unsend messages, undo purchases, retract uploads, or reverse changes already accepted by a remote service.
+- Capture is per app, not full-device: the selected app, its helpers, and certified dependent writers form one capture group. Unrelated apps and system services do not rewind.
+- Exact restore defaults to **App + Local Files**. APFS clones preserve file preimages and restoration writes through the same inode so open descriptors remain valid.
+- **App Only — Keep Current Files** is offered only when a compatibility run proves that combining historical memory with current files is safe. Databases, games, and IDEs should normally keep it disabled.
+- Choosing **Open App From Here** always saves the app and captured local files being left first, so disk changes branch with memory instead of being destructively overwritten.
 
 The store proves these transaction semantics using harness-owned artifacts. It does not make another app's state restorable by itself.
 
@@ -139,7 +146,7 @@ The first functional baseline is not cheap: depending on the app, it may be hund
 
 Real snapshots can contain extremely sensitive material: document text, window titles, paths, credentials in memory, personal messages, and screen content. Treat a Continuum store like an unlocked session of the captured app even when its chunks are encrypted.
 
-The v0.2 design keeps data local, does not install a privileged daemon, does not weaken SIP, and never edits the selected vendor source. The opt-in setup route does create and re-sign a separate managed copy inside Continuum's private Application Support directory. Do not add broad capture, Full Disk Access, source-bundle mutation, or network synchronization without explicit scope UI, stable code signing, a threat review, tested rollback, and a clear deletion path.
+The v0.3 design keeps data local, does not install a privileged daemon, never changes SIP state, and never edits the selected vendor source. This development Mac is currently SIP-disabled by the user for task-port research. The opt-in setup route creates and re-signs a separate managed copy inside Continuum's private Application Support directory. Do not add broad capture, Full Disk Access, source-bundle mutation, or network synchronization without explicit scope UI, stable code signing, a threat review, tested rollback, and a clear deletion path.
 
 ## Uninstall the development build
 
@@ -177,4 +184,4 @@ The proof harness creates only self-cleaning temporary directories. Full Disk Ac
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module boundaries and the transaction invariants that must remain true while the runtime evolves.
 
-The next engineering gate is not “support KSP somehow.” The registered-arena proof must expand into a general capture cut across writable mappings, thread restoration or replay, helpers, local files, descriptors/IPC, windows, and graphics without SIP changes. Only measured end-to-end restoration can certify an app, with KSP serving as a demanding acceptance workload rather than a special-case illusion.
+The next engineering gate is not “support KSP somehow.” The working memory/register cut and APFS file primitive must gain capture-group file attribution, VM-topology generations, descriptor/Mach/XPC virtualization, and graphics republication. Only measured end-to-end restoration can certify an app, with KSP serving as a demanding acceptance workload rather than a special-case illusion.

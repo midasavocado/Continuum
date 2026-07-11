@@ -1,14 +1,14 @@
 # Continuum architecture
 
-Continuum v0.2 is a native macOS research prototype for the parts of rewind that can be made concrete today: broad target discovery, opt-in permission onboarding, reversible managed-copy setup, cross-process registered-arena experiments, durable snapshot metadata, and branch-safe rewind transactions. It is intentionally not described as a universal process-restoration engine.
+Continuum v0.3 is a native macOS per-app rewind research prototype. The current proof has complete private/COW memory cuts, ARM64 register restoration, mandatory safety snapshots, batched in-place page restoration, APFS file preimages, durable branch transactions, and consumer UI. It is intentionally not described as a universal process-restoration engine.
 
 ## Module boundaries
 
 | Module | Owns | Must not own |
 | --- | --- | --- |
 | `ContinuumCore` | Sendable domain models, identifiers, errors, display naming, and protocols | AppKit, persistence, Mach calls, permission prompts, or presentation state |
-| `ContinuumStore` | Durable index, content-addressed chunks, integrity checks, reference accounting, and atomic snapshot/rewind transactions | Process inspection, UI, permission prompts, or claims that stored bytes are restorable |
-| `ContinuumRuntime` | Low-level Mach/VM primitives for owned memory and one registered private/COW arena in an authorized external process | Thread-state restoration, product policy, user consent, arbitrary-app compatibility claims, or durable storage |
+| `ContinuumStore` | Durable index, content-addressed chunks, APFS per-file COW roots, in-place file-byte restoration, integrity checks, and atomic snapshot/rewind transactions | File discovery/attribution, process inspection, UI, permission prompts, or claims that unvalidated bytes are restorable |
+| `ContinuumRuntime` | Mach task identity, nested VM-map capture, retained COW views, ARM64 register cuts, safety snapshots, batched page restore/readback, and fail-closed topology validation | Descriptor/IPC/GPU restoration, product policy, user consent, arbitrary-app compatibility claims, or durable storage |
 | `ContinuumSystem` | Window-owner/app inventory, code-signing inspection, permission requests/status, generic managed-copy setup/recovery, compatibility probing, and global hotkeys | Snapshot indexing, branch policy, SwiftUI state, source-app mutation, or bypassing SIP/TCC |
 | `ContinuumApp` | SwiftUI/AppKit consumer shell, onboarding, Snapshot Library, timeline/branch presentation, explicit user actions, and the honest metadata-only checkpoint fallback | Raw store file mutation, Mach implementation details, or silently requesting broad permissions |
 | `ContinuumHarness` | Reproducible command-line proofs for setup, VM-region inspection, the owned/external registered-arena experiments, and store transactions | Shipping UI behavior or compatibility certification |
@@ -49,6 +49,9 @@ These invariants apply even while the runtime remains experimental:
 10. **External effects remain external.** A local restore cannot unsend a message, reverse a purchase, or change a remote server. Crossing recorded effects produces a warning, never a success claim.
 11. **Storage pressure fails closed.** If permanent safety data cannot fit, rewind does not start. Pinned manual and pre-rewind snapshots are not silently evicted.
 12. **Unknown state is not fabricated.** Missing process, descriptor, graphics, helper, or IPC state makes the snapshot unavailable; visual continuity is never presented as functional restoration.
+13. **Scope is per app.** A capture group contains one app, its helper/process tree, and certified dependent local writers. Continuum never describes this as a whole-device snapshot.
+14. **Files branch with memory by default.** Exact restore uses the captured APFS file root. Keeping newer files with older memory is a separate policy that is disabled unless compatibility validation proves it safe.
+15. **Open vnode identity survives.** Hot file restore writes captured bytes into the existing inode. Replacing a path or swapping a clone underneath an open descriptor is not accepted as exact restoration.
 
 The state machine is deliberately small:
 
@@ -71,16 +74,17 @@ Snapshot material should be treated like an unlocked session of the captured app
 
 The future scheduler defaults to 100 ms active epochs, conditionally tightens to 50 ms for games only when performance gates pass, and backs off to one second while idle. Its default budgets are 2 GB for 90 seconds of hot history and 20 GB for a 30-minute rolling disk window. A first restorable baseline may cost hundreds of megabytes to multiple gigabytes; later points reference content-addressed deltas. Product surfaces must report logical/shared and physically unique bytes separately. None of these cadence or retention targets are active in the current metadata-only app capturer.
 
-The v0.2 application does not install a privileged daemon, weaken SIP, edit the selected vendor source, or silently grant itself TCC permissions. Its opt-in setup coordinator clones a verified `Original.app` and a separate `Managed.app` into Application Support, writes a marker only to the managed copy, and ad-hoc signs that copy with `get-task-allow`. Platform, sandbox/identity-bound, App Store/DRM, restricted-entitlement, and unsupported-nested-code targets fail closed. Prepared copies remain uncertified and are not launched by the capture service.
+The application does not silently change SIP, edit the selected vendor source, or grant itself TCC permissions. Its opt-in setup coordinator clones a verified `Original.app` and a separate `Managed.app` into Application Support. On this development Mac, SIP is user-disabled for research against unmodified tasks; a consumer build still needs a supported authorization/instrumentation route and Apple-granted system-extension entitlements.
 
 ## Research boundary
 
-The runtime now has two proof levels:
+The runtime now has three proof levels:
 
 1. The self-process proof checkpoints memory allocated by the harness.
-2. The signed external proof pins one cooperative target by PID, start time, and executable inode; registers one private/COW arena; suspends the target; captures the arena and ARM64 general/NEON thread-state evidence; validates the mapping/protections/thread set; restores bytes with readback and emergency rollback; and alternates A↔B for at least 100 cycles.
+2. The registered-arena external proof alternates two target-owned states with readback validation for at least 100 cycles.
+3. The full-process proof walks the target's nested VM map, retains COW views for every readable+writable private/COW mapping, captures general/NEON registers, creates a current-state safety cut before restore, compares local views, coalesces changed pages into large writes, restores registers, and validates the result. Current measurements are roughly 50 ms per snapshot and 65–70 ms per hot restore for about 313 MB of logical writable state.
 
-The external proof never calls `thread_set_state`. It does not enumerate or restore arbitrary mappings, and its JSON handshake exists only for the included cooperative target. Therefore it does not prove restoration of an arbitrary GUI process. A general native-app rewind engine must separately solve or reject:
+The proof calls `thread_set_state`, but it requires the same task, thread identities, and VM topology. A second functional cycle correctly fails after the target replaces a private allocator mapping with `SM_TRUESHARED` state. Therefore it still does not prove restoration of an arbitrary GUI process. A general native-app rewind engine must separately solve or reject:
 
 - authenticated access to another app's task and complete helper tree;
 - safe thread cuts and in-flight syscalls;
@@ -88,5 +92,17 @@ The external proof never calls `thread_set_state`. It does not enumerate or rest
 - WindowServer, Core Animation, Metal, audio, input, and device state;
 - code signing, library validation, TCC identity, App Store/DRM constraints, and app updates;
 - deterministic replay without duplicating external effects.
+
+## Per-app local file transaction
+
+`APFSLocalFileCheckpointStore` is the first real disk primitive:
+
+1. Discovery supplies regular files attributed to one capture group.
+2. Capture creates APFS `clonefile` preimages in a private snapshot root and atomically publishes a manifest only after every clone exists.
+3. The manifest pins original path, device, inode, byte length, and mode.
+4. Restore refuses a changed device/inode, truncates the existing vnode to the historical length, copies bytes from the clone through `pwrite`, and fsyncs before success.
+5. A higher coordinator must create the mandatory current-state file root before calling restore.
+
+This layer intentionally does not yet discover files or restore renames, deletes, hard links, xattrs, SQLite locks, pipes, sockets, or shared-daemon writes. Endpoint Security plus an in-process dirty-range journal is the planned attribution/namespace layer. APFS whole-volume revert is not the hot path because it applies on a later mount and would rewind unrelated apps.
 
 Each application is therefore certified from measured capture and restore behavior. A successful managed-copy transaction certifies only that setup is reversible and attachable—not that the app can rewind. Unsupported software remains visible in inventory with an explanation, but no enabled **Play from Here** action. KSP is an eventual acceptance workload for the general engine, not a special-case claim.

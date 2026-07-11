@@ -30,6 +30,32 @@ public enum RestoreAvailability: String, Codable, CaseIterable, Sendable {
     }
 }
 
+public enum LocalFileCoverage: String, Codable, CaseIterable, Sendable {
+    case exact
+    case unchanged
+    case unavailable
+
+    public var displayName: String {
+        switch self {
+        case .exact: "Rewind with app"
+        case .unchanged: "No local changes"
+        case .unavailable: "Not captured"
+        }
+    }
+}
+
+public enum LocalFileRestorePolicy: String, Codable, CaseIterable, Sendable {
+    case rewindCapturedFiles
+    case keepCurrentFiles
+
+    public var displayName: String {
+        switch self {
+        case .rewindCapturedFiles: "App + Local Files"
+        case .keepCurrentFiles: "App Only — Keep Current Files"
+        }
+    }
+}
+
 public enum CheckpointValidation: String, Codable, Sendable {
     case provisional
     case validating
@@ -103,6 +129,10 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
     public var uniqueBytes: Int64
     public var isPinned: Bool
     public var externalEffects: [ExternalEffect]
+    /// Nil decodes old store records as unavailable without a schema-breaking
+    /// migration. New exact snapshots set this explicitly.
+    public var localFileCoverage: LocalFileCoverage?
+    public var allowsKeepingCurrentFiles: Bool?
 
     public init(
         id: SnapshotID = UUID(),
@@ -118,7 +148,9 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         logicalBytes: Int64 = 0,
         uniqueBytes: Int64 = 0,
         isPinned: Bool = true,
-        externalEffects: [ExternalEffect] = []
+        externalEffects: [ExternalEffect] = [],
+        localFileCoverage: LocalFileCoverage? = .unavailable,
+        allowsKeepingCurrentFiles: Bool? = false
     ) {
         self.id = id
         self.name = name
@@ -134,6 +166,16 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         self.uniqueBytes = uniqueBytes
         self.isPinned = isPinned
         self.externalEffects = externalEffects
+        self.localFileCoverage = localFileCoverage
+        self.allowsKeepingCurrentFiles = allowsKeepingCurrentFiles
+    }
+
+    public var effectiveLocalFileCoverage: LocalFileCoverage {
+        localFileCoverage ?? .unavailable
+    }
+
+    public var isKeepingCurrentFilesCertified: Bool {
+        allowsKeepingCurrentFiles ?? false
     }
 }
 

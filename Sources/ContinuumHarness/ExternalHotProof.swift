@@ -5,6 +5,8 @@ import Foundation
 
 enum ExternalHotProof {
     static let minimumCycleCount = 100
+    private static let fullProcessCycleCount = 1
+    private static let fullProcessCaptureBudget: UInt64 = 512 * 1_024 * 1_024
 
     static func run(targetPath: String, cycles: Int) throws {
         guard cycles >= minimumCycleCount else {
@@ -26,10 +28,10 @@ enum ExternalHotProof {
         try require(ready.protocolVersion == 1, "target uses an unsupported protocol version")
 
         guard let targetPID = ready.processIdentifier,
-              targetPID == target.processIdentifier,
-              let address = ready.address,
-              let length = ready.length,
-              length > 0
+            targetPID == target.processIdentifier,
+            let address = ready.address,
+            let length = ready.length,
+            length > 0
         else {
             throw ExternalHotProofFailure.protocolViolation(
                 "ready handshake did not identify the launched process and arena"
@@ -40,6 +42,33 @@ enum ExternalHotProof {
             address % UInt64(Int(sysconf(_SC_PAGESIZE))) == 0,
             "target arena is not page-aligned"
         )
+
+        // Exercise the command, JSON, allocator, and reply paths before the
+        // first full-process cut. A production compatibility probe must reach
+        // a stable VM topology before publishing a restorable checkpoint.
+        for pass in 1...8 {
+            let warmB = try target.send(command: "mutate", state: "B")
+            try require(
+                warmB.state == "B",
+                "target warm-up \(pass) did not enter state B"
+            )
+            let checkedB = try target.send(command: "validate", state: "B")
+            try require(
+                checkedB.valid == true,
+                "target warm-up \(pass) did not validate state B"
+            )
+            let warmA = try target.send(command: "mutate", state: "A")
+            try require(
+                warmA.state == "A",
+                "target warm-up \(pass) did not return to state A"
+            )
+            let checkedA = try target.send(command: "validate", state: "A")
+            try require(
+                checkedA.valid == true,
+                "target warm-up \(pass) did not validate state A"
+            )
+        }
+        usleep(100_000)
 
         var session: OpaquePointer?
         try check(
@@ -62,6 +91,7 @@ enum ExternalHotProof {
         let mutated = try target.send(command: "mutate", state: "B")
         try require(mutated.event == "mutated", "target did not acknowledge mutation to B")
         try require(mutated.state == "B", "target did not enter state B")
+        usleep(100_000)
 
         let safetyB = try capture(session: session, expectedAddress: address, expectedLength: length)
         try require(stateA.bytes != safetyB.bytes, "target mutation did not change captured bytes")
@@ -70,6 +100,49 @@ enum ExternalHotProof {
             stateA.descriptor.thread_set_hash == safetyB.descriptor.thread_set_hash,
             "target thread set changed between A and safety B captures"
         )
+        // Establish both whole-process images from one stable VM topology. The
+        // target command above supplies real target-owned B bytes; the runtime
+        // then moves only the registered arena between A and B while the target
+        // remains parked, avoiding transient Foundation allocator mappings.
+        try restore(stateA, into: session, label: "staging A", cycle: 0)
+        let processStateAStart = DispatchTime.now().uptimeNanoseconds
+        let processStateA = try captureProcess(session: session)
+        progress(
+            "full-process A snapshot: \(milliseconds(since: processStateAStart)) ms"
+        )
+        defer { continuum_remote_process_snapshot_destroy(processStateA.snapshot) }
+
+        try restore(safetyB, into: session, label: "staging B", cycle: 0)
+        let processSafetyBStart = DispatchTime.now().uptimeNanoseconds
+        let processSafetyB = try captureProcess(session: session)
+        progress(
+            "full-process B snapshot: \(milliseconds(since: processSafetyBStart)) ms"
+        )
+        defer { continuum_remote_process_snapshot_destroy(processSafetyB.snapshot) }
+
+        if processStateA.info.vm_layout_hash != processSafetyB.info.vm_layout_hash {
+            let difference = try processLayoutDifference(processStateA, processSafetyB)
+            throw ExternalHotProofFailure.invariant(
+                "target VM layout changed between full-process captures "
+                    + "(A captured=\(processStateA.info.captured_region_count)/\(processStateA.info.captured_bytes), "
+                    + "excluded=\(processStateA.info.excluded_region_count)/\(processStateA.info.excluded_bytes); "
+                    + "B captured=\(processSafetyB.info.captured_region_count)/\(processSafetyB.info.captured_bytes), "
+                    + "excluded=\(processSafetyB.info.excluded_region_count)/\(processSafetyB.info.excluded_bytes); "
+                    + difference + ")"
+            )
+        }
+        try require(
+            processStateA.info.thread_set_hash == processSafetyB.info.thread_set_hash,
+            "target thread set changed between full-process captures"
+        )
+
+        for cycle in 1...fullProcessCycleCount {
+            try restoreProcess(processStateA, into: session, label: "A", cycle: cycle)
+            try validate(target: target, expected: "A", digest: stateA.digest, cycle: cycle)
+
+            try restoreProcess(processSafetyB, into: session, label: "B", cycle: cycle)
+            try validate(target: target, expected: "B", digest: safetyB.digest, cycle: cycle)
+        }
 
         for cycle in 1...cycles {
             try restore(stateA, into: session, label: "A", cycle: cycle)
@@ -87,9 +160,95 @@ enum ExternalHotProof {
         print("  target PID:          \(targetPID)")
         print("  registered arena:    0x\(String(address, radix: 16)) + \(length) bytes")
         print("  captured threads:    A=\(stateA.threadCount), B=\(safetyB.threadCount)")
-        print("  restore cycles:      \(cycles)")
-        print("  verified restores:   \(cycles * 2) (target-owned byte validation)")
+        print("  full VM regions:     \(processStateA.info.captured_region_count)")
+        print("  full captured bytes: \(processStateA.info.captured_bytes)")
+        print("  excluded VM regions: \(processStateA.info.excluded_region_count)")
+        print("  restore cycles:      \(fullProcessCycleCount) full-process + \(cycles) arena-only")
+        print(
+            "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
+        )
         print("  safety state B was captured before the first rewind and restored last")
+    }
+
+    private static func captureProcess(session: OpaquePointer) throws -> RemoteProcessCapture {
+        var snapshot: OpaquePointer?
+        var info = continuum_remote_process_snapshot_info()
+        try check(
+            continuum_remote_session_capture_process(
+                session,
+                fullProcessCaptureBudget,
+                &snapshot,
+                &info
+            ),
+            operation: "capture full external process"
+        )
+        guard let snapshot else {
+            throw ExternalHotProofFailure.invariant(
+                "runtime returned a nil full-process snapshot"
+            )
+        }
+        try require(info.captured_region_count > 0, "full-process capture had no regions")
+        try require(info.captured_bytes > 0, "full-process capture had no bytes")
+        try require(info.thread_count > 0, "full-process capture had no threads")
+        try require(info.vm_layout_hash != 0, "full-process capture had no VM hash")
+        try require(info.thread_set_hash != 0, "full-process capture had no thread hash")
+        return RemoteProcessCapture(snapshot: snapshot, info: info)
+    }
+
+    private static func processLayoutDifference(
+        _ left: RemoteProcessCapture,
+        _ right: RemoteProcessCapture
+    ) throws -> String {
+        func regions(
+            _ capture: RemoteProcessCapture
+        ) throws -> [UInt64: continuum_remote_process_region_info] {
+            let count = continuum_remote_process_snapshot_region_count(capture.snapshot)
+            var result: [UInt64: continuum_remote_process_region_info] = [:]
+            for index in 0..<count {
+                var info = continuum_remote_process_region_info()
+                try check(
+                    continuum_remote_process_snapshot_region_info(
+                        capture.snapshot,
+                        index,
+                        &info
+                    ),
+                    operation: "inspect full-process region \(index)"
+                )
+                result[info.address] = info
+            }
+            return result
+        }
+
+        let leftRegions = try regions(left)
+        let rightRegions = try regions(right)
+        let addresses = Set(leftRegions.keys).union(rightRegions.keys).sorted()
+        var changes: [String] = []
+        for address in addresses {
+            let a = leftRegions[address]
+            let b = rightRegions[address]
+            guard
+                a?.length != b?.length
+                    || a?.protection != b?.protection
+                    || a?.maximum_protection != b?.maximum_protection
+                    || a?.inheritance != b?.inheritance
+                    || a?.share_mode != b?.share_mode
+                    || a?.user_tag != b?.user_tag
+            else { continue }
+            let aText =
+                a.map {
+                    "A=\($0.length)b/p\($0.protection)/m\($0.maximum_protection)"
+                        + "/i\($0.inheritance)/s\($0.share_mode)/tag\($0.user_tag)"
+                } ?? "A=missing"
+            let bText =
+                b.map {
+                    "B=\($0.length)b/p\($0.protection)/m\($0.maximum_protection)"
+                        + "/i\($0.inheritance)/s\($0.share_mode)/tag\($0.user_tag)"
+                } ?? "B=missing"
+            changes.append("0x\(String(address, radix: 16)) \(aText) \(bText)")
+            if changes.count == 8 { break }
+        }
+        return changes.isEmpty
+            ? "eligible regions match; an excluded mapping changed" : changes.joined(separator: ", ")
     }
 
     private static func capture(
@@ -118,14 +277,14 @@ enum ExternalHotProof {
         )
 
         guard descriptor.address == expectedAddress,
-              descriptor.length == UInt64(expectedLength),
-              descriptor.mapping_address <= expectedAddress,
-              expectedAddress - descriptor.mapping_address <= descriptor.mapping_length,
-              UInt64(expectedLength)
+            descriptor.length == UInt64(expectedLength),
+            descriptor.mapping_address <= expectedAddress,
+            expectedAddress - descriptor.mapping_address <= descriptor.mapping_length,
+            UInt64(expectedLength)
                 <= descriptor.mapping_length - (expectedAddress - descriptor.mapping_address),
-              ownedBytes.length == expectedLength,
-              let bytePointer = ownedBytes.bytes,
-              let threadSnapshot
+            ownedBytes.length == expectedLength,
+            let bytePointer = ownedBytes.bytes,
+            let threadSnapshot
         else {
             throw ExternalHotProofFailure.invariant(
                 "runtime capture did not return the registered arena and thread evidence"
@@ -187,6 +346,59 @@ enum ExternalHotProof {
         )
     }
 
+    private static func restoreProcess(
+        _ capture: RemoteProcessCapture,
+        into session: OpaquePointer,
+        label: String,
+        cycle: Int
+    ) throws {
+        let started = DispatchTime.now().uptimeNanoseconds
+        var report = continuum_remote_process_restore_report()
+        try check(
+            continuum_remote_session_restore_process(
+                session,
+                capture.snapshot,
+                &report
+            ),
+            operation: "restore full process \(label) on cycle \(cycle)"
+        )
+        try require(
+            report.regions_written > 0
+                && report.regions_written <= capture.info.captured_region_count,
+            "full-process restore \(label) on cycle \(cycle) reported invalid dirty-region coverage"
+        )
+        try require(
+            report.bytes_written > 0
+                && report.bytes_written <= capture.info.captured_bytes,
+            "full-process restore \(label) on cycle \(cycle) reported invalid dirty-page bytes"
+        )
+        try require(
+            report.thread_states_restored == capture.info.thread_count,
+            "full-process restore \(label) on cycle \(cycle) missed a thread"
+        )
+        try require(
+            report.memory_readback_verified == 1,
+            "full-process restore \(label) on cycle \(cycle) lacked readback verification"
+        )
+        try require(
+            report.rollback_attempted == 0,
+            "full-process restore \(label) on cycle \(cycle) unexpectedly needed rollback"
+        )
+        progress(
+            "full-process restore \(label) cycle \(cycle): "
+                + "\(milliseconds(since: started)) ms, \(report.bytes_written) dirty bytes"
+        )
+    }
+
+    private static func milliseconds(since start: UInt64) -> UInt64 {
+        (DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+    }
+
+    private static func progress(_ message: String) {
+        print(message)
+        fflush(stdout)
+    }
+
     private static func validate(
         target: ExternalTargetProcess,
         expected: String,
@@ -205,7 +417,8 @@ enum ExternalHotProof {
 
     private static func check(_ status: continuum_status, operation: String) throws {
         guard status == CONTINUUM_STATUS_OK else {
-            let detail = continuum_status_string(status).map(String.init(cString:))
+            let detail =
+                continuum_status_string(status).map(String.init(cString:))
                 ?? String(describing: status)
             throw ExternalHotProofFailure.runtime(operation: operation, status: detail)
         }
@@ -216,10 +429,10 @@ enum ExternalHotProof {
     }
 
     private static func digest(_ data: Data) -> String {
-        var value: UInt64 = 0xcbf29ce484222325
+        var value: UInt64 = 0xcbf2_9ce4_8422_2325
         for byte in data {
             value ^= UInt64(byte)
-            value &*= 0x100000001b3
+            value &*= 0x100_0000_01b3
         }
         return String(format: "%016llx", value)
     }
@@ -230,6 +443,11 @@ private struct RemoteCapture {
     let bytes: Data
     let digest: String
     let threadCount: Int
+}
+
+private struct RemoteProcessCapture {
+    let snapshot: OpaquePointer
+    let info: continuum_remote_process_snapshot_info
 }
 
 private final class ExternalTargetProcess {
@@ -254,8 +472,8 @@ private final class ExternalTargetProcess {
         let url = URL(fileURLWithPath: expanded).standardizedFileURL
         var isDirectory = ObjCBool(false)
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              !isDirectory.boolValue,
-              FileManager.default.isExecutableFile(atPath: url.path)
+            !isDirectory.boolValue,
+            FileManager.default.isExecutableFile(atPath: url.path)
         else {
             throw ExternalHotProofFailure.target(
                 "target is not an executable file: \(url.path)"
@@ -339,7 +557,8 @@ private final class ExternalTargetProcess {
 
     private func readReply() throws -> TargetReply {
         var line = Data()
-        let deadline = DispatchTime.now().uptimeNanoseconds
+        let deadline =
+            DispatchTime.now().uptimeNanoseconds
             &+ Self.replyTimeoutNanoseconds
         while line.count <= 1_048_576 {
             try waitForProtocolData(until: deadline)
@@ -467,14 +686,14 @@ private enum ExternalHotProofFailure: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case let .invariant(message):
+        case .invariant(let message):
             "External hot proof failed: \(message)."
-        case let .protocolViolation(message):
+        case .protocolViolation(let message):
             "External target protocol violation: \(message)."
-        case let .runtime(operation, status):
+        case .runtime(let operation, let status):
             "External runtime operation '\(operation)' failed with status \(status). "
                 + "No SIP or task-access bypass was attempted."
-        case let .target(message):
+        case .target(let message):
             "External target failed: \(message)."
         }
     }

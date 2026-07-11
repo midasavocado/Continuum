@@ -30,7 +30,9 @@ typedef enum continuum_status {
     CONTINUUM_STATUS_SUSPEND_FAILED = 18,
     CONTINUUM_STATUS_RESUME_FAILED = 19,
     CONTINUUM_STATUS_THREAD_STATE_FAILED = 20,
-    CONTINUUM_STATUS_REGION_MAPPING_CHANGED = 21
+    CONTINUUM_STATUS_REGION_MAPPING_CHANGED = 21,
+    CONTINUUM_STATUS_SNAPSHOT_BUDGET_EXCEEDED = 22,
+    CONTINUUM_STATUS_THREAD_RESTORE_FAILED = 23
 } continuum_status;
 
 typedef struct continuum_runtime_info {
@@ -47,6 +49,7 @@ typedef struct continuum_runtime_info {
 typedef struct continuum_tracked_region continuum_tracked_region;
 typedef struct continuum_remote_session continuum_remote_session;
 typedef struct continuum_remote_thread_snapshot continuum_remote_thread_snapshot;
+typedef struct continuum_remote_process_snapshot continuum_remote_process_snapshot;
 
 typedef struct continuum_remote_identity {
     int32_t process_id;
@@ -78,6 +81,38 @@ typedef struct continuum_remote_restore_report {
     uint8_t rollback_attempted;
     uint8_t rollback_verified;
 } continuum_remote_restore_report;
+
+/// Coverage reported for a full-process hot snapshot. Only readable+writable
+/// SM_PRIVATE/SM_COW mappings are captured; every other mapping is counted as
+/// excluded so callers cannot mistake this for kernel or resource state.
+typedef struct continuum_remote_process_snapshot_info {
+    uint64_t captured_region_count;
+    uint64_t captured_bytes;
+    uint64_t excluded_region_count;
+    uint64_t excluded_bytes;
+    uint64_t thread_count;
+    uint64_t vm_layout_hash;
+    uint64_t thread_set_hash;
+} continuum_remote_process_snapshot_info;
+
+typedef struct continuum_remote_process_restore_report {
+    uint64_t regions_written;
+    uint64_t bytes_written;
+    uint64_t thread_states_restored;
+    uint8_t memory_readback_verified;
+    uint8_t rollback_attempted;
+    uint8_t rollback_verified;
+} continuum_remote_process_restore_report;
+
+typedef struct continuum_remote_process_region_info {
+    uint64_t address;
+    uint64_t length;
+    int32_t protection;
+    int32_t maximum_protection;
+    int32_t inheritance;
+    uint32_t share_mode;
+    uint32_t user_tag;
+} continuum_remote_process_region_info;
 
 typedef struct continuum_remote_thread_state_info {
     uint64_t thread_identifier;
@@ -184,6 +219,43 @@ continuum_status continuum_remote_thread_snapshot_copy_vector_state(
 
 void continuum_remote_thread_snapshot_destroy(
     continuum_remote_thread_snapshot *snapshot
+);
+
+/// Captures every currently mapped readable+writable private/COW region plus
+/// ARM64 general and vector thread state from an external task. The target is
+/// suspended only for the coherent cut. This intentionally excludes file
+/// descriptors, Mach message queues, sockets, WindowServer, GPU, devices, and
+/// kernel state. A zero maximum is invalid; the budget prevents accidental
+/// unbounded allocation when probing a large application.
+continuum_status continuum_remote_session_capture_process(
+    continuum_remote_session *session,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_process_snapshot **out_snapshot,
+    continuum_remote_process_snapshot_info *out_info
+);
+
+/// Restores a full-process hot snapshot into the exact still-running task.
+/// Before writing, Continuum captures an in-memory safety snapshot. VM layout,
+/// process identity, and thread identities must still match. Any failed write,
+/// readback, or thread restore triggers a best-effort validated rollback.
+continuum_status continuum_remote_session_restore_process(
+    continuum_remote_session *session,
+    const continuum_remote_process_snapshot *snapshot,
+    continuum_remote_process_restore_report *out_report
+);
+
+void continuum_remote_process_snapshot_destroy(
+    continuum_remote_process_snapshot *snapshot
+);
+
+size_t continuum_remote_process_snapshot_region_count(
+    const continuum_remote_process_snapshot *snapshot
+);
+
+continuum_status continuum_remote_process_snapshot_region_info(
+    const continuum_remote_process_snapshot *snapshot,
+    size_t index,
+    continuum_remote_process_region_info *out_info
 );
 
 void continuum_owned_buffer_destroy(continuum_owned_buffer *buffer);

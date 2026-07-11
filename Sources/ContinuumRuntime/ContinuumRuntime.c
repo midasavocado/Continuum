@@ -11,10 +11,11 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define CONTINUUM_WRITE_CHUNK_SIZE (1024U * 1024U)
+#define CONTINUUM_WRITE_CHUNK_SIZE (64U * 1024U * 1024U)
 #define CONTINUUM_FNV_OFFSET UINT64_C(1469598103934665603)
 #define CONTINUUM_FNV_PRIME UINT64_C(1099511628211)
 #define CONTINUUM_RESUME_ATTEMPT_LIMIT 3U
@@ -34,6 +35,20 @@ typedef struct continuum_remote_thread_entry {
     uint8_t *vector_bytes;
     size_t vector_length;
 } continuum_remote_thread_entry;
+
+typedef struct continuum_remote_process_region {
+    uint64_t address;
+    uint64_t length;
+    int32_t protection;
+    int32_t maximum_protection;
+    int32_t inheritance;
+    uint32_t share_mode;
+    uint32_t user_tag;
+    uint8_t *bytes;
+    int *page_dispositions;
+    size_t page_count;
+    uint8_t is_cow_mapping;
+} continuum_remote_process_region;
 
 struct continuum_tracked_region {
     uint8_t *address;
@@ -60,12 +75,30 @@ struct continuum_remote_thread_snapshot {
     uint64_t set_hash;
 };
 
+struct continuum_remote_process_snapshot {
+    continuum_remote_identity identity;
+    continuum_remote_process_region *regions;
+    size_t region_count;
+    continuum_remote_thread_snapshot *threads;
+    continuum_remote_process_snapshot_info info;
+};
+
 static int continuum_add_u64(uint64_t left, uint64_t right, uint64_t *result) {
     if (result == NULL || UINT64_MAX - left < right) {
         return 0;
     }
     *result = left + right;
     return 1;
+}
+
+static void continuum_hash_u64(uint64_t *hash, uint64_t value) {
+    if (hash == NULL) {
+        return;
+    }
+    for (size_t byte = 0; byte < sizeof(value); byte += 1) {
+        *hash ^= (value >> (byte * 8)) & UINT64_C(0xFF);
+        *hash *= CONTINUUM_FNV_PRIME;
+    }
 }
 
 static int continuum_identity_equal(
@@ -81,6 +114,12 @@ static int continuum_identity_equal(
 
 static int continuum_is_private_or_cow_share_mode(uint32_t share_mode) {
     return share_mode == SM_PRIVATE || share_mode == SM_COW;
+}
+
+static uint32_t continuum_canonical_share_mode(uint32_t share_mode) {
+    return continuum_is_private_or_cow_share_mode(share_mode)
+        ? UINT32_C(1)
+        : share_mode;
 }
 
 static continuum_status continuum_read_process_identity(
@@ -495,6 +534,697 @@ static continuum_status continuum_capture_thread_snapshot(
     *out_snapshot = snapshot;
     return CONTINUUM_STATUS_OK;
 #endif
+}
+
+void continuum_remote_process_snapshot_destroy(
+    continuum_remote_process_snapshot *snapshot
+) {
+    if (snapshot == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < snapshot->region_count; index += 1) {
+        continuum_remote_process_region *region = &snapshot->regions[index];
+        if (region->bytes != NULL) {
+            if (region->is_cow_mapping) {
+                (void)mach_vm_deallocate(
+                    mach_task_self(),
+                    (mach_vm_address_t)(uintptr_t)region->bytes,
+                    region->length
+                );
+            } else {
+                memset(region->bytes, 0, (size_t)region->length);
+                free(region->bytes);
+            }
+        }
+        free(region->page_dispositions);
+        memset(region, 0, sizeof(*region));
+    }
+    free(snapshot->regions);
+    continuum_remote_thread_snapshot_destroy(snapshot->threads);
+    memset(snapshot, 0, sizeof(*snapshot));
+    free(snapshot);
+}
+
+size_t continuum_remote_process_snapshot_region_count(
+    const continuum_remote_process_snapshot *snapshot
+) {
+    return snapshot == NULL ? 0 : snapshot->region_count;
+}
+
+continuum_status continuum_remote_process_snapshot_region_info(
+    const continuum_remote_process_snapshot *snapshot,
+    size_t index,
+    continuum_remote_process_region_info *out_info
+) {
+    if (snapshot == NULL || out_info == NULL || index >= snapshot->region_count) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    const continuum_remote_process_region *region = &snapshot->regions[index];
+    out_info->address = region->address;
+    out_info->length = region->length;
+    out_info->protection = region->protection;
+    out_info->maximum_protection = region->maximum_protection;
+    out_info->inheritance = region->inheritance;
+    out_info->share_mode = region->share_mode;
+    out_info->user_tag = region->user_tag;
+    return CONTINUUM_STATUS_OK;
+}
+
+static int continuum_process_region_metadata_equal(
+    const continuum_remote_process_region *left,
+    const continuum_remote_process_region *right
+) {
+    return left != NULL && right != NULL
+        && left->address == right->address
+        && left->length == right->length
+        && left->protection == right->protection
+        && left->maximum_protection == right->maximum_protection
+        && left->inheritance == right->inheritance
+        && continuum_canonical_share_mode(left->share_mode)
+            == continuum_canonical_share_mode(right->share_mode)
+        && left->user_tag == right->user_tag;
+}
+
+static continuum_status continuum_query_page_dispositions(
+    mach_port_t task,
+    mach_vm_address_t address,
+    mach_vm_size_t length,
+    int *dispositions,
+    size_t page_count
+) {
+    if (task == MACH_PORT_NULL || address == 0 || length == 0
+        || dispositions == NULL || page_count == 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+
+    mach_vm_size_t returned_count = page_count;
+    kern_return_t result = mach_vm_page_range_query(
+        task,
+        address,
+        length,
+        (mach_vm_address_t)(uintptr_t)dispositions,
+        &returned_count
+    );
+    if (result != KERN_SUCCESS || returned_count != page_count) {
+        return CONTINUUM_STATUS_MACH_ERROR;
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+static continuum_status continuum_capture_process_snapshot_suspended(
+    continuum_remote_session *session,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_process_snapshot **out_snapshot
+) {
+    if (session == NULL || out_snapshot == NULL || maximum_captured_bytes == 0
+        || session->is_self || session->task == MACH_PORT_NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_snapshot = NULL;
+
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    continuum_remote_process_snapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (snapshot == NULL) {
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+    snapshot->identity = session->identity;
+    snapshot->info.vm_layout_hash = CONTINUUM_FNV_OFFSET;
+
+    size_t capacity = 0;
+    mach_vm_address_t address = 0;
+    natural_t depth = 0;
+    for (;;) {
+        mach_vm_size_t region_size = 0;
+        vm_region_submap_info_data_64_t info;
+        memset(&info, 0, sizeof(info));
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t result = mach_vm_region_recurse(
+            session->task,
+            &address,
+            &region_size,
+            &depth,
+            (vm_region_recurse_info_t)&info,
+            &count
+        );
+        if (result == KERN_INVALID_ADDRESS) {
+            break;
+        }
+        if (result != KERN_SUCCESS || region_size == 0) {
+            status = CONTINUUM_STATUS_MACH_ERROR;
+            break;
+        }
+        if (info.is_submap) {
+            depth += 1;
+            continue;
+        }
+
+        const int eligible =
+            (info.protection & (VM_PROT_READ | VM_PROT_WRITE))
+                == (VM_PROT_READ | VM_PROT_WRITE)
+            && continuum_is_private_or_cow_share_mode(info.share_mode);
+        continuum_hash_u64(&snapshot->info.vm_layout_hash, address);
+        continuum_hash_u64(&snapshot->info.vm_layout_hash, region_size);
+        continuum_hash_u64(
+            &snapshot->info.vm_layout_hash,
+            (uint64_t)(uint32_t)info.protection
+        );
+        continuum_hash_u64(
+            &snapshot->info.vm_layout_hash,
+            (uint64_t)(uint32_t)info.max_protection
+        );
+        continuum_hash_u64(
+            &snapshot->info.vm_layout_hash,
+            (uint64_t)(uint32_t)info.inheritance
+        );
+        continuum_hash_u64(
+            &snapshot->info.vm_layout_hash,
+            continuum_canonical_share_mode(info.share_mode)
+        );
+        continuum_hash_u64(&snapshot->info.vm_layout_hash, info.user_tag);
+        continuum_hash_u64(&snapshot->info.vm_layout_hash, (uint64_t)eligible);
+
+        if (eligible) {
+            uint64_t total = 0;
+            if (!continuum_add_u64(
+                    snapshot->info.captured_bytes,
+                    region_size,
+                    &total
+                )) {
+                status = CONTINUUM_STATUS_RANGE_ERROR;
+                break;
+            }
+            if (total > maximum_captured_bytes || region_size > SIZE_MAX) {
+                status = CONTINUUM_STATUS_SNAPSHOT_BUDGET_EXCEEDED;
+                break;
+            }
+            if (snapshot->region_count == capacity) {
+                size_t new_capacity = capacity == 0 ? 32 : capacity * 2;
+                if (new_capacity < capacity
+                    || new_capacity > SIZE_MAX / sizeof(*snapshot->regions)) {
+                    status = CONTINUUM_STATUS_RANGE_ERROR;
+                    break;
+                }
+                continuum_remote_process_region *resized = realloc(
+                    snapshot->regions,
+                    new_capacity * sizeof(*snapshot->regions)
+                );
+                if (resized == NULL) {
+                    status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+                    break;
+                }
+                memset(
+                    resized + capacity,
+                    0,
+                    (new_capacity - capacity) * sizeof(*snapshot->regions)
+                );
+                snapshot->regions = resized;
+                capacity = new_capacity;
+            }
+
+            continuum_remote_process_region *region =
+                &snapshot->regions[snapshot->region_count];
+            region->address = address;
+            region->length = region_size;
+            region->protection = info.protection;
+            region->maximum_protection = info.max_protection;
+            region->inheritance = info.inheritance;
+            region->share_mode = info.share_mode;
+            region->user_tag = info.user_tag;
+            snapshot->region_count += 1;
+            const size_t page_size = (size_t)getpagesize();
+            region->page_count = (size_t)(region_size / page_size);
+            if (region_size % page_size != 0) {
+                region->page_count += 1;
+            }
+            if (region->page_count == 0
+                || region->page_count > SIZE_MAX / sizeof(int)) {
+                status = CONTINUUM_STATUS_RANGE_ERROR;
+                break;
+            }
+            region->page_dispositions = calloc(
+                region->page_count,
+                sizeof(*region->page_dispositions)
+            );
+            if (region->page_dispositions == NULL) {
+                status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+                break;
+            }
+            status = continuum_query_page_dispositions(
+                session->task,
+                address,
+                region_size,
+                region->page_dispositions,
+                region->page_count
+            );
+            if (status != CONTINUUM_STATUS_OK) {
+                break;
+            }
+
+            mach_vm_address_t snapshot_address = 0;
+            vm_prot_t current_protection = VM_PROT_NONE;
+            vm_prot_t maximum_protection = VM_PROT_NONE;
+            kern_return_t remap_result = mach_vm_remap(
+                mach_task_self(),
+                &snapshot_address,
+                region_size,
+                0,
+                VM_FLAGS_ANYWHERE,
+                session->task,
+                address,
+                TRUE,
+                &current_protection,
+                &maximum_protection,
+                VM_INHERIT_NONE
+            );
+            if (remap_result != KERN_SUCCESS || snapshot_address == 0) {
+                status = CONTINUUM_STATUS_MACH_ERROR;
+                break;
+            }
+            remap_result = mach_vm_protect(
+                mach_task_self(),
+                snapshot_address,
+                region_size,
+                FALSE,
+                VM_PROT_READ
+            );
+            if (remap_result != KERN_SUCCESS) {
+                (void)mach_vm_deallocate(
+                    mach_task_self(),
+                    snapshot_address,
+                    region_size
+                );
+                status = CONTINUUM_STATUS_MACH_ERROR;
+                break;
+            }
+            region->bytes = (uint8_t *)(uintptr_t)snapshot_address;
+            region->is_cow_mapping = 1;
+
+            int *post_capture_dispositions = calloc(
+                region->page_count,
+                sizeof(*post_capture_dispositions)
+            );
+            if (post_capture_dispositions == NULL) {
+                status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+                break;
+            }
+            status = continuum_query_page_dispositions(
+                session->task,
+                address,
+                region_size,
+                post_capture_dispositions,
+                region->page_count
+            );
+            if (status == CONTINUUM_STATUS_OK) {
+                for (size_t page = 0; page < region->page_count; page += 1) {
+                    region->page_dispositions[page]
+                        |= post_capture_dispositions[page];
+                }
+            }
+            free(post_capture_dispositions);
+            if (status != CONTINUUM_STATUS_OK) {
+                break;
+            }
+
+            snapshot->info.captured_region_count += 1;
+            snapshot->info.captured_bytes = total;
+        } else {
+            uint64_t total = 0;
+            if (!continuum_add_u64(
+                    snapshot->info.excluded_bytes,
+                    region_size,
+                    &total
+                )) {
+                status = CONTINUUM_STATUS_RANGE_ERROR;
+                break;
+            }
+            snapshot->info.excluded_region_count += 1;
+            snapshot->info.excluded_bytes = total;
+        }
+
+        if (UINT64_MAX - address < region_size) {
+            break;
+        }
+        address += region_size;
+    }
+
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_capture_thread_snapshot(
+            session->task,
+            &snapshot->threads
+        );
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        snapshot->info.thread_count = snapshot->threads->count;
+        snapshot->info.thread_set_hash = snapshot->threads->set_hash;
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        continuum_remote_process_snapshot_destroy(snapshot);
+        return status;
+    }
+
+    *out_snapshot = snapshot;
+    return CONTINUUM_STATUS_OK;
+}
+
+static void continuum_prewarm_process_snapshot(
+    const continuum_remote_process_snapshot *snapshot
+) {
+    if (snapshot == NULL) {
+        return;
+    }
+    const size_t page_size = (size_t)getpagesize();
+    volatile uint8_t sink = 0;
+    for (size_t index = 0; index < snapshot->region_count; index += 1) {
+        const continuum_remote_process_region *region = &snapshot->regions[index];
+        if (region->bytes == NULL || region->length == 0) {
+            continue;
+        }
+        (void)madvise(region->bytes, (size_t)region->length, MADV_WILLNEED);
+        for (uint64_t offset = 0; offset < region->length; offset += page_size) {
+            sink ^= region->bytes[offset];
+        }
+    }
+    (void)sink;
+}
+
+typedef struct continuum_remote_thread_port_entry {
+    uint64_t identifier;
+    thread_act_t port;
+} continuum_remote_thread_port_entry;
+
+static int continuum_thread_port_entry_compare(const void *left, const void *right) {
+    const continuum_remote_thread_port_entry *left_entry = left;
+    const continuum_remote_thread_port_entry *right_entry = right;
+    if (left_entry->identifier < right_entry->identifier) {
+        return -1;
+    }
+    if (left_entry->identifier > right_entry->identifier) {
+        return 1;
+    }
+    return 0;
+}
+
+static continuum_status continuum_restore_thread_snapshot(
+    mach_port_t task,
+    const continuum_remote_thread_snapshot *snapshot,
+    uint64_t *out_restored_count
+) {
+    if (task == MACH_PORT_NULL || snapshot == NULL || out_restored_count == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_restored_count = 0;
+
+#if !defined(__arm64__)
+    return CONTINUUM_STATUS_UNSUPPORTED_ARCHITECTURE;
+#else
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t thread_count = 0;
+    kern_return_t result = task_threads(task, &threads, &thread_count);
+    if (result != KERN_SUCCESS) {
+        return CONTINUUM_STATUS_THREAD_STATE_FAILED;
+    }
+
+    continuum_status status = CONTINUUM_STATUS_OK;
+    continuum_remote_thread_port_entry *entries = NULL;
+    if ((size_t)thread_count != snapshot->count) {
+        status = CONTINUUM_STATUS_THREAD_SET_CHANGED;
+    } else if (thread_count > 0) {
+        entries = calloc(thread_count, sizeof(*entries));
+        if (entries == NULL) {
+            status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+        }
+    }
+
+    for (mach_msg_type_number_t index = 0;
+         status == CONTINUUM_STATUS_OK && index < thread_count;
+         index += 1) {
+        thread_identifier_info_data_t identifier_info;
+        mach_msg_type_number_t identifier_count = THREAD_IDENTIFIER_INFO_COUNT;
+        result = thread_info(
+            threads[index],
+            THREAD_IDENTIFIER_INFO,
+            (thread_info_t)&identifier_info,
+            &identifier_count
+        );
+        if (result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
+            break;
+        }
+        entries[index].identifier = identifier_info.thread_id;
+        entries[index].port = threads[index];
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        qsort(entries, thread_count, sizeof(*entries), continuum_thread_port_entry_compare);
+        for (mach_msg_type_number_t index = 0; index < thread_count; index += 1) {
+            if (entries[index].identifier != snapshot->entries[index].identifier) {
+                status = CONTINUUM_STATUS_THREAD_SET_CHANGED;
+                break;
+            }
+        }
+    }
+
+    for (mach_msg_type_number_t index = 0;
+         status == CONTINUUM_STATUS_OK && index < thread_count;
+         index += 1) {
+        const continuum_remote_thread_entry *saved = &snapshot->entries[index];
+        mach_msg_type_number_t vector_count =
+            (mach_msg_type_number_t)(saved->vector_length / sizeof(natural_t));
+        result = thread_set_state(
+            entries[index].port,
+            saved->vector_flavor,
+            (thread_state_t)saved->vector_bytes,
+            vector_count
+        );
+        if (result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_THREAD_RESTORE_FAILED;
+            break;
+        }
+
+        mach_msg_type_number_t general_count =
+            (mach_msg_type_number_t)(saved->general_length / sizeof(natural_t));
+        result = thread_set_state(
+            entries[index].port,
+            saved->general_flavor,
+            (thread_state_t)saved->general_bytes,
+            general_count
+        );
+        if (result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_THREAD_RESTORE_FAILED;
+            break;
+        }
+        *out_restored_count += 1;
+    }
+
+    free(entries);
+    for (mach_msg_type_number_t index = 0; index < thread_count; index += 1) {
+        mach_port_deallocate(mach_task_self(), threads[index]);
+    }
+    if (threads != NULL) {
+        vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)threads,
+            (vm_size_t)(thread_count * sizeof(thread_act_t))
+        );
+    }
+    return status;
+#endif
+}
+
+static continuum_status continuum_validate_process_snapshot_layout(
+    const continuum_remote_process_snapshot *current,
+    const continuum_remote_process_snapshot *saved
+) {
+    if (current == NULL || saved == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!continuum_identity_equal(&current->identity, &saved->identity)) {
+        return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    }
+    if (current->region_count != saved->region_count
+        || current->info.captured_region_count != saved->info.captured_region_count
+        || current->info.captured_bytes != saved->info.captured_bytes
+        || current->info.excluded_region_count != saved->info.excluded_region_count
+        || current->info.excluded_bytes != saved->info.excluded_bytes
+        || current->info.vm_layout_hash != saved->info.vm_layout_hash) {
+        return CONTINUUM_STATUS_REGION_MAPPING_CHANGED;
+    }
+    if (current->info.thread_count != saved->info.thread_count
+        || current->info.thread_set_hash != saved->info.thread_set_hash) {
+        return CONTINUUM_STATUS_THREAD_SET_CHANGED;
+    }
+    for (size_t index = 0; index < saved->region_count; index += 1) {
+        if (!continuum_process_region_metadata_equal(
+                &current->regions[index],
+                &saved->regions[index]
+            )) {
+            return CONTINUUM_STATUS_REGION_MAPPING_CHANGED;
+        }
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+static continuum_status continuum_apply_process_snapshot(
+    mach_port_t task,
+    const continuum_remote_process_snapshot *snapshot,
+    const continuum_remote_process_snapshot *current,
+    continuum_remote_process_restore_report *out_report
+) {
+    if (task == MACH_PORT_NULL || snapshot == NULL || current == NULL
+        || out_report == NULL || snapshot->region_count != current->region_count) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_report, 0, sizeof(*out_report));
+
+    const size_t page_size = (size_t)getpagesize();
+
+    continuum_status status = CONTINUUM_STATUS_OK;
+    for (size_t index = 0;
+        status == CONTINUUM_STATUS_OK && index < snapshot->region_count;
+         index += 1) {
+        const continuum_remote_process_region *region = &snapshot->regions[index];
+        const continuum_remote_process_region *current_region =
+            &current->regions[index];
+        if (!continuum_process_region_metadata_equal(region, current_region)
+            || region->bytes == NULL
+            || region->page_dispositions == NULL
+            || current_region->bytes == NULL
+            || current_region->page_dispositions == NULL
+            || region->page_count != current_region->page_count) {
+            status = CONTINUUM_STATUS_REGION_MAPPING_CHANGED;
+            break;
+        }
+
+        int region_written = 0;
+        size_t page = 0;
+        while (page < region->page_count) {
+            uint64_t offset = (uint64_t)page * page_size;
+            size_t length = (size_t)((region->length - offset) < page_size
+                ? (region->length - offset)
+                : page_size);
+            if (memcmp(
+                    region->bytes + offset,
+                    current_region->bytes + offset,
+                    length
+                ) == 0) {
+                page += 1;
+                continue;
+            }
+
+            const size_t run_start_page = page;
+            page += 1;
+            while (page < region->page_count) {
+                offset = (uint64_t)page * page_size;
+                length = (size_t)((region->length - offset) < page_size
+                    ? (region->length - offset)
+                    : page_size);
+                if (memcmp(
+                        region->bytes + offset,
+                        current_region->bytes + offset,
+                        length
+                    ) == 0) {
+                    break;
+                }
+                page += 1;
+            }
+
+            const uint64_t run_offset = (uint64_t)run_start_page * page_size;
+            const uint64_t run_end = ((uint64_t)page * page_size) < region->length
+                ? (uint64_t)page * page_size
+                : region->length;
+            const size_t run_length = (size_t)(run_end - run_offset);
+            uint64_t written = 0;
+            status = continuum_write_task_bytes(
+                task,
+                region->address + run_offset,
+                region->bytes + run_offset,
+                run_length,
+                &written
+            );
+            out_report->bytes_written += written;
+            if (status != CONTINUUM_STATUS_OK || written != run_length) {
+                if (status == CONTINUUM_STATUS_OK) {
+                    status = CONTINUUM_STATUS_SHORT_WRITE;
+                }
+                break;
+            }
+            region_written = 1;
+        }
+        if (region_written) {
+            out_report->regions_written += 1;
+        }
+
+        if (status == CONTINUUM_STATUS_OK && region_written) {
+            mach_vm_address_t verification_address = 0;
+            vm_prot_t current_protection = VM_PROT_NONE;
+            vm_prot_t maximum_protection = VM_PROT_NONE;
+            kern_return_t result = mach_vm_remap(
+                mach_task_self(),
+                &verification_address,
+                region->length,
+                0,
+                VM_FLAGS_ANYWHERE,
+                task,
+                region->address,
+                FALSE,
+                &current_protection,
+                &maximum_protection,
+                VM_INHERIT_NONE
+            );
+            if (result != KERN_SUCCESS || verification_address == 0) {
+                status = CONTINUUM_STATUS_MACH_ERROR;
+                break;
+            }
+            result = mach_vm_protect(
+                mach_task_self(),
+                verification_address,
+                region->length,
+                FALSE,
+                VM_PROT_READ
+            );
+            if (result != KERN_SUCCESS) {
+                status = CONTINUUM_STATUS_MACH_ERROR;
+            } else {
+                const uint8_t *verified =
+                    (const uint8_t *)(uintptr_t)verification_address;
+                for (page = 0; page < region->page_count; page += 1) {
+                    uint64_t offset = (uint64_t)page * page_size;
+                    size_t length = (size_t)((region->length - offset) < page_size
+                        ? (region->length - offset)
+                        : page_size);
+                    if (memcmp(
+                            region->bytes + offset,
+                            current_region->bytes + offset,
+                            length
+                        ) != 0
+                        && memcmp(region->bytes + offset, verified + offset, length)
+                            != 0) {
+                        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                        break;
+                    }
+                }
+            }
+            (void)mach_vm_deallocate(
+                mach_task_self(),
+                verification_address,
+                region->length
+            );
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        out_report->memory_readback_verified = 1;
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_restore_thread_snapshot(
+            task,
+            snapshot->threads,
+            &out_report->thread_states_restored
+        );
+    }
+    return status;
 }
 
 static continuum_status continuum_discharge_owned_suspensions(
@@ -945,6 +1675,130 @@ continuum_status continuum_remote_session_capture(
     return CONTINUUM_STATUS_OK;
 }
 
+continuum_status continuum_remote_session_capture_process(
+    continuum_remote_session *session,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_process_snapshot **out_snapshot,
+    continuum_remote_process_snapshot_info *out_info
+) {
+    if (session == NULL || out_snapshot == NULL || out_info == NULL
+        || maximum_captured_bytes == 0 || session->is_self) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_snapshot = NULL;
+    memset(out_info, 0, sizeof(*out_info));
+
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    continuum_remote_process_snapshot *snapshot = NULL;
+    status = continuum_capture_process_snapshot_suspended(
+        session,
+        maximum_captured_bytes,
+        &snapshot
+    );
+
+    continuum_status resume_status = continuum_resume_session(session, did_suspend);
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        status = resume_status;
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        continuum_remote_process_snapshot_destroy(snapshot);
+        return status;
+    }
+
+    // The coherent cut is complete and the target is already running again.
+    // Fault historical COW views into the guardian now so later restores do
+    // not pay thousands of mapping faults while the app is frozen.
+    continuum_prewarm_process_snapshot(snapshot);
+
+    *out_info = snapshot->info;
+    *out_snapshot = snapshot;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_session_restore_process(
+    continuum_remote_session *session,
+    const continuum_remote_process_snapshot *snapshot,
+    continuum_remote_process_restore_report *out_report
+) {
+    if (session == NULL || snapshot == NULL || out_report == NULL
+        || session->is_self || snapshot->info.captured_bytes == 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_report, 0, sizeof(*out_report));
+
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+    if (!continuum_identity_equal(&session->identity, &snapshot->identity)) {
+        return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    }
+
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    continuum_remote_process_snapshot *safety = NULL;
+    status = continuum_capture_process_snapshot_suspended(
+        session,
+        snapshot->info.captured_bytes,
+        &safety
+    );
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_validate_process_snapshot_layout(safety, snapshot);
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_apply_process_snapshot(
+            session->task,
+            snapshot,
+            safety,
+            out_report
+        );
+    }
+
+    if (status != CONTINUUM_STATUS_OK && safety != NULL
+        && (out_report->bytes_written > 0
+            || out_report->thread_states_restored > 0)) {
+        continuum_status original_status = status;
+        out_report->rollback_attempted = 1;
+        continuum_remote_process_restore_report rollback_report;
+        continuum_status rollback_status = continuum_apply_process_snapshot(
+            session->task,
+            safety,
+            snapshot,
+            &rollback_report
+        );
+        if (rollback_status == CONTINUUM_STATUS_OK
+            && rollback_report.memory_readback_verified == 1
+            && rollback_report.thread_states_restored
+                == safety->info.thread_count) {
+            out_report->rollback_verified = 1;
+            status = original_status;
+        } else {
+            status = CONTINUUM_STATUS_ROLLBACK_FAILED;
+        }
+    }
+
+    continuum_remote_process_snapshot_destroy(safety);
+    continuum_status resume_status = continuum_resume_session(session, did_suspend);
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        return resume_status;
+    }
+    return status;
+}
+
 continuum_status continuum_remote_session_restore(
     continuum_remote_session *session,
     const continuum_remote_region_descriptor *descriptor,
@@ -1256,6 +2110,10 @@ const char *continuum_status_string(continuum_status status) {
             return "thread state capture failed";
         case CONTINUUM_STATUS_REGION_MAPPING_CHANGED:
             return "registered virtual-memory mapping changed";
+        case CONTINUUM_STATUS_SNAPSHOT_BUDGET_EXCEEDED:
+            return "process snapshot exceeded its capture budget";
+        case CONTINUUM_STATUS_THREAD_RESTORE_FAILED:
+            return "thread register restore failed";
     }
     return "unknown status";
 }

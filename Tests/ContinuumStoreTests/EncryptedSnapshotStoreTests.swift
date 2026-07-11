@@ -6,6 +6,58 @@ import XCTest
 final class EncryptedSnapshotStoreTests: XCTestCase {
     private let key = Data(repeating: 0x42, count: 32)
 
+    func testAPFSFileCheckpointRestoresBytesWithoutReplacingLiveInode() async throws {
+        try await withTemporaryDirectory { root in
+            let live = root.appendingPathComponent("live.txt")
+            try Data("before".utf8).write(to: live)
+            let inodeBefore = try FileManager.default.attributesOfItem(
+                atPath: live.path
+            )[.systemFileNumber] as? NSNumber
+
+            let store = try APFSLocalFileCheckpointStore(
+                rootURL: root.appendingPathComponent("file-checkpoints")
+            )
+            let snapshotID = UUID()
+            let manifest = try await store.capture(
+                snapshotID: snapshotID,
+                files: [live]
+            )
+            XCTAssertEqual(manifest.entries.count, 1)
+
+            try Data("future-state".utf8).write(to: live)
+            let report = try await store.restore(snapshotID: snapshotID)
+            XCTAssertEqual(report.restoredFileCount, 1)
+            XCTAssertEqual(try Data(contentsOf: live), Data("before".utf8))
+
+            let inodeAfter = try FileManager.default.attributesOfItem(
+                atPath: live.path
+            )[.systemFileNumber] as? NSNumber
+            XCTAssertEqual(inodeAfter, inodeBefore)
+        }
+    }
+
+    func testAPFSFileCheckpointRefusesAReplacedLiveInode() async throws {
+        try await withTemporaryDirectory { root in
+            let live = root.appendingPathComponent("live.txt")
+            try Data("before".utf8).write(to: live)
+            let store = try APFSLocalFileCheckpointStore(
+                rootURL: root.appendingPathComponent("file-checkpoints")
+            )
+            let snapshotID = UUID()
+            _ = try await store.capture(snapshotID: snapshotID, files: [live])
+
+            try FileManager.default.removeItem(at: live)
+            try Data("replacement".utf8).write(to: live)
+
+            do {
+                _ = try await store.restore(snapshotID: snapshotID)
+                XCTFail("Replacing a vnode must invalidate exact in-place restore")
+            } catch let error as LocalFileCheckpointError {
+                XCTAssertEqual(error, .fileIdentityChanged(live.path))
+            }
+        }
+    }
+
     func testContentAddressedChunksDeduplicateAndRoundTripArtifactMetadata() async throws {
         try await withTemporaryDirectory { root in
             let store = try EncryptedSnapshotStore(rootURL: root, encryptionKey: key)

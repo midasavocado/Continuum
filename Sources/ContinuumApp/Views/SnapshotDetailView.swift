@@ -1,5 +1,5 @@
-import SwiftUI
 import ContinuumCore
+import SwiftUI
 
 struct SnapshotDetailView: View {
     let snapshot: SnapshotRecord
@@ -44,6 +44,7 @@ struct SnapshotDetailView: View {
                 }
 
                 detailsCard
+                localStateCard
                 notesCard
                 actionBar
             }
@@ -55,7 +56,9 @@ struct SnapshotDetailView: View {
             Button("Cancel", role: .cancel) {}
             Button("Delete Snapshot", role: .destructive, action: onDelete)
         } message: {
-            Text("Continuum will remove this saved moment. Shared data used by another snapshot or branch stays safe.")
+            Text(
+                "Continuum will remove this saved moment. Shared data used by another snapshot or branch stays safe."
+            )
         }
     }
 
@@ -65,14 +68,17 @@ struct SnapshotDetailView: View {
                 .font(.system(size: 28))
                 .foregroundStyle(snapshot.kind.continuumTint)
                 .frame(width: 42, height: 42)
-                .background(snapshot.kind.continuumTint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                .background(
+                    snapshot.kind.continuumTint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(snapshot.name)
                     .font(.title.weight(.semibold))
                     .textSelection(.enabled)
-                Text("\(snapshot.app.displayName) • \(snapshot.createdAt.formatted(date: .long, time: .standard))")
-                    .foregroundStyle(.secondary)
+                Text(
+                    "\(snapshot.app.displayName) • \(snapshot.createdAt.formatted(date: .long, time: .standard))"
+                )
+                .foregroundStyle(.secondary)
             }
 
             Spacer()
@@ -89,9 +95,11 @@ struct SnapshotDetailView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("This state cannot be restored")
                         .font(.headline)
-                    Text("The metadata remains available for context, but Continuum will not present a screenshot or visual replay as if the app itself had returned.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        "The metadata remains available for context, but Continuum will not present a screenshot or visual replay as if the app itself had returned."
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -107,10 +115,45 @@ struct SnapshotDetailView: View {
                 detailRow("Type", value: snapshot.kind.displayName)
                 detailRow("Restore", value: snapshot.availability.displayName)
                 detailRow("Processes", value: snapshot.checkpoint.processIdentifiers.count.formatted())
+                detailRow("Scope", value: "This app + helpers")
                 detailRow("Threads", value: snapshot.checkpoint.threadCount.formatted())
                 detailRow("Stored", value: continuumByteCount(snapshot.uniqueBytes))
                 detailRow("Logical state", value: continuumByteCount(snapshot.logicalBytes))
                 detailRow("Validation", value: validationTitle)
+            }
+        }
+    }
+
+    private var localStateCard: some View {
+        SurfaceCard {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Local file rewind", systemImage: "internaldrive")
+                    .font(.headline)
+
+                detailRow(
+                    "Default",
+                    value: snapshot.effectiveLocalFileCoverage.displayName
+                )
+
+                if snapshot.isKeepingCurrentFilesCertified {
+                    Text(
+                        "You can choose App Only when opening this state. Continuum still saves the current app and file state first."
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                } else if snapshot.effectiveLocalFileCoverage == .exact {
+                    Text(
+                        "App Only is disabled because old memory with newer files could corrupt this app. The exact restore rewinds captured local files with it."
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                } else {
+                    Text(
+                        "This snapshot has no certified file root. Continuum will not call it an exact restorable state until app-owned files and databases are captured together."
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -160,7 +203,7 @@ struct SnapshotDetailView: View {
             if snapshot.availability != .unavailable {
                 VStack(alignment: .trailing, spacing: 3) {
                     Button(
-                        snapshot.availability == .instant ? "Restore Snapshot" : "Restore by Replay",
+                        snapshot.availability == .instant ? "Open App From Here" : "Open by Replay",
                         systemImage: snapshot.availability == .instant ? "bolt.fill" : "play.fill",
                         action: onRestore
                     )
