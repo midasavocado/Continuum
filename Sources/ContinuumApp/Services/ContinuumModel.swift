@@ -219,6 +219,43 @@ final class ContinuumModel {
         }
     }
 
+    func restore(snapshotID: SnapshotID) async {
+        await performAction {
+            guard let snapshot = self.snapshots.first(where: {
+                $0.id == snapshotID
+            }) else {
+                throw ContinuumError.snapshotNotFound
+            }
+            guard snapshot.availability != .unavailable else {
+                throw ContinuumError.restoreUnavailable(
+                    "This snapshot no longer has a live restorable process."
+                )
+            }
+
+            self.rewindPhase = .restoring(snapshotID)
+            let artifacts = try await self.repository.artifacts(for: snapshotID)
+            let result = await self.checkpointCapturer.restore(
+                snapshot: snapshot,
+                artifacts: artifacts
+            )
+            switch result {
+            case .exactLocal, .experimentalHot:
+                self.onlineWarning = snapshot.externalEffects.isEmpty
+                    ? nil
+                    : snapshot.externalEffects
+            case let .exactLocalWithOnlineWarning(effects):
+                self.onlineWarning = effects.isEmpty ? snapshot.externalEffects : effects
+            case let .failed(detail):
+                self.rewindPhase = .failed(detail)
+                throw ContinuumError.restoreUnavailable(detail)
+            }
+
+            self.selectedSnapshotID = snapshotID
+            self.rewindPhase = .completed(snapshotID)
+            try await self.refreshIndex()
+        }
+    }
+
     func commitRewind(target targetSnapshotID: SnapshotID) async {
         await performAction {
             try await self.performCommitRewind(target: targetSnapshotID)
@@ -774,7 +811,25 @@ final class ContinuumModel {
             discoveredApplications + explicitApplications + loadedSetups.map(\.app)
         )
 
-        await apply(index: loadedIndex)
+        var recoveredIndex = loadedIndex
+        for provisional in loadedIndex.provisionalRewinds {
+            guard let safetySnapshot = loadedIndex.snapshots.first(where: {
+                $0.id == provisional.safetySnapshotID
+            }) else {
+                try await repository.cancelRewind(provisional.id)
+                recoveredIndex = try await repository.loadIndex()
+                continue
+            }
+            let availability = await checkpointCapturer.currentRestoreAvailability(
+                for: safetySnapshot
+            )
+            if availability == .unavailable {
+                try await repository.cancelRewind(provisional.id)
+                recoveredIndex = try await repository.loadIndex()
+            }
+        }
+
+        await apply(index: recoveredIndex)
         runningProcesses = loadedProcesses.sorted(by: Self.processSort)
         installedApps = loadedApplications.sorted(by: Self.appSort)
         setupRecords = loadedSetups.sorted(by: Self.setupRecordSort)
@@ -786,8 +841,16 @@ final class ContinuumModel {
             runningProcesses: loadedProcesses
         )
 
+        if let activeProvisional,
+           !recoveredIndex.provisionalRewinds.contains(where: {
+               $0.id == activeProvisional.id
+           }) {
+            self.activeProvisional = nil
+            pendingTargetSnapshotID = nil
+            rewindPhase = .idle
+        }
         if activeProvisional == nil,
-           let storedProvisional = loadedIndex.provisionalRewinds.first {
+           let storedProvisional = recoveredIndex.provisionalRewinds.first {
             activeProvisional = storedProvisional
             rewindPhase = .previewing(storedProvisional.id)
         }

@@ -2,16 +2,14 @@ import SwiftUI
 
 struct HowRewindWorksView: View {
     private let stages = [
-        ("1", "Continuum saves checkpoints", "Only apps that pass a restore check are marked rewindable."),
-        ("2", "You open Rewind", "Continuum freezes the app and first saves a Before Rewind snapshot."),
-        ("3", "You choose a moment", "Play From Here restores validated local state and starts a new branch."),
-        ("4", "Nothing is thrown away", "Undo Rewind returns to the future you left, after saving your new path too.")
+        ("1", "Save a snapshot", "Switch to an app and press the Snapshot shortcut."),
+        ("2", "Restore it", "Choose that snapshot and press Restore. Continuum puts the live app back at that point.")
     ]
 
     var body: some View {
         OnboardingPage(
             title: "The restore contract",
-            subtitle: "These steps remain locked for an app until its backend proves every one of them."
+            subtitle: "For now, Continuum does one thing: snapshot, then restore."
         ) {
             VStack(spacing: 11) {
                 ForEach(stages, id: \.0) { stage in
@@ -38,7 +36,7 @@ struct HowRewindWorksView: View {
 
             OnboardingCallout(
                 title: "No screenshot tricks",
-                message: "A thumbnail can help you find a moment, but it is never treated as restorable state. If Continuum cannot validate a restore, Play From Here stays unavailable."
+                message: "A thumbnail can help identify a snapshot, but only captured app state enables Restore."
             )
         }
     }

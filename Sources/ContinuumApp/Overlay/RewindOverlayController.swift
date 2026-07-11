@@ -13,7 +13,6 @@ final class RewindOverlayController {
     private var refreshTask: Task<Void, Never>?
     private var transactionTask: Task<Void, Never>?
     private var cancellationRequested = false
-    private var rewindTransactionStarted = false
 
     init(preferences: ContinuumPreferences) {
         self.preferences = preferences
@@ -29,9 +28,8 @@ final class RewindOverlayController {
             return
         }
 
-        if transactionTask == nil, !rewindTransactionStarted {
+        if transactionTask == nil {
             cancellationRequested = false
-            rewindTransactionStarted = false
             selection.prepare(
                 snapshots: restorableSnapshots,
                 stepMilliseconds: preferences.timelineArrowStep.milliseconds
@@ -63,7 +61,7 @@ final class RewindOverlayController {
             backing: .buffered,
             defer: false
         )
-        panel.title = "Continuum Rewind"
+        panel.title = "Continuum Restore"
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
@@ -134,38 +132,16 @@ final class RewindOverlayController {
         }
 
         cancellationRequested = false
-        rewindTransactionStarted = false
         model.dismissError()
         model.selectedSnapshotID = snapshotID
 
         withAnimation(.easeInOut(duration: 0.18)) {
-            selection.phase = .securingPresent
-        }
-        await model.beginRewind()
-
-        guard case .previewing = model.rewindPhase else {
-            if cancellationRequested {
-                animateOut()
-            } else {
-                fail(modelFailureMessage(default: "Continuum could not secure the state you are leaving, so nothing changed."))
-            }
-            return
-        }
-
-        rewindTransactionStarted = true
-        if cancellationRequested {
-            await cancelActiveRewindAndDismiss()
-            return
-        }
-
-        withAnimation(.easeInOut(duration: 0.18)) {
             selection.phase = .restoring
         }
-        await model.commitRewind(target: snapshotID)
+        await model.restore(snapshotID: snapshotID)
 
         if case let .completed(completedSnapshotID) = model.rewindPhase,
            completedSnapshotID == snapshotID {
-            rewindTransactionStarted = false
             withAnimation(.spring(response: 0.38, dampingFraction: 0.76)) {
                 selection.phase = .committed
             }
@@ -174,11 +150,7 @@ final class RewindOverlayController {
             return
         }
 
-        if cancellationRequested {
-            await cancelActiveRewindAndDismiss()
-        } else {
-            fail(modelFailureMessage(default: "This moment could not be restored. Your safety snapshot was kept."))
-        }
+        fail(modelFailureMessage(default: "This snapshot could not be restored."))
     }
 
     private func requestDismissal() {
@@ -186,51 +158,18 @@ final class RewindOverlayController {
         case .browsing, .committed:
             animateOut()
 
-        case .failed where !rewindTransactionStarted:
+        case .failed:
             animateOut()
 
         case .securingPresent:
-            cancellationRequested = true
-            withAnimation(.easeInOut(duration: 0.15)) {
-                selection.phase = .cancelling
-            }
-
-        case .failed:
-            cancellationRequested = true
-            transactionTask = Task { [weak self] in
-                guard let self else { return }
-                await self.cancelActiveRewindAndDismiss()
-                self.transactionTask = nil
-            }
+            animateOut()
 
         case .restoring:
             // A restore that has already started is allowed to finish atomically.
             // The overlay closes as soon as the transaction resolves.
             cancellationRequested = true
 
-        case .cancelling:
-            break
-        }
-    }
-
-    private func cancelActiveRewindAndDismiss() async {
-        guard let model else {
-            rewindTransactionStarted = false
-            animateOut()
-            return
-        }
-
-        withAnimation(.easeInOut(duration: 0.15)) {
-            selection.phase = .cancelling
-        }
-        model.dismissError()
-        await model.cancelRewind()
-
-        if case .idle = model.rewindPhase {
-            rewindTransactionStarted = false
-            animateOut()
-        } else {
-            fail(modelFailureMessage(default: "Continuum could not validate the state you started from. The safety snapshot was retained."))
+        case .cancelling: animateOut()
         }
     }
 

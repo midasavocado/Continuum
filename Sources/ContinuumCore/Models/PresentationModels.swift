@@ -11,7 +11,7 @@ public enum ContinuumSection: String, Codable, CaseIterable, Identifiable, Senda
 
     public var title: String {
         switch self {
-        case .timeline: "Timeline"
+        case .timeline: "Restore"
         case .snapshots: "Snapshots"
         case .branches: "Branches"
         case .apps: "Apps"

@@ -4,7 +4,7 @@ struct WelcomeOnboardingView: View {
     var body: some View {
         OnboardingPage(
             title: "Build rewind without pretending.",
-            subtitle: "Continuum is a research build for proving safe Mac app rewind. Today it records encrypted diagnostics and validates the storage and branching foundation."
+            subtitle: "Continuum captures a running Mac app, then restores that captured state later."
         ) {
             HStack(alignment: .top, spacing: 18) {
                 feature(
@@ -15,12 +15,12 @@ struct WelcomeOnboardingView: View {
                 feature(
                     symbol: "arrow.counterclockwise",
                     title: "Prove restoration",
-                    detail: "Rewind stays locked until a backend can restore real state and preserve the future first."
+                    detail: "Restore is enabled only when Continuum captured real app state."
                 )
                 feature(
-                    symbol: "arrow.triangle.branch",
+                    symbol: "arrow.counterclockwise",
                     title: "Keep every path",
-                    detail: "The included demo and transaction harness prove non-destructive branch semantics."
+                    detail: "The included demo shows the simple snapshot → restore flow."
                 )
             }
 

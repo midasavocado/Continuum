@@ -79,9 +79,9 @@ struct RewindOverlayView: View {
             .shadow(color: .indigo.opacity(0.28), radius: 10, y: 5)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Rewind")
+                Text("Restore Snapshot")
                     .font(.title2.weight(.semibold))
-                Text("Choose a saved moment. Nothing changes until you press Return.")
+                Text("Choose a snapshot, then press Return to restore it.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -225,7 +225,7 @@ struct RewindOverlayView: View {
                 .disabled(!state.canCommit)
                 .help(snapshot.availability == .unavailable
                       ? "This moment cannot be restored"
-                      : "Save the present, then rewind to this moment")
+                      : "Restore this snapshot")
             }
         }
         .frame(minHeight: 32)
@@ -234,8 +234,7 @@ struct RewindOverlayView: View {
     private func commitTitle(for snapshot: SnapshotRecord) -> String {
         switch snapshot.availability {
         case .unavailable: "Unavailable"
-        case .experimentalHot: "Try from Here"
-        case .instant, .replayRequired: "Play from Here"
+        case .experimentalHot, .instant, .replayRequired: "Restore"
         }
     }
 
@@ -248,7 +247,7 @@ struct RewindOverlayView: View {
         case .securingPresent:
             BusyOverlay(
                 title: "Saving where you are…",
-                detail: "Your current future is being secured before anything changes."
+                detail: "Preparing the selected snapshot."
             )
 
         case .cancelling:
@@ -259,7 +258,7 @@ struct RewindOverlayView: View {
 
         case .restoring:
             BusyOverlay(
-                title: "Rewinding…",
+                title: "Restoring…",
                 detail: "Restoring local app state and rebuilding resources."
             )
 
@@ -422,7 +421,7 @@ private struct CommitBurstView: View {
                     .symbolRenderingMode(.palette)
                     .foregroundStyle(.white, Color.accentColor)
                     .shadow(color: Color.accentColor.opacity(0.35), radius: 16, y: 6)
-                Text("Rewind complete")
+                Text("Snapshot restored")
                     .font(.title2.weight(.semibold))
                 Text("Playing from the selected moment")
                     .font(.subheadline)

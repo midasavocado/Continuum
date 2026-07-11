@@ -157,7 +157,7 @@ private struct CaptureSettingsView: View {
                     status: .requiresCertifiedBackend
                 )
             } footer: {
-                Text("Manual and Before Rewind snapshots remain pinned until you delete them. Continuum saves these preferences, but this build does not yet enforce automatic rolling-history eviction.")
+                Text("Saved snapshots remain pinned until you delete them. Continuum saves these preferences, but this build does not yet enforce automatic rolling-history eviction.")
             }
         }
         .formStyle(.grouped)

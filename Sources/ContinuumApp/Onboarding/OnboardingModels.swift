@@ -144,9 +144,9 @@ final class OnboardingProgress: ObservableObject {
 
     func rewindDemo() {
         guard demoPhase == .changed else { return }
-        beforeRewindText = demoText
         demoText = Self.demoOriginalText
-        demoPhase = .rewound
+        beforeRewindText = nil
+        demoPhase = .undone
     }
 
     func undoDemoRewind() {

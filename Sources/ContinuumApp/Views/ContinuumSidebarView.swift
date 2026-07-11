@@ -9,7 +9,7 @@ struct ContinuumSidebarView: View {
     var body: some View {
         List(selection: $selection) {
             Section("Continuum") {
-                ForEach(ContinuumSection.allCases) { section in
+                ForEach([ContinuumSection.timeline, .snapshots, .apps, .storage]) { section in
                     HStack(spacing: 10) {
                         Image(systemName: section.systemImage)
                             .foregroundStyle(.secondary)

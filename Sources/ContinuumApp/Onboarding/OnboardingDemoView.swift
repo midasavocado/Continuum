@@ -5,8 +5,8 @@ struct OnboardingDemoView: View {
 
     var body: some View {
         OnboardingPage(
-            title: "Try a safe rewind",
-            subtitle: "This little demo never touches another app. It shows exactly when snapshots and branches are created."
+            title: "Try snapshot → restore",
+            subtitle: "Save the text, change it, then restore the saved version."
         ) {
             OnboardingCard {
                 VStack(alignment: .leading, spacing: 12) {
@@ -76,15 +76,15 @@ struct OnboardingDemoView: View {
                     .accessibilityHint("Changes the demo document after the snapshot")
             }
         case .changed:
-            Button("Rewind", action: progress.rewindDemo)
+            Button("Restore Snapshot", action: progress.rewindDemo)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [])
-                .accessibilityHint("Automatically saves the current demo text, then restores the manual snapshot")
+                .accessibilityHint("Restores the saved demo snapshot")
         case .rewound:
-            Button("Undo Rewind", action: progress.undoDemoRewind)
+            Button("Finish Restore", action: progress.undoDemoRewind)
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [])
-                .accessibilityHint("Restores the automatically saved Before Rewind snapshot")
+                .accessibilityHint("Completes the old saved demo state")
         case .undone:
             Label("Demo complete", systemImage: "checkmark.circle.fill")
                 .font(.headline)
@@ -95,7 +95,7 @@ struct OnboardingDemoView: View {
     private var timeline: some View {
         OnboardingCard {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Demo timeline")
+                Text("Demo")
                     .font(.headline)
                 HStack(spacing: 8) {
                     timelineItem(
@@ -107,17 +107,9 @@ struct OnboardingDemoView: View {
                         .foregroundStyle(.tertiary)
                         .accessibilityHidden(true)
                     timelineItem(
-                        title: "Before Rewind",
-                        isPresent: [.rewound, .undone].contains(progress.demoPhase),
-                        symbol: "arrow.triangle.branch"
-                    )
-                    Image(systemName: "arrow.right")
-                        .foregroundStyle(.tertiary)
-                        .accessibilityHidden(true)
-                    timelineItem(
-                        title: "Undo available",
+                        title: "Restored",
                         isPresent: progress.demoPhase == .undone,
-                        symbol: "arrow.uturn.backward"
+                        symbol: "checkmark.circle.fill"
                     )
                 }
             }
@@ -139,8 +131,8 @@ struct OnboardingDemoView: View {
         case .readyToSave: "Ready"
         case .snapshotSaved: "Snapshot saved"
         case .changed: "Changed"
-        case .rewound: "Rewound"
-        case .undone: "Future restored"
+        case .rewound: "Restoring"
+        case .undone: "Snapshot restored"
         }
     }
 
@@ -148,9 +140,9 @@ struct OnboardingDemoView: View {
         switch progress.demoPhase {
         case .readyToSave: "First, save this moment"
         case .snapshotSaved: "Now change the future"
-        case .changed: "Rewind is safe to try"
-        case .rewound: "Continuum saved Before Rewind first"
-        case .undone: "Both paths survived"
+        case .changed: "Restore the snapshot"
+        case .rewound: "Restoring snapshot"
+        case .undone: "Snapshot restored"
         }
     }
 
@@ -161,11 +153,11 @@ struct OnboardingDemoView: View {
         case .snapshotSaved:
             "You can edit the text yourself, or use the sample change button."
         case .changed:
-            "Rewind will preserve this changed version before restoring the manual snapshot."
+            "Restore returns the document to the text stored in the snapshot."
         case .rewound:
-            "The original text is back, and the changed version is waiting in an automatic safety snapshot."
+            "The original saved text is back."
         case .undone:
-            "Undo Rewind restored the changed future. A future certified rewind follows the same preserve-first rule."
+            "That is the whole workflow: snapshot, change, restore."
         }
     }
 }

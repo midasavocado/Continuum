@@ -50,10 +50,10 @@ struct ContinuumMainView: View {
                 onSaveSnapshot: { Task { await model.saveManualSnapshot() } },
                 onBeginRewind: { snapshot in
                     model.selectedSnapshotID = snapshot.id
-                    Task { await model.beginRewind() }
+                    Task { await model.restore(snapshotID: snapshot.id) }
                 },
                 onCommitRewind: { snapshot in
-                    Task { await model.commitRewind(target: snapshot.id) }
+                    Task { await model.restore(snapshotID: snapshot.id) }
                 },
                 onCancelRewind: { Task { await model.cancelRewind() } },
                 onUndoRewind: { Task { await model.undoRewind() } }
@@ -67,7 +67,7 @@ struct ContinuumMainView: View {
                 onRestore: { snapshot in
                     model.selectedSnapshotID = snapshot.id
                     model.selectedSection = .timeline
-                    Task { await model.beginRewind() }
+                    Task { await model.restore(snapshotID: snapshot.id) }
                 },
                 onDelete: { snapshot in
                     Task { await model.delete(snapshotID: snapshot.id) }

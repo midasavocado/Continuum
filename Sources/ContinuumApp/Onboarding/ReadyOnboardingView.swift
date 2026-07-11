@@ -16,7 +16,7 @@ struct ReadyOnboardingView: View {
                 )
                 shortcutRow(
                     keys: ["⌃", "⌥", "⌘", "R"],
-                    title: "Open Rewind Timeline",
+                    title: "Open Snapshot Restore",
                     detail: "Opens the floating keyboard timeline; Return works only on validated states."
                 )
             }
@@ -30,7 +30,7 @@ struct ReadyOnboardingView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("\(selectedStorageGigabytes) GB planned history budget")
                             .font(.headline)
-                        Text("Change the shortcut, timeline step, and future capture targets in Continuum Settings.")
+                        Text("Change the snapshot and restore shortcuts in Continuum Settings.")
                             .foregroundStyle(.secondary)
                     }
                 }

@@ -66,7 +66,7 @@ struct SnapshotLibraryView: View {
     private var filterBar: some View {
         HStack(spacing: 12) {
             Picker("Filter", selection: $filter) {
-                ForEach(SnapshotFilter.allCases) { filter in
+                ForEach([SnapshotFilter.all, .manual]) { filter in
                     Text(filter.title).tag(filter)
                 }
             }
@@ -137,7 +137,7 @@ struct SnapshotLibraryView: View {
 
     private var emptyDescription: String {
         if snapshots.isEmpty {
-            return "Use Save Snapshot to keep a permanent moment. Continuum also saves the state before every rewind."
+            return "Use Save Snapshot to capture an app, then select it and press Restore."
         }
         return "Try another filter or search term."
     }

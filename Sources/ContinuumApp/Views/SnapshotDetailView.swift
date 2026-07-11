@@ -57,7 +57,7 @@ struct SnapshotDetailView: View {
             Button("Delete Snapshot", role: .destructive, action: onDelete)
         } message: {
             Text(
-                "Continuum will remove this saved moment. Shared data used by another snapshot or branch stays safe."
+                "Continuum will remove this saved snapshot. Shared data used by another snapshot stays safe."
             )
         }
     }
@@ -269,8 +269,7 @@ struct SnapshotDetailView: View {
 
     private var restoreActionTitle: String {
         switch snapshot.availability {
-        case .instant: "Open App From Here"
-        case .experimentalHot: "Try Hot Rewind"
+        case .instant, .experimentalHot: "Restore Snapshot"
         case .replayRequired: "Open by Replay"
         case .unavailable: "Unavailable"
         }

@@ -32,7 +32,7 @@ final class DisplayNameTests: XCTestCase {
 
     func testNavigationAndFilterTitlesAreConsumerFacing() {
         XCTAssertEqual(ContinuumSection.allCases.map(\.title), [
-            "Timeline", "Snapshots", "Branches", "Apps", "Storage",
+            "Restore", "Snapshots", "Branches", "Apps", "Storage",
         ])
         XCTAssertEqual(SnapshotFilter.allCases.map(\.title), [
             "All", "Manual", "Before Rewind", "Crash Recovery",

@@ -49,7 +49,7 @@ struct TimelineDashboardView: View {
             .frame(maxWidth: 980, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .top)
         }
-        .navigationTitle("Timeline")
+        .navigationTitle("Restore")
         .onAppear { selectNewestSnapshot() }
         .onChange(of: snapshots.count) { _, _ in selectNewestSnapshot() }
     }
@@ -57,9 +57,9 @@ struct TimelineDashboardView: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Rewind, proven before promised")
+                Text("Snapshot → Restore")
                     .font(.largeTitle.weight(.semibold))
-                Text("Browse encrypted diagnostic moments while the exact-restore runtime is being certified.")
+                Text("Save the frontmost app, then restore that snapshot whenever you need it.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -118,7 +118,7 @@ struct TimelineDashboardView: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Rewind")
+                        Text("Restore a Snapshot")
                             .font(.title2.weight(.semibold))
                         Text(rewindInstruction)
                             .font(.subheadline)
@@ -171,7 +171,7 @@ struct TimelineDashboardView: View {
     private var phaseIndicator: some View {
         switch rewindPhase {
         case .idle:
-            StatusBadge(title: "Research build", systemImage: "hammer.fill", tint: .orange)
+            StatusBadge(title: "Ready", systemImage: "checkmark.circle.fill", tint: .green)
         case .capturingSafetySnapshot:
             StatusBadge(title: "Saving current state", systemImage: "lock.fill", tint: .blue)
         case .previewing:
@@ -188,11 +188,11 @@ struct TimelineDashboardView: View {
     private var rewindInstruction: String {
         switch rewindPhase {
         case .idle, .completed, .failed:
-            "Use the Rewind shortcut to open the keyboard timeline. Only validated states can be selected."
+            "Choose a saved snapshot and restore it."
         case .capturingSafetySnapshot:
-            "Securing the current future before preview begins."
+            "Preparing the snapshot."
         case .previewing:
-            "This is a validated local state. Online actions are not reversed."
+            "Ready to restore this snapshot. Online actions are not reversed."
         case .restoring:
             "Restoring local state and rebuilding app resources."
         }
@@ -225,14 +225,17 @@ struct TimelineDashboardView: View {
     private var rewindActions: some View {
         switch rewindPhase {
         case .idle, .failed:
-            VStack(alignment: .leading, spacing: 7) {
-                Label("Press your Rewind shortcut to open the floating timeline", systemImage: "keyboard")
-                    .font(.headline)
-                Text(selectedSnapshot?.availability == .unavailable
-                     ? "This selected moment contains diagnostics only, so Return will stay unavailable."
-                     : "Left and Right choose a moment, Return continues from it, and Escape cancels.")
-                    .font(.caption)
+            HStack {
+                Text("Select a snapshot above.")
                     .foregroundStyle(.secondary)
+                Spacer()
+                if let selectedSnapshot {
+                    Button("Restore", systemImage: "arrow.counterclockwise") {
+                        onBeginRewind(selectedSnapshot)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(selectedSnapshot.availability == .unavailable || isPerformingAction)
+                }
             }
 
         case .capturingSafetySnapshot:
@@ -245,13 +248,13 @@ struct TimelineDashboardView: View {
 
         case .previewing:
             HStack {
-                Label("Current future safely saved", systemImage: "lock.fill")
+                Label("Snapshot ready", systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel", action: onCancelRewind)
                 if let selectedSnapshot, selectedSnapshot.availability != .unavailable {
-                    Button("Play from Here", systemImage: "play.fill") {
+                    Button("Restore", systemImage: "arrow.counterclockwise") {
                         onCommitRewind(selectedSnapshot)
                     }
                     .buttonStyle(.borderedProminent)
@@ -274,13 +277,11 @@ struct TimelineDashboardView: View {
 
         case .completed:
             HStack {
-                Label("You’re on a new branch. The future you left is still safe.", systemImage: "arrow.triangle.branch")
+                Label("Snapshot restored.", systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Undo Rewind", action: onUndoRewind)
-                    .buttonStyle(.bordered)
-                Button("Rewind Again…") {
+                Button("Restore Another…") {
                     if let selectedSnapshot { onBeginRewind(selectedSnapshot) }
                 }
                     .buttonStyle(.borderedProminent)
