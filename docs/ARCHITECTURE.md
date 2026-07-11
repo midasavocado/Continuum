@@ -82,9 +82,9 @@ The runtime now has three proof levels:
 
 1. The self-process proof checkpoints memory allocated by the harness.
 2. The registered-arena external proof alternates two target-owned states with readback validation for at least 100 cycles.
-3. The full-process proof walks the target's nested VM map, retains COW views for every readable+writable private/COW mapping, captures general/NEON registers, creates a current-state safety cut before restore, compares local views, coalesces changed pages into large writes, restores registers, and validates the result. Current measurements are roughly 50 ms per snapshot and 65–70 ms per hot restore for about 313 MB of logical writable state.
+3. The full-process proof walks the target's nested VM map, retains COW views for every readable+writable private/COW mapping, captures general/NEON registers, creates a current-state safety cut before restore, compares local views, coalesces changed pages into large writes, restores registers, and validates the result. It also inventories descriptors, supported descriptor details, the Mach right namespace, and the thread set at each cut. Current measurements are roughly 50–55 ms per snapshot and 65–75 ms per hot restore for about 320 MB of logical writable state.
 
-The proof calls `thread_set_state`, but it requires the same task, thread identities, and VM topology. A second functional cycle correctly fails after the target replaces a private allocator mapping with `SM_TRUESHARED` state. Therefore it still does not prove restoration of an arbitrary GUI process. A general native-app rewind engine must separately solve or reject:
+The proof calls `thread_set_state`, but it requires the same task, thread identities, VM topology, descriptor table, and Mach namespace. An added vnode descriptor is rejected before memory is written. A second functional cycle correctly fails after the target replaces a private allocator mapping with `SM_TRUESHARED` state. Fingerprinting is a safety gate, not kernel-resource restoration, so this still does not prove restoration of an arbitrary GUI process. A general native-app rewind engine must separately solve or reject:
 
 - authenticated access to another app's task and complete helper tree;
 - safe thread cuts and in-flight syscalls;

@@ -5,6 +5,7 @@
 #include <mach/mach_vm.h>
 #include <mach/thread_info.h>
 #include <mach/vm_region.h>
+#include <mach_debug/ipc_info.h>
 #if defined(__arm64__)
 #include <mach/arm/thread_status.h>
 #endif
@@ -80,8 +81,14 @@ struct continuum_remote_process_snapshot {
     continuum_remote_process_region *regions;
     size_t region_count;
     continuum_remote_thread_snapshot *threads;
+    continuum_remote_resource_fingerprint resources;
     continuum_remote_process_snapshot_info info;
 };
+
+static continuum_status continuum_capture_resource_fingerprint_suspended(
+    continuum_remote_session *session,
+    continuum_remote_resource_fingerprint *out_fingerprint
+);
 
 static int continuum_add_u64(uint64_t left, uint64_t right, uint64_t *result) {
     if (result == NULL || UINT64_MAX - left < right) {
@@ -97,6 +104,21 @@ static void continuum_hash_u64(uint64_t *hash, uint64_t value) {
     }
     for (size_t byte = 0; byte < sizeof(value); byte += 1) {
         *hash ^= (value >> (byte * 8)) & UINT64_C(0xFF);
+        *hash *= CONTINUUM_FNV_PRIME;
+    }
+}
+
+static void continuum_hash_bytes(
+    uint64_t *hash,
+    const void *bytes,
+    size_t length
+) {
+    if (hash == NULL || bytes == NULL) {
+        return;
+    }
+    const uint8_t *cursor = bytes;
+    for (size_t index = 0; index < length; index += 1) {
+        *hash ^= cursor[index];
         *hash *= CONTINUUM_FNV_PRIME;
     }
 }
@@ -881,6 +903,12 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         snapshot->info.thread_count = snapshot->threads->count;
         snapshot->info.thread_set_hash = snapshot->threads->set_hash;
     }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_capture_resource_fingerprint_suspended(
+            session,
+            &snapshot->resources
+        );
+    }
     if (status != CONTINUUM_STATUS_OK) {
         continuum_remote_process_snapshot_destroy(snapshot);
         return status;
@@ -909,6 +937,371 @@ static void continuum_prewarm_process_snapshot(
         }
     }
     (void)sink;
+}
+
+static int continuum_fd_info_compare(const void *left, const void *right) {
+    const struct proc_fdinfo *left_info = left;
+    const struct proc_fdinfo *right_info = right;
+    if (left_info->proc_fd < right_info->proc_fd) {
+        return -1;
+    }
+    if (left_info->proc_fd > right_info->proc_fd) {
+        return 1;
+    }
+    return 0;
+}
+
+static void continuum_hash_file_info(
+    uint64_t *hash,
+    const struct proc_fileinfo *info,
+    continuum_remote_resource_fingerprint *fingerprint
+) {
+    continuum_hash_u64(hash, info->fi_openflags);
+    continuum_hash_u64(hash, info->fi_status);
+    continuum_hash_u64(hash, (uint64_t)info->fi_offset);
+    continuum_hash_u64(hash, (uint64_t)(uint32_t)info->fi_type);
+    continuum_hash_u64(hash, info->fi_guardflags);
+    if ((info->fi_status & PROC_FP_GUARDED) != 0 || info->fi_guardflags != 0) {
+        fingerprint->guarded_descriptor_count += 1;
+    }
+}
+
+static continuum_status continuum_capture_descriptor_fingerprint(
+    int32_t process_id,
+    continuum_remote_resource_fingerprint *fingerprint
+) {
+    int required_bytes = proc_pidinfo(
+        process_id,
+        PROC_PIDLISTFDS,
+        0,
+        NULL,
+        0
+    );
+    if (required_bytes < 0) {
+        return CONTINUUM_STATUS_MACH_ERROR;
+    }
+
+    size_t capacity = (size_t)required_bytes
+        + 32U * sizeof(struct proc_fdinfo);
+    if (capacity < sizeof(struct proc_fdinfo) || capacity > INT_MAX) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    struct proc_fdinfo *descriptors = calloc(1, capacity);
+    if (descriptors == NULL) {
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+
+    int returned_bytes = proc_pidinfo(
+        process_id,
+        PROC_PIDLISTFDS,
+        0,
+        descriptors,
+        (int)capacity
+    );
+    if (returned_bytes < 0
+        || returned_bytes % (int)sizeof(struct proc_fdinfo) != 0) {
+        free(descriptors);
+        return CONTINUUM_STATUS_MACH_ERROR;
+    }
+    size_t descriptor_count =
+        (size_t)returned_bytes / sizeof(struct proc_fdinfo);
+    qsort(
+        descriptors,
+        descriptor_count,
+        sizeof(*descriptors),
+        continuum_fd_info_compare
+    );
+
+    uint64_t hash = CONTINUUM_FNV_OFFSET;
+    continuum_status status = CONTINUUM_STATUS_OK;
+    for (size_t index = 0; index < descriptor_count; index += 1) {
+        const struct proc_fdinfo descriptor = descriptors[index];
+        continuum_hash_u64(&hash, (uint64_t)(uint32_t)descriptor.proc_fd);
+        continuum_hash_u64(&hash, descriptor.proc_fdtype);
+
+        switch (descriptor.proc_fdtype) {
+            case PROX_FDTYPE_VNODE: {
+                struct vnode_fdinfowithpath info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                fingerprint->vnode_count += 1;
+                continuum_hash_file_info(&hash, &info.pfi, fingerprint);
+                continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_dev);
+                continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_ino);
+                continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_gen);
+                continuum_hash_u64(
+                    &hash,
+                    (uint64_t)info.pvip.vip_vi.vi_stat.vst_size
+                );
+                continuum_hash_bytes(
+                    &hash,
+                    info.pvip.vip_path,
+                    strnlen(info.pvip.vip_path, sizeof(info.pvip.vip_path))
+                );
+                break;
+            }
+            case PROX_FDTYPE_SOCKET: {
+                struct socket_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDSOCKETINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                fingerprint->socket_count += 1;
+                continuum_hash_file_info(&hash, &info.pfi, fingerprint);
+                continuum_hash_u64(&hash, info.psi.soi_so);
+                continuum_hash_u64(&hash, info.psi.soi_pcb);
+                continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.psi.soi_type);
+                continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.psi.soi_protocol);
+                continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.psi.soi_family);
+                continuum_hash_u64(&hash, (uint64_t)(uint16_t)info.psi.soi_state);
+                continuum_hash_u64(&hash, info.psi.soi_rcv.sbi_cc);
+                continuum_hash_u64(&hash, info.psi.soi_snd.sbi_cc);
+                break;
+            }
+            case PROX_FDTYPE_PIPE: {
+                struct pipe_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDPIPEINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                fingerprint->pipe_count += 1;
+                continuum_hash_file_info(&hash, &info.pfi, fingerprint);
+                continuum_hash_u64(&hash, info.pipeinfo.pipe_handle);
+                continuum_hash_u64(&hash, info.pipeinfo.pipe_peerhandle);
+                continuum_hash_u64(
+                    &hash,
+                    (uint64_t)(uint32_t)info.pipeinfo.pipe_status
+                );
+                break;
+            }
+            case PROX_FDTYPE_KQUEUE: {
+                struct kqueue_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDKQUEUEINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                fingerprint->kqueue_count += 1;
+                continuum_hash_file_info(&hash, &info.pfi, fingerprint);
+                continuum_hash_u64(&hash, info.kqueueinfo.kq_state);
+                continuum_hash_u64(&hash, info.kqueueinfo.kq_stat.vst_ino);
+                break;
+            }
+            case PROX_FDTYPE_PSHM: {
+                struct pshm_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDPSHMINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                fingerprint->shared_memory_count += 1;
+                continuum_hash_file_info(&hash, &info.pfi, fingerprint);
+                continuum_hash_u64(&hash, info.pshminfo.pshm_stat.vst_ino);
+                continuum_hash_u64(&hash, info.pshminfo.pshm_mappaddr);
+                continuum_hash_bytes(
+                    &hash,
+                    info.pshminfo.pshm_name,
+                    strnlen(info.pshminfo.pshm_name, sizeof(info.pshminfo.pshm_name))
+                );
+                break;
+            }
+            case PROX_FDTYPE_PSEM: {
+                struct psem_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDPSEMINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                fingerprint->semaphore_count += 1;
+                continuum_hash_file_info(&hash, &info.pfi, fingerprint);
+                continuum_hash_u64(&hash, info.pseminfo.psem_stat.vst_ino);
+                continuum_hash_bytes(
+                    &hash,
+                    info.pseminfo.psem_name,
+                    strnlen(info.pseminfo.psem_name, sizeof(info.pseminfo.psem_name))
+                );
+                break;
+            }
+            default:
+                fingerprint->unsupported_descriptor_count += 1;
+                break;
+        }
+        if (status != CONTINUUM_STATUS_OK) {
+            break;
+        }
+    }
+
+    if (status == CONTINUUM_STATUS_OK) {
+        fingerprint->file_descriptor_count = descriptor_count;
+        fingerprint->descriptor_table_hash = hash;
+    }
+    free(descriptors);
+    return status;
+}
+
+static int continuum_ipc_name_compare(const void *left, const void *right) {
+    const ipc_info_name_t *left_info = left;
+    const ipc_info_name_t *right_info = right;
+    if (left_info->iin_name < right_info->iin_name) {
+        return -1;
+    }
+    if (left_info->iin_name > right_info->iin_name) {
+        return 1;
+    }
+    return 0;
+}
+
+static continuum_status continuum_capture_mach_space_fingerprint(
+    mach_port_t task,
+    continuum_remote_resource_fingerprint *fingerprint
+) {
+    ipc_info_space_t space_info;
+    memset(&space_info, 0, sizeof(space_info));
+    ipc_info_name_array_t table = NULL;
+    mach_msg_type_number_t table_count = 0;
+    ipc_info_tree_name_array_t tree = NULL;
+    mach_msg_type_number_t tree_count = 0;
+    kern_return_t result = mach_port_space_info(
+        task,
+        &space_info,
+        &table,
+        &table_count,
+        &tree,
+        &tree_count
+    );
+    if (result != KERN_SUCCESS) {
+        return CONTINUUM_STATUS_MACH_ERROR;
+    }
+
+    qsort(table, table_count, sizeof(*table), continuum_ipc_name_compare);
+    uint64_t hash = CONTINUUM_FNV_OFFSET;
+    continuum_hash_u64(&hash, space_info.iis_genno_mask);
+    for (mach_msg_type_number_t index = 0; index < table_count; index += 1) {
+        const ipc_info_name_t entry = table[index];
+        if (entry.iin_type == MACH_PORT_TYPE_NONE) {
+            continue;
+        }
+        fingerprint->mach_name_count += 1;
+        continuum_hash_u64(&hash, entry.iin_name);
+        continuum_hash_u64(&hash, entry.iin_type);
+        continuum_hash_u64(&hash, entry.iin_urefs);
+        continuum_hash_u64(&hash, entry.iin_object);
+        if ((entry.iin_type & MACH_PORT_TYPE_SEND) != 0) {
+            fingerprint->mach_send_right_count += 1;
+        }
+        if ((entry.iin_type & MACH_PORT_TYPE_RECEIVE) != 0) {
+            fingerprint->mach_receive_right_count += 1;
+        }
+        if ((entry.iin_type & MACH_PORT_TYPE_SEND_ONCE) != 0) {
+            fingerprint->mach_send_once_right_count += 1;
+        }
+        if ((entry.iin_type & MACH_PORT_TYPE_PORT_SET) != 0) {
+            fingerprint->mach_port_set_count += 1;
+        }
+        if ((entry.iin_type & MACH_PORT_TYPE_DEAD_NAME) != 0) {
+            fingerprint->mach_dead_name_count += 1;
+        }
+    }
+    fingerprint->mach_space_hash = hash;
+
+    if (table != NULL) {
+        (void)vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)table,
+            (vm_size_t)(table_count * sizeof(*table))
+        );
+    }
+    if (tree != NULL) {
+        (void)vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)tree,
+            (vm_size_t)(tree_count * sizeof(*tree))
+        );
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+static continuum_status continuum_capture_resource_fingerprint_suspended(
+    continuum_remote_session *session,
+    continuum_remote_resource_fingerprint *out_fingerprint
+) {
+    if (session == NULL || out_fingerprint == NULL
+        || session->task == MACH_PORT_NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_fingerprint, 0, sizeof(*out_fingerprint));
+
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_capture_descriptor_fingerprint(
+            session->identity.process_id,
+            out_fingerprint
+        );
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_capture_mach_space_fingerprint(
+            session->task,
+            out_fingerprint
+        );
+    }
+
+    continuum_remote_thread_snapshot *threads = NULL;
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_capture_thread_snapshot(session->task, &threads);
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        out_fingerprint->thread_count = threads->count;
+        out_fingerprint->thread_set_hash = threads->set_hash;
+    }
+    continuum_remote_thread_snapshot_destroy(threads);
+    return status;
 }
 
 typedef struct continuum_remote_thread_port_entry {
@@ -1043,6 +1436,23 @@ static continuum_status continuum_validate_process_snapshot_layout(
     }
     if (!continuum_identity_equal(&current->identity, &saved->identity)) {
         return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    }
+    uint32_t resource_changes = continuum_remote_resource_fingerprint_changes(
+        &saved->resources,
+        &current->resources
+    );
+    if ((resource_changes
+            & CONTINUUM_RESOURCE_CHANGE_UNSUPPORTED_DESCRIPTOR) != 0) {
+        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+    }
+    if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE) != 0) {
+        return CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED;
+    }
+    if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_MACH_SPACE) != 0) {
+        return CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED;
+    }
+    if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_THREAD_SET) != 0) {
+        return CONTINUUM_STATUS_THREAD_SET_CHANGED;
     }
     if (current->region_count != saved->region_count
         || current->info.captured_region_count != saved->info.captured_region_count
@@ -1559,6 +1969,88 @@ continuum_status continuum_remote_session_identity(
     }
     *out_identity = session->identity;
     return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_session_capture_resource_fingerprint(
+    continuum_remote_session *session,
+    continuum_remote_resource_fingerprint *out_fingerprint
+) {
+    if (session == NULL || out_fingerprint == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_fingerprint, 0, sizeof(*out_fingerprint));
+
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_capture_resource_fingerprint_suspended(
+            session,
+            out_fingerprint
+        );
+    }
+
+    continuum_status resume_status = continuum_resume_session(
+        session,
+        did_suspend
+    );
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        status = resume_status;
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        memset(out_fingerprint, 0, sizeof(*out_fingerprint));
+    }
+    return status;
+}
+
+uint32_t continuum_remote_resource_fingerprint_changes(
+    const continuum_remote_resource_fingerprint *saved,
+    const continuum_remote_resource_fingerprint *current
+) {
+    const uint32_t all_changes =
+        CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE
+        | CONTINUUM_RESOURCE_CHANGE_MACH_SPACE
+        | CONTINUUM_RESOURCE_CHANGE_THREAD_SET
+        | CONTINUUM_RESOURCE_CHANGE_UNSUPPORTED_DESCRIPTOR;
+    if (saved == NULL || current == NULL) {
+        return all_changes;
+    }
+
+    uint32_t changes = CONTINUUM_RESOURCE_CHANGE_NONE;
+    if (saved->file_descriptor_count != current->file_descriptor_count
+        || saved->vnode_count != current->vnode_count
+        || saved->socket_count != current->socket_count
+        || saved->pipe_count != current->pipe_count
+        || saved->kqueue_count != current->kqueue_count
+        || saved->shared_memory_count != current->shared_memory_count
+        || saved->semaphore_count != current->semaphore_count
+        || saved->guarded_descriptor_count != current->guarded_descriptor_count
+        || saved->descriptor_table_hash != current->descriptor_table_hash) {
+        changes |= CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE;
+    }
+    if (saved->mach_name_count != current->mach_name_count
+        || saved->mach_send_right_count != current->mach_send_right_count
+        || saved->mach_receive_right_count != current->mach_receive_right_count
+        || saved->mach_send_once_right_count
+            != current->mach_send_once_right_count
+        || saved->mach_port_set_count != current->mach_port_set_count
+        || saved->mach_dead_name_count != current->mach_dead_name_count
+        || saved->mach_space_hash != current->mach_space_hash) {
+        changes |= CONTINUUM_RESOURCE_CHANGE_MACH_SPACE;
+    }
+    if (saved->thread_count != current->thread_count
+        || saved->thread_set_hash != current->thread_set_hash) {
+        changes |= CONTINUUM_RESOURCE_CHANGE_THREAD_SET;
+    }
+    if (saved->unsupported_descriptor_count > 0
+        || current->unsupported_descriptor_count > 0) {
+        changes |= CONTINUUM_RESOURCE_CHANGE_UNSUPPORTED_DESCRIPTOR;
+    }
+    return changes;
 }
 
 continuum_status continuum_remote_session_register_region(
@@ -2114,6 +2606,12 @@ const char *continuum_status_string(continuum_status status) {
             return "process snapshot exceeded its capture budget";
         case CONTINUUM_STATUS_THREAD_RESTORE_FAILED:
             return "thread register restore failed";
+        case CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED:
+            return "target descriptor table changed";
+        case CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED:
+            return "target Mach port namespace changed";
+        case CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR:
+            return "target has an unsupported descriptor type";
     }
     return "unknown status";
 }

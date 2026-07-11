@@ -105,6 +105,7 @@ enum ExternalHotProof {
         // then moves only the registered arena between A and B while the target
         // remains parked, avoiding transient Foundation allocator mappings.
         try restore(stateA, into: session, label: "staging A", cycle: 0)
+        var resourceStateA = try captureResources(session: session)
         let processStateAStart = DispatchTime.now().uptimeNanoseconds
         let processStateA = try captureProcess(session: session)
         progress(
@@ -113,6 +114,7 @@ enum ExternalHotProof {
         defer { continuum_remote_process_snapshot_destroy(processStateA.snapshot) }
 
         try restore(safetyB, into: session, label: "staging B", cycle: 0)
+        var resourceSafetyB = try captureResources(session: session)
         let processSafetyBStart = DispatchTime.now().uptimeNanoseconds
         let processSafetyB = try captureProcess(session: session)
         progress(
@@ -135,6 +137,15 @@ enum ExternalHotProof {
             processStateA.info.thread_set_hash == processSafetyB.info.thread_set_hash,
             "target thread set changed between full-process captures"
         )
+        let resourceChanges = continuum_remote_resource_fingerprint_changes(
+            &resourceStateA,
+            &resourceSafetyB
+        )
+        try require(
+            resourceChanges == UInt32(CONTINUUM_RESOURCE_CHANGE_NONE.rawValue),
+            "target kernel resources changed between full-process captures: "
+                + resourceChangeDescription(resourceChanges)
+        )
 
         for cycle in 1...fullProcessCycleCount {
             try restoreProcess(processStateA, into: session, label: "A", cycle: cycle)
@@ -152,6 +163,27 @@ enum ExternalHotProof {
             try validate(target: target, expected: "B", digest: safetyB.digest, cycle: cycle)
         }
 
+        let opened = try target.send(command: "open-resource")
+        try require(
+            opened.event == "resource-opened",
+            "target did not open the descriptor-change probe"
+        )
+        try verifyDescriptorMutationIsRejected(
+            processSafetyB,
+            by: session
+        )
+        try validate(
+            target: target,
+            expected: "B",
+            digest: safetyB.digest,
+            cycle: cycles + 1
+        )
+        let closed = try target.send(command: "close-resource")
+        try require(
+            closed.event == "resource-closed",
+            "target did not close the descriptor-change probe"
+        )
+
         try target.exitCleanly()
         exitedCleanly = true
 
@@ -163,11 +195,100 @@ enum ExternalHotProof {
         print("  full VM regions:     \(processStateA.info.captured_region_count)")
         print("  full captured bytes: \(processStateA.info.captured_bytes)")
         print("  excluded VM regions: \(processStateA.info.excluded_region_count)")
+        print(
+            "  kernel resources:    \(resourceSummary(resourceStateA))"
+        )
+        print("  resource A->B gate:  unchanged")
+        print("  descriptor mutation: rejected before memory write")
         print("  restore cycles:      \(fullProcessCycleCount) full-process + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
         )
         print("  safety state B was captured before the first rewind and restored last")
+    }
+
+    private static func verifyDescriptorMutationIsRejected(
+        _ capture: RemoteProcessCapture,
+        by session: OpaquePointer
+    ) throws {
+        var report = continuum_remote_process_restore_report()
+        let status = continuum_remote_session_restore_process(
+            session,
+            capture.snapshot,
+            &report
+        )
+        try require(
+            status == CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED,
+            "descriptor-change restore returned \(runtimeStatusDescription(status))"
+        )
+        try require(
+            report.bytes_written == 0
+                && report.thread_states_restored == 0
+                && report.rollback_attempted == 0,
+            "descriptor-change guard modified the target before rejecting restore"
+        )
+    }
+
+    private static func captureResources(
+        session: OpaquePointer
+    ) throws -> continuum_remote_resource_fingerprint {
+        var fingerprint = continuum_remote_resource_fingerprint()
+        try check(
+            continuum_remote_session_capture_resource_fingerprint(
+                session,
+                &fingerprint
+            ),
+            operation: "capture external target kernel-resource fingerprint"
+        )
+        try require(
+            fingerprint.file_descriptor_count > 0,
+            "resource fingerprint contained no file descriptors"
+        )
+        try require(
+            fingerprint.descriptor_table_hash != 0,
+            "resource fingerprint contained no descriptor hash"
+        )
+        try require(
+            fingerprint.mach_name_count > 0 && fingerprint.mach_space_hash != 0,
+            "resource fingerprint contained no Mach namespace"
+        )
+        try require(
+            fingerprint.thread_count > 0 && fingerprint.thread_set_hash != 0,
+            "resource fingerprint contained no thread set"
+        )
+        return fingerprint
+    }
+
+    private static func resourceSummary(
+        _ fingerprint: continuum_remote_resource_fingerprint
+    ) -> String {
+        "fd=\(fingerprint.file_descriptor_count) "
+            + "vnode=\(fingerprint.vnode_count) "
+            + "socket=\(fingerprint.socket_count) "
+            + "pipe=\(fingerprint.pipe_count) "
+            + "kqueue=\(fingerprint.kqueue_count) "
+            + "mach=\(fingerprint.mach_name_count) "
+            + "threads=\(fingerprint.thread_count) "
+            + "unsupported=\(fingerprint.unsupported_descriptor_count)"
+    }
+
+    private static func resourceChangeDescription(_ changes: UInt32) -> String {
+        var names: [String] = []
+        if changes & UInt32(CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE.rawValue) != 0 {
+            names.append("descriptor table")
+        }
+        if changes & UInt32(CONTINUUM_RESOURCE_CHANGE_MACH_SPACE.rawValue) != 0 {
+            names.append("Mach namespace")
+        }
+        if changes & UInt32(CONTINUUM_RESOURCE_CHANGE_THREAD_SET.rawValue) != 0 {
+            names.append("thread set")
+        }
+        if changes
+            & UInt32(CONTINUUM_RESOURCE_CHANGE_UNSUPPORTED_DESCRIPTOR.rawValue) != 0
+        {
+            names.append("unsupported descriptor")
+        }
+        return names.isEmpty ? "none" : names.joined(separator: ", ")
     }
 
     private static func captureProcess(session: OpaquePointer) throws -> RemoteProcessCapture {
@@ -417,11 +538,14 @@ enum ExternalHotProof {
 
     private static func check(_ status: continuum_status, operation: String) throws {
         guard status == CONTINUUM_STATUS_OK else {
-            let detail =
-                continuum_status_string(status).map(String.init(cString:))
-                ?? String(describing: status)
+            let detail = runtimeStatusDescription(status)
             throw ExternalHotProofFailure.runtime(operation: operation, status: detail)
         }
+    }
+
+    private static func runtimeStatusDescription(_ status: continuum_status) -> String {
+        continuum_status_string(status).map(String.init(cString:))
+            ?? String(describing: status)
     }
 
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {

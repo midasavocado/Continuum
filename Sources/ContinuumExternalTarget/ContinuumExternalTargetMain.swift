@@ -19,6 +19,7 @@ private final class TargetServer {
     private let arena: UnsafeMutableRawPointer
     private let encoder: JSONEncoder
     private let decoder = JSONDecoder()
+    private var probeDescriptor: Int32 = -1
 
     init() throws {
         pageSize = Int(sysconf(_SC_PAGESIZE))
@@ -45,6 +46,9 @@ private final class TargetServer {
     }
 
     deinit {
+        if probeDescriptor >= 0 {
+            close(probeDescriptor)
+        }
         arena.initializeMemory(as: UInt8.self, repeating: 0, count: pageSize)
         munmap(arena, pageSize)
     }
@@ -97,6 +101,34 @@ private final class TargetServer {
                     valid: matches,
                     error: matches ? nil : "arena bytes do not match state \(expected.rawValue)"
                 ))
+            case "open-resource":
+                guard probeDescriptor < 0 else {
+                    try send(.error("probe descriptor is already open", command: command.command))
+                    continue
+                }
+                probeDescriptor = open("/dev/null", O_RDONLY | O_CLOEXEC)
+                guard probeDescriptor >= 0 else {
+                    try send(.error(
+                        "could not open probe descriptor: errno \(errno)",
+                        command: command.command
+                    ))
+                    continue
+                }
+                try send(reply(event: "resource-opened", command: command.command))
+            case "close-resource":
+                guard probeDescriptor >= 0 else {
+                    try send(.error("probe descriptor is not open", command: command.command))
+                    continue
+                }
+                guard close(probeDescriptor) == 0 else {
+                    try send(.error(
+                        "could not close probe descriptor: errno \(errno)",
+                        command: command.command
+                    ))
+                    continue
+                }
+                probeDescriptor = -1
+                try send(reply(event: "resource-closed", command: command.command))
             case "exit":
                 try send(reply(event: "exiting", command: command.command))
                 return

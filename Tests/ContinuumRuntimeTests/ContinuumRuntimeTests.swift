@@ -142,6 +142,86 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertNil(threads)
     }
 
+    func testResourceFingerprintInventoriesSelfAndClassifiesChanges() {
+        var session: OpaquePointer?
+        XCTAssertEqual(
+            continuum_remote_session_open(getpid(), &session),
+            CONTINUUM_STATUS_OK
+        )
+        guard let session else { return XCTFail("Expected self session") }
+        defer { continuum_remote_session_destroy(session) }
+
+        var captured = continuum_remote_resource_fingerprint()
+        XCTAssertEqual(
+            continuum_remote_session_capture_resource_fingerprint(
+                session,
+                &captured
+            ),
+            CONTINUUM_STATUS_OK
+        )
+        XCTAssertGreaterThanOrEqual(captured.file_descriptor_count, 3)
+        XCTAssertGreaterThan(captured.descriptor_table_hash, 0)
+        XCTAssertGreaterThan(captured.mach_name_count, 0)
+        XCTAssertGreaterThan(captured.mach_space_hash, 0)
+        XCTAssertGreaterThan(captured.thread_count, 0)
+        XCTAssertGreaterThan(captured.thread_set_hash, 0)
+
+        let descriptorChange = UInt32(
+            CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE.rawValue
+        )
+        let machChange = UInt32(CONTINUUM_RESOURCE_CHANGE_MACH_SPACE.rawValue)
+        let threadChange = UInt32(CONTINUUM_RESOURCE_CHANGE_THREAD_SET.rawValue)
+        let unsupportedChange = UInt32(
+            CONTINUUM_RESOURCE_CHANGE_UNSUPPORTED_DESCRIPTOR.rawValue
+        )
+
+        var saved = continuum_remote_resource_fingerprint()
+        var current = saved
+        XCTAssertEqual(
+            continuum_remote_resource_fingerprint_changes(&saved, &current),
+            UInt32(CONTINUUM_RESOURCE_CHANGE_NONE.rawValue)
+        )
+
+        current.descriptor_table_hash = 1
+        XCTAssertEqual(
+            continuum_remote_resource_fingerprint_changes(&saved, &current),
+            descriptorChange
+        )
+        current = saved
+        current.mach_space_hash = 1
+        XCTAssertEqual(
+            continuum_remote_resource_fingerprint_changes(&saved, &current),
+            machChange
+        )
+        current = saved
+        current.thread_set_hash = 1
+        XCTAssertEqual(
+            continuum_remote_resource_fingerprint_changes(&saved, &current),
+            threadChange
+        )
+        current = saved
+        current.unsupported_descriptor_count = 1
+        XCTAssertEqual(
+            continuum_remote_resource_fingerprint_changes(&saved, &current),
+            unsupportedChange
+        )
+
+        let allChanges = descriptorChange | machChange | threadChange
+            | unsupportedChange
+        XCTAssertEqual(
+            continuum_remote_resource_fingerprint_changes(nil, &current),
+            allChanges
+        )
+        XCTAssertEqual(
+            continuum_remote_session_capture_resource_fingerprint(nil, &captured),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(
+            continuum_remote_session_capture_resource_fingerprint(session, nil),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+    }
+
     func testRemoteSelfSessionCapturesThreadEvidenceAndRestoresArenaBytes() {
         let length = 16_384
         guard let memory = mmap(
@@ -513,7 +593,12 @@ final class ContinuumRuntimeTests: XCTestCase {
             CONTINUUM_STATUS_SUSPEND_FAILED,
             CONTINUUM_STATUS_RESUME_FAILED,
             CONTINUUM_STATUS_THREAD_STATE_FAILED,
-            CONTINUUM_STATUS_REGION_MAPPING_CHANGED
+            CONTINUUM_STATUS_REGION_MAPPING_CHANGED,
+            CONTINUUM_STATUS_SNAPSHOT_BUDGET_EXCEEDED,
+            CONTINUUM_STATUS_THREAD_RESTORE_FAILED,
+            CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED,
+            CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED,
+            CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR
         ]
 
         for status in statuses {

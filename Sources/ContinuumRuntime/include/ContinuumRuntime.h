@@ -32,7 +32,10 @@ typedef enum continuum_status {
     CONTINUUM_STATUS_THREAD_STATE_FAILED = 20,
     CONTINUUM_STATUS_REGION_MAPPING_CHANGED = 21,
     CONTINUUM_STATUS_SNAPSHOT_BUDGET_EXCEEDED = 22,
-    CONTINUUM_STATUS_THREAD_RESTORE_FAILED = 23
+    CONTINUUM_STATUS_THREAD_RESTORE_FAILED = 23,
+    CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED = 24,
+    CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED = 25,
+    CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR = 26
 } continuum_status;
 
 typedef struct continuum_runtime_info {
@@ -122,6 +125,36 @@ typedef struct continuum_remote_thread_state_info {
     size_t vector_state_length;
 } continuum_remote_thread_state_info;
 
+typedef struct continuum_remote_resource_fingerprint {
+    uint64_t file_descriptor_count;
+    uint64_t vnode_count;
+    uint64_t socket_count;
+    uint64_t pipe_count;
+    uint64_t kqueue_count;
+    uint64_t shared_memory_count;
+    uint64_t semaphore_count;
+    uint64_t guarded_descriptor_count;
+    uint64_t unsupported_descriptor_count;
+    uint64_t descriptor_table_hash;
+    uint64_t mach_name_count;
+    uint64_t mach_send_right_count;
+    uint64_t mach_receive_right_count;
+    uint64_t mach_send_once_right_count;
+    uint64_t mach_port_set_count;
+    uint64_t mach_dead_name_count;
+    uint64_t mach_space_hash;
+    uint64_t thread_count;
+    uint64_t thread_set_hash;
+} continuum_remote_resource_fingerprint;
+
+typedef enum continuum_resource_change {
+    CONTINUUM_RESOURCE_CHANGE_NONE = 0,
+    CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE = 1 << 0,
+    CONTINUUM_RESOURCE_CHANGE_MACH_SPACE = 1 << 1,
+    CONTINUUM_RESOURCE_CHANGE_THREAD_SET = 1 << 2,
+    CONTINUUM_RESOURCE_CHANGE_UNSUPPORTED_DESCRIPTOR = 1 << 3
+} continuum_resource_change;
+
 continuum_status continuum_runtime_inspect_self(continuum_runtime_info *out_info);
 
 continuum_status continuum_tracked_region_create(
@@ -157,6 +190,21 @@ continuum_status continuum_remote_session_open(
 continuum_status continuum_remote_session_identity(
     const continuum_remote_session *session,
     continuum_remote_identity *out_identity
+);
+
+/// Captures a read-only kernel-resource fingerprint while an external target
+/// is suspended. It inventories descriptor topology, vnode identity/offsets,
+/// Mach right topology, and thread identities. It does not serialize resource
+/// contents and therefore acts as a certification/restore guard, not a restore
+/// mechanism by itself.
+continuum_status continuum_remote_session_capture_resource_fingerprint(
+    continuum_remote_session *session,
+    continuum_remote_resource_fingerprint *out_fingerprint
+);
+
+uint32_t continuum_remote_resource_fingerprint_changes(
+    const continuum_remote_resource_fingerprint *saved,
+    const continuum_remote_resource_fingerprint *current
 );
 
 /// Registers the only memory range capture and restore may touch. The range
