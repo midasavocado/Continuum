@@ -42,7 +42,9 @@ public struct MacPermissionService: PermissionProviding, Sendable {
     }
 
     public func statuses() async -> [PermissionStatus] {
-        PermissionKind.allCases.map(status(for:))
+        await MainActor.run {
+            PermissionKind.allCases.map(status(for:))
+        }
     }
 
     public func request(_ permission: PermissionKind) async -> PermissionStatus {
