@@ -256,6 +256,36 @@ final class ContinuumRuntimeTests: XCTestCase {
             ),
             CONTINUUM_STATUS_INVALID_ARGUMENT
         )
+        var requiredLength = 0
+        XCTAssertEqual(
+            continuum_remote_process_group_copy_member_region_bytes(
+                nil, 0, 0, nil, 0, &requiredLength
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(
+            continuum_remote_process_group_member_thread_count(nil, 0),
+            0
+        )
+        var threadInfo = continuum_remote_thread_state_info()
+        XCTAssertEqual(
+            continuum_remote_process_group_copy_member_thread_info(
+                nil, 0, 0, &threadInfo
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(
+            continuum_remote_process_group_copy_member_thread_general_state(
+                nil, 0, 0, nil, 0, &requiredLength
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(
+            continuum_remote_process_group_copy_member_thread_vector_state(
+                nil, 0, 0, nil, 0, &requiredLength
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
         var report = continuum_remote_process_group_restore_report()
         XCTAssertEqual(
             continuum_remote_process_group_restore(nil, &report),

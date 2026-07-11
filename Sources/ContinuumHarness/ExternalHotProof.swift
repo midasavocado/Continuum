@@ -161,6 +161,7 @@ enum ExternalHotProof {
         var resourceStateA = try captureResources(session: session)
         let processStateAStart = DispatchTime.now().uptimeNanoseconds
         let processStateA = try captureProcessGroup(rootProcessID: targetPID)
+        try verifyDurableExportSurface(processStateA)
         progress(
             "process-group A snapshot: \(milliseconds(since: processStateAStart)) ms"
         )
@@ -453,6 +454,124 @@ enum ExternalHotProof {
                 && report.rollback_attempted == 0,
             "descriptor-change guard modified the target before rejecting restore"
         )
+    }
+
+    private static func verifyDurableExportSurface(
+        _ capture: RemoteProcessGroupCapture
+    ) throws {
+        for memberIndex in 0..<continuum_remote_process_group_member_count(
+            capture.snapshot
+        ) {
+            let regionCount = continuum_remote_process_group_member_region_count(
+                capture.snapshot,
+                memberIndex
+            )
+            try require(regionCount > 0, "durable export found no memory regions")
+
+            var smallestRegionIndex = 0
+            var smallestRegionLength = UInt64.max
+            for regionIndex in 0..<regionCount {
+                var region = continuum_remote_process_region_info()
+                try check(
+                    continuum_remote_process_group_copy_member_region_info(
+                        capture.snapshot,
+                        memberIndex,
+                        regionIndex,
+                        &region
+                    ),
+                    operation: "inspect durable region export"
+                )
+                var requiredLength = 0
+                try check(
+                    continuum_remote_process_group_copy_member_region_bytes(
+                        capture.snapshot,
+                        memberIndex,
+                        regionIndex,
+                        nil,
+                        0,
+                        &requiredLength
+                    ),
+                    operation: "size durable region export"
+                )
+                try require(
+                    UInt64(requiredLength) == region.length,
+                    "durable region byte length disagreed with metadata"
+                )
+                if region.length < smallestRegionLength {
+                    smallestRegionLength = region.length
+                    smallestRegionIndex = regionIndex
+                }
+            }
+
+            var regionBytes = Data(count: Int(smallestRegionLength))
+            var copiedRegionLength = 0
+            let regionStatus = regionBytes.withUnsafeMutableBytes { buffer in
+                continuum_remote_process_group_copy_member_region_bytes(
+                    capture.snapshot,
+                    memberIndex,
+                    smallestRegionIndex,
+                    buffer.baseAddress,
+                    buffer.count,
+                    &copiedRegionLength
+                )
+            }
+            try check(regionStatus, operation: "copy durable region bytes")
+            try require(
+                copiedRegionLength == regionBytes.count,
+                "durable region export returned a short copy"
+            )
+
+            let threadCount = continuum_remote_process_group_member_thread_count(
+                capture.snapshot,
+                memberIndex
+            )
+            try require(threadCount > 0, "durable export found no thread states")
+            for threadIndex in 0..<threadCount {
+                var thread = continuum_remote_thread_state_info()
+                try check(
+                    continuum_remote_process_group_copy_member_thread_info(
+                        capture.snapshot,
+                        memberIndex,
+                        threadIndex,
+                        &thread
+                    ),
+                    operation: "inspect durable thread export"
+                )
+                try require(
+                    thread.general_state_length > 0 && thread.vector_state_length > 0,
+                    "durable thread export omitted a register bank"
+                )
+                var general = Data(count: thread.general_state_length)
+                var requiredGeneral = 0
+                let generalStatus = general.withUnsafeMutableBytes { buffer in
+                    continuum_remote_process_group_copy_member_thread_general_state(
+                        capture.snapshot,
+                        memberIndex,
+                        threadIndex,
+                        buffer.baseAddress,
+                        buffer.count,
+                        &requiredGeneral
+                    )
+                }
+                try check(generalStatus, operation: "copy durable general registers")
+                try require(requiredGeneral == general.count, "general register copy was short")
+
+                var vector = Data(count: thread.vector_state_length)
+                var requiredVector = 0
+                let vectorStatus = vector.withUnsafeMutableBytes { buffer in
+                    continuum_remote_process_group_copy_member_thread_vector_state(
+                        capture.snapshot,
+                        memberIndex,
+                        threadIndex,
+                        buffer.baseAddress,
+                        buffer.count,
+                        &requiredVector
+                    )
+                }
+                try check(vectorStatus, operation: "copy durable vector registers")
+                try require(requiredVector == vector.count, "vector register copy was short")
+            }
+        }
     }
 
     private static func captureResources(

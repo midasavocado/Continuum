@@ -25,6 +25,58 @@ final class ModelRoundTripTests: XCTestCase {
         XCTAssertEqual(decoded, snapshot)
     }
 
+    func testDurableCheckpointImageRoundTripsWithoutLivePointers() throws {
+        let chunk = DurableChunkReference(
+            hash: String(repeating: "a", count: 64),
+            logicalBytes: 16_384,
+            storedBytes: 1_024,
+            compression: .lzfse
+        )
+        let image = DurableCheckpointImage(
+            checkpointID: UUID(),
+            createdAt: Date(timeIntervalSince1970: 1_750_000_000),
+            architecture: "arm64",
+            operatingSystemBuild: "test-build",
+            pageSize: 16_384,
+            rootProcessIdentifier: 4242,
+            app: makeApp(),
+            members: [
+                DurableProcessImage(
+                    processIdentifier: 4242,
+                    parentProcessIdentifier: 1,
+                    executableDevice: 7,
+                    executableInode: 9,
+                    vmLayoutHash: 11,
+                    regions: [
+                        DurableMemoryRegion(
+                            address: 0x1_0000_0000,
+                            length: 16_384,
+                            protection: 3,
+                            maximumProtection: 7,
+                            inheritance: 2,
+                            shareMode: 2,
+                            userTag: 0,
+                            chunks: [chunk]
+                        )
+                    ],
+                    threads: [
+                        DurableThreadImage(
+                            threadIdentifier: 13,
+                            generalStateFlavor: 6,
+                            generalState: chunk,
+                            vectorStateFlavor: 17,
+                            vectorState: chunk
+                        )
+                    ]
+                )
+            ],
+            writableFiles: []
+        )
+
+        XCTAssertEqual(try roundTrip(image), image)
+        XCTAssertEqual(image.formatVersion, DurableCheckpointImage.currentFormatVersion)
+    }
+
     func testStoreIndexRoundTripsNestedSnapshotBranchAndProvisionalRewind() throws {
         let snapshot = makeSnapshot()
         let branch = BranchRecord(

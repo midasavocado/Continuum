@@ -2975,6 +2975,14 @@ continuum_status continuum_remote_process_group_copy_member_info(
         snapshot->members[index].snapshot;
     out_info->process_id = snapshot->members[index].session->identity.process_id;
     out_info->parent_process_id = snapshot->members[index].parent_process_id;
+    out_info->start_seconds =
+        snapshot->members[index].session->identity.start_seconds;
+    out_info->start_microseconds =
+        snapshot->members[index].session->identity.start_microseconds;
+    out_info->executable_device =
+        snapshot->members[index].session->identity.executable_device;
+    out_info->executable_inode =
+        snapshot->members[index].session->identity.executable_inode;
     out_info->captured_region_count =
         process_snapshot->info.captured_region_count;
     out_info->captured_bytes = process_snapshot->info.captured_bytes;
@@ -3135,6 +3143,107 @@ continuum_status continuum_remote_process_group_copy_member_region_info(
         snapshot->members[member_index].snapshot,
         region_index,
         out_info
+    );
+}
+
+continuum_status continuum_remote_process_group_copy_member_region_bytes(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t region_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+) {
+    if (snapshot == NULL || out_required_length == NULL
+        || member_index >= snapshot->member_count
+        || snapshot->members[member_index].snapshot == NULL
+        || (destination == NULL && destination_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    const continuum_remote_process_snapshot *process =
+        snapshot->members[member_index].snapshot;
+    if (region_index >= process->region_count) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    const continuum_remote_process_region *region = &process->regions[region_index];
+    *out_required_length = (size_t)region->length;
+    if (destination == NULL) {
+        return CONTINUUM_STATUS_OK;
+    }
+    if (destination_capacity < region->length || region->bytes == NULL) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    memcpy(destination, region->bytes, (size_t)region->length);
+    return CONTINUUM_STATUS_OK;
+}
+
+size_t continuum_remote_process_group_member_thread_count(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index
+) {
+    if (snapshot == NULL || member_index >= snapshot->member_count
+        || snapshot->members[member_index].snapshot == NULL
+        || snapshot->members[member_index].snapshot->threads == NULL) {
+        return 0;
+    }
+    return snapshot->members[member_index].snapshot->threads->count;
+}
+
+static const continuum_remote_thread_snapshot *continuum_group_member_threads(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index
+) {
+    if (snapshot == NULL || member_index >= snapshot->member_count
+        || snapshot->members[member_index].snapshot == NULL) {
+        return NULL;
+    }
+    return snapshot->members[member_index].snapshot->threads;
+}
+
+continuum_status continuum_remote_process_group_copy_member_thread_info(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t thread_index,
+    continuum_remote_thread_state_info *out_info
+) {
+    return continuum_remote_thread_snapshot_info(
+        continuum_group_member_threads(snapshot, member_index),
+        thread_index,
+        out_info
+    );
+}
+
+continuum_status continuum_remote_process_group_copy_member_thread_general_state(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t thread_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+) {
+    return continuum_remote_thread_snapshot_copy_general_state(
+        continuum_group_member_threads(snapshot, member_index),
+        thread_index,
+        destination,
+        destination_capacity,
+        out_required_length
+    );
+}
+
+continuum_status continuum_remote_process_group_copy_member_thread_vector_state(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t thread_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+) {
+    return continuum_remote_thread_snapshot_copy_vector_state(
+        continuum_group_member_threads(snapshot, member_index),
+        thread_index,
+        destination,
+        destination_capacity,
+        out_required_length
     );
 }
 

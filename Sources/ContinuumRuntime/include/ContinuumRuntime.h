@@ -178,6 +178,10 @@ typedef struct continuum_remote_process_group_snapshot_info {
 typedef struct continuum_remote_process_group_member_info {
     int32_t process_id;
     int32_t parent_process_id;
+    uint64_t start_seconds;
+    uint64_t start_microseconds;
+    uint64_t executable_device;
+    uint64_t executable_inode;
     uint64_t captured_region_count;
     uint64_t captured_bytes;
     uint64_t thread_count;
@@ -438,6 +442,47 @@ continuum_status continuum_remote_process_group_copy_member_region_info(
     size_t member_index,
     size_t region_index,
     continuum_remote_process_region_info *out_info
+);
+
+/// Copies captured bytes from one process-tree region. A null destination with
+/// zero capacity reports the required length without copying.
+continuum_status continuum_remote_process_group_copy_member_region_bytes(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t region_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+);
+
+size_t continuum_remote_process_group_member_thread_count(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index
+);
+
+continuum_status continuum_remote_process_group_copy_member_thread_info(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t thread_index,
+    continuum_remote_thread_state_info *out_info
+);
+
+continuum_status continuum_remote_process_group_copy_member_thread_general_state(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t thread_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+);
+
+continuum_status continuum_remote_process_group_copy_member_thread_vector_state(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t thread_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
 );
 
 void continuum_remote_process_group_snapshot_destroy(
