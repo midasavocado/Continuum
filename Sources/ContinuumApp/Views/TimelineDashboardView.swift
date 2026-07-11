@@ -96,7 +96,7 @@ struct TimelineDashboardView: View {
                          : "Rewind engine not available")
                         .font(.headline)
                     Text(canCaptureFunctionalState
-                         ? "Experimental Hot rewinds live memory and threads; files and external resources remain guarded limitations."
+                         ? "Experimental Hot rewinds live memory, threads, and captured open-file bytes; other resources remain guarded limitations."
                          : "This build cannot create a restorable state yet, so saving and rewinding are unavailable instead of pretending.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)

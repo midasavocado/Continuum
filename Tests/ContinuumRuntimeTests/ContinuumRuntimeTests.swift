@@ -261,6 +261,36 @@ final class ContinuumRuntimeTests: XCTestCase {
             continuum_remote_process_group_restore(nil, &report),
             CONTINUUM_STATUS_INVALID_ARGUMENT
         )
+        XCTAssertEqual(
+            continuum_remote_process_group_capture_with_resources(
+                getpid(),
+                1_024,
+                nil,
+                nil,
+                &snapshot,
+                &info
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(
+            continuum_remote_process_group_restore_with_resources(
+                nil,
+                nil,
+                nil,
+                &report
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        var vnodeCount = 0
+        XCTAssertEqual(
+            continuum_remote_process_group_copy_writable_vnodes(
+                nil,
+                nil,
+                0,
+                &vnodeCount
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
     }
 
     func testRemoteSelfSessionCapturesThreadEvidenceAndRestoresArenaBytes() {

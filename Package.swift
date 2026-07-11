@@ -29,7 +29,7 @@ let package = Package(
         ),
         .target(
             name: "ContinuumSystem",
-            dependencies: ["ContinuumCore", "ContinuumRuntime"],
+            dependencies: ["ContinuumCore", "ContinuumRuntime", "ContinuumStore"],
             linkerSettings: [
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Security")

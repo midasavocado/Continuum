@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -17,6 +18,8 @@ typedef struct target_state {
     size_t length;
     char state;
     int probe_descriptor;
+    int stable_descriptor;
+    char stable_path[PATH_MAX];
     int is_helper;
     pid_t helper_pid;
     FILE *helper_input;
@@ -25,6 +28,7 @@ typedef struct target_state {
     size_t helper_length;
     char helper_state;
     char helper_digest[17];
+    int helper_valid;
 } target_state;
 
 static uint64_t digest_bytes(const uint8_t *bytes, size_t length) {
@@ -51,6 +55,28 @@ static void write_state(target_state *target, char state) {
 
 static void current_digest(const target_state *target, char output[17]) {
     snprintf(output, 17, "%016llx", digest_bytes(target->arena, target->length));
+}
+
+static int write_file_state(target_state *target, char state) {
+    char bytes[32];
+    int length = snprintf(bytes, sizeof(bytes), "continuum-file-%c\n", state);
+    if (length <= 0
+        || pwrite(target->stable_descriptor, bytes, (size_t)length, 0) != length
+        || ftruncate(target->stable_descriptor, length) != 0
+        || fsync(target->stable_descriptor) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int validate_file_state(target_state *target, char state) {
+    char expected[32];
+    char actual[32] = {0};
+    int length = snprintf(expected, sizeof(expected), "continuum-file-%c\n", state);
+    if (length <= 0 || pread(target->stable_descriptor, actual, sizeof(actual), 0) != length) {
+        return 0;
+    }
+    return memcmp(actual, expected, (size_t)length) == 0;
 }
 
 static int parse_command(const char *line, char command[32], char *state) {
@@ -83,6 +109,7 @@ static int parse_helper_reply(target_state *target, const char *line) {
     const char *length_key = strstr(line, "\"length\":");
     const char *state_key = strstr(line, "\"state\":\"");
     const char *digest_key = strstr(line, "\"digest\":\"");
+    const char *valid_key = strstr(line, "\"valid\":");
     if (pid_key == NULL || state_key == NULL || digest_key == NULL) {
         return 0;
     }
@@ -109,6 +136,9 @@ static int parse_helper_reply(target_state *target, const char *line) {
     digest_key += strlen("\"digest\":\"");
     memcpy(target->helper_digest, digest_key, 16);
     target->helper_digest[16] = '\0';
+    target->helper_valid = valid_key == NULL
+        ? -1
+        : (strncmp(valid_key + strlen("\"valid\":"), "true", 4) == 0 ? 1 : 0);
     return target->helper_pid > 0;
 }
 
@@ -264,6 +294,33 @@ static int run_server(target_state *target) {
                 && helper_valid
                 && (target->is_helper || target->helper_state == requested_state);
             send_reply(target, "validated", command, valid, valid ? NULL : "state mismatch");
+        } else if (strcmp(command, "mutate-file") == 0) {
+            int helper_valid = target->is_helper
+                || helper_exchange(target, command, requested_state);
+            int valid = (requested_state == 'A' || requested_state == 'B')
+                && helper_valid
+                && write_file_state(target, requested_state);
+            send_reply(
+                target,
+                "file-mutated",
+                command,
+                valid,
+                valid ? NULL : "file mutation failed"
+            );
+        } else if (strcmp(command, "validate-file") == 0) {
+            int helper_valid = target->is_helper
+                ? validate_file_state(target, requested_state)
+                : (helper_exchange(target, command, requested_state)
+                    && target->helper_valid == 1);
+            int valid = validate_file_state(target, requested_state)
+                && helper_valid;
+            send_reply(
+                target,
+                "file-validated",
+                command,
+                valid,
+                valid ? NULL : "file state mismatch"
+            );
         } else if (strcmp(command, "open-resource") == 0) {
             target->probe_descriptor = open("/dev/null", O_RDONLY | O_CLOEXEC);
             send_reply(
@@ -303,6 +360,7 @@ int main(int argc, char **argv) {
     target_state target;
     memset(&target, 0, sizeof(target));
     target.probe_descriptor = -1;
+    target.stable_descriptor = -1;
     target.is_helper = argc > 1 && strcmp(argv[1], "--continuum-helper") == 0;
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
@@ -321,10 +379,28 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
     write_state(&target, 'A');
+    snprintf(
+        target.stable_path,
+        sizeof(target.stable_path),
+        "/private/tmp/continuum-external-target-%d-XXXXXX",
+        getpid()
+    );
+    target.stable_descriptor = mkstemp(target.stable_path);
+    if (target.stable_descriptor < 0
+        || !write_file_state(&target, 'B')) {
+        if (target.stable_descriptor >= 0) {
+            close(target.stable_descriptor);
+        }
+        unlink(target.stable_path);
+        munmap(target.arena, target.length);
+        return EXIT_FAILURE;
+    }
     if (!target.is_helper && !spawn_helper(&target, argv[0])) {
         return EXIT_FAILURE;
     }
     int succeeded = run_server(&target);
+    close(target.stable_descriptor);
+    unlink(target.stable_path);
     munmap(target.arena, target.length);
     return succeeded ? EXIT_SUCCESS : EXIT_FAILURE;
 }

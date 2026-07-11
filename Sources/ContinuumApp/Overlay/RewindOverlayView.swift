@@ -183,7 +183,7 @@ struct RewindOverlayView: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 } else if snapshot.availability == .experimentalHot {
                     Label {
-                        Text("Experimental Hot restores live memory and threads. Files, connections, windows, and GPU resources are not reconstructed yet.")
+                        Text("Experimental Hot restores live memory, threads, and captured open-file bytes. Closed or renamed files, connections, windows, and GPU resources are not reconstructed yet.")
                     } icon: {
                         Image(systemName: "flask.fill")
                     }

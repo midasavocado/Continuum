@@ -57,6 +57,22 @@ typedef struct continuum_remote_process_snapshot continuum_remote_process_snapsh
 typedef struct continuum_remote_process_group_snapshot
     continuum_remote_process_group_snapshot;
 
+/// Runs while every member of a process group remains coherently suspended.
+/// The callback must not resume or mutate process topology. Returning a failure
+/// aborts capture, resumes every task, and destroys the incomplete snapshot.
+typedef continuum_status (*continuum_remote_resource_capture_callback)(
+    const continuum_remote_process_group_snapshot *snapshot,
+    void *context
+);
+
+/// Runs after memory/thread state has been applied but before any group member
+/// resumes. A failure triggers the runtime's all-member memory rollback; the
+/// callback owns rollback of any external resource bytes it changed.
+typedef continuum_status (*continuum_remote_resource_restore_callback)(
+    const continuum_remote_process_group_snapshot *snapshot,
+    void *context
+);
+
 typedef struct continuum_remote_identity {
     int32_t process_id;
     uint64_t start_seconds;
@@ -182,6 +198,20 @@ typedef struct continuum_remote_process_group_restore_report {
     uint8_t rollback_attempted;
     uint8_t rollback_verified;
 } continuum_remote_process_group_restore_report;
+
+#define CONTINUUM_REMOTE_PATH_MAX 4096
+
+typedef struct continuum_remote_writable_vnode_info {
+    int32_t process_id;
+    int32_t file_descriptor;
+    uint32_t open_flags;
+    int64_t offset;
+    uint64_t device;
+    uint64_t inode;
+    uint64_t byte_count;
+    uint32_t mode;
+    char path[CONTINUUM_REMOTE_PATH_MAX];
+} continuum_remote_writable_vnode_info;
 
 typedef enum continuum_resource_change {
     CONTINUUM_RESOURCE_CHANGE_NONE = 0,
@@ -340,12 +370,33 @@ continuum_status continuum_remote_process_group_capture(
     continuum_remote_process_group_snapshot_info *out_info
 );
 
+/// Captures the process group and invokes `callback` during the same coherent
+/// suspension cut. This is the integration point for file, IPC, window, GPU,
+/// audio, and device checkpoint adapters.
+continuum_status continuum_remote_process_group_capture_with_resources(
+    int32_t root_process_id,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_resource_capture_callback callback,
+    void *callback_context,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+);
+
 /// Restores a hot process group only while the exact original tasks, parent
 /// relationships, VM layouts, resource fingerprints, and thread identities
 /// remain present. All safety cuts validate before the first write. A partial
 /// multi-process write rolls every touched member back before resuming them.
 continuum_status continuum_remote_process_group_restore(
     continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_process_group_restore_report *out_report
+);
+
+/// Restores memory/thread state and invokes `callback` before the group resumes.
+/// A callback failure rolls process memory back to the pre-restore safety cut.
+continuum_status continuum_remote_process_group_restore_with_resources(
+    continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_resource_restore_callback callback,
+    void *callback_context,
     continuum_remote_process_group_restore_report *out_report
 );
 
@@ -357,6 +408,16 @@ continuum_status continuum_remote_process_group_copy_member_info(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t index,
     continuum_remote_process_group_member_info *out_info
+);
+
+/// Copies every regular vnode opened for writing by any captured group member.
+/// A null `entries` with zero capacity returns the required count. Call only
+/// from a coherent resource callback while the group is suspended.
+continuum_status continuum_remote_process_group_copy_writable_vnodes(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_writable_vnode_info *entries,
+    size_t entry_capacity,
+    size_t *out_entry_count
 );
 
 size_t continuum_remote_process_group_member_region_count(

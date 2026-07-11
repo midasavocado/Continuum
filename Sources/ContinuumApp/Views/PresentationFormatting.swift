@@ -41,6 +41,43 @@ extension RestoreAvailability {
     }
 }
 
+extension ResourceDomain {
+    var displayName: String {
+        switch self {
+        case .memory: "Memory"
+        case .threads: "Threads"
+        case .localFiles: "Local files"
+        case .descriptors: "Files and descriptors"
+        case .sockets: "Network sockets"
+        case .machIPC: "App connections"
+        case .windowServer: "Windows"
+        case .graphicsGPU: "Graphics and GPU"
+        case .audioDevices: "Audio and devices"
+        case .clocksRandomInput: "Time and input"
+        }
+    }
+}
+
+extension ResourceRestoreMode {
+    var displayName: String {
+        switch self {
+        case .restored: "Restored"
+        case .reconnected: "Reconnected"
+        case .rebuilt: "Rebuilt"
+        case .guarded: "Must stay unchanged"
+        case .unavailable: "Not restored"
+        }
+    }
+
+    var continuumTint: Color {
+        switch self {
+        case .restored, .reconnected, .rebuilt: .green
+        case .guarded: .orange
+        case .unavailable: .secondary
+        }
+    }
+}
+
 extension CompatibilityReport {
     var continuumStatusTitle: String {
         if canRestoreNow { return "Ready to rewind" }

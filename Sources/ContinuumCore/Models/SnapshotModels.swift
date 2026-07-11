@@ -34,12 +34,14 @@ public enum RestoreAvailability: String, Codable, CaseIterable, Sendable {
 
 public enum LocalFileCoverage: String, Codable, CaseIterable, Sendable {
     case exact
+    case openFiles
     case unchanged
     case unavailable
 
     public var displayName: String {
         switch self {
         case .exact: "Rewind with app"
+        case .openFiles: "Open files only"
         case .unchanged: "No local changes"
         case .unavailable: "Not captured"
         }
@@ -55,6 +57,46 @@ public enum LocalFileRestorePolicy: String, Codable, CaseIterable, Sendable {
         case .rewindCapturedFiles: "App + Local Files"
         case .keepCurrentFiles: "App Only — Keep Current Files"
         }
+    }
+}
+
+public enum ResourceDomain: String, Codable, CaseIterable, Sendable {
+    case memory
+    case threads
+    case localFiles
+    case descriptors
+    case sockets
+    case machIPC
+    case windowServer
+    case graphicsGPU
+    case audioDevices
+    case clocksRandomInput
+}
+
+public enum ResourceRestoreMode: String, Codable, CaseIterable, Sendable {
+    case restored
+    case reconnected
+    case rebuilt
+    case guarded
+    case unavailable
+
+    public var isFunctional: Bool {
+        switch self {
+        case .restored, .reconnected, .rebuilt: true
+        case .guarded, .unavailable: false
+        }
+    }
+}
+
+public struct ResourceCoverage: Codable, Hashable, Sendable {
+    public let domain: ResourceDomain
+    public let mode: ResourceRestoreMode
+    public let detail: String
+
+    public init(domain: ResourceDomain, mode: ResourceRestoreMode, detail: String) {
+        self.domain = domain
+        self.mode = mode
+        self.detail = detail
     }
 }
 
@@ -138,6 +180,9 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
     /// migration. New exact snapshots set this explicitly.
     public var localFileCoverage: LocalFileCoverage?
     public var allowsKeepingCurrentFiles: Bool?
+    /// Per-domain restoration evidence. Nil decodes legacy snapshots without
+    /// implying coverage that was never recorded.
+    public var resourceCoverage: [ResourceCoverage]?
 
     public init(
         id: SnapshotID = UUID(),
@@ -156,7 +201,8 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         isPinned: Bool = true,
         externalEffects: [ExternalEffect] = [],
         localFileCoverage: LocalFileCoverage? = .unavailable,
-        allowsKeepingCurrentFiles: Bool? = false
+        allowsKeepingCurrentFiles: Bool? = false,
+        resourceCoverage: [ResourceCoverage]? = nil
     ) {
         self.id = id
         self.name = name
@@ -175,6 +221,7 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         self.externalEffects = externalEffects
         self.localFileCoverage = localFileCoverage
         self.allowsKeepingCurrentFiles = allowsKeepingCurrentFiles
+        self.resourceCoverage = resourceCoverage
     }
 
     public var effectiveLocalFileCoverage: LocalFileCoverage {
@@ -183,6 +230,19 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
 
     public var isKeepingCurrentFilesCertified: Bool {
         allowsKeepingCurrentFiles ?? false
+    }
+
+    public var hasCompleteResourceCoverage: Bool {
+        guard let resourceCoverage else { return false }
+        let bestModeByDomain = Dictionary(
+            resourceCoverage.map { ($0.domain, $0.mode) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return resourceCoverage.count == ResourceDomain.allCases.count
+            && bestModeByDomain.count == ResourceDomain.allCases.count
+            && ResourceDomain.allCases.allSatisfy {
+            bestModeByDomain[$0]?.isFunctional == true
+        }
     }
 }
 

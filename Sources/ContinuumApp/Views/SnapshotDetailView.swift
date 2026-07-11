@@ -43,6 +43,7 @@ struct SnapshotDetailView: View {
                     }
                     detailsCard
                     localStateCard
+                    resourceCoverageCard
                 }
                 notesCard
                 actionBar
@@ -149,7 +150,7 @@ struct SnapshotDetailView: View {
                     .foregroundStyle(.secondary)
                 } else if snapshot.availability == .experimentalHot {
                     Text(
-                        "Experimental Hot restores the still-running process tree only. Local files stay current, and Continuum refuses the restore if guarded kernel resources changed."
+                        "Experimental Hot restores the still-running process tree and captured bytes of open writable files. Closed or renamed files stay current, and Continuum refuses the restore if guarded kernel resources changed."
                     )
                     .font(.subheadline)
                     .foregroundStyle(.orange)
@@ -200,6 +201,33 @@ struct SnapshotDetailView: View {
                     }
                     .disabled(!hasChanges)
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var resourceCoverageCard: some View {
+        if let coverage = snapshot.resourceCoverage, !coverage.isEmpty {
+            SurfaceCard {
+                DisclosureGroup("What this snapshot can restore") {
+                    VStack(spacing: 9) {
+                        Divider()
+                        ForEach(coverage, id: \.domain) { item in
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(item.domain.displayName)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(item.mode.displayName)
+                                    .fontWeight(.medium)
+                                    .foregroundStyle(item.mode.continuumTint)
+                            }
+                            .font(.subheadline)
+                            .help(item.detail)
+                        }
+                    }
+                    .padding(.top, 6)
+                }
+                .font(.headline)
             }
         }
     }

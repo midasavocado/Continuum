@@ -53,13 +53,9 @@ public enum LocalFileCheckpointError: Error, LocalizedError, Equatable, Sendable
 /// above this byte-preservation layer.
 public actor APFSLocalFileCheckpointStore {
     private let rootURL: URL
-    private let fileManager: FileManager
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
 
     public init(rootURL: URL, fileManager: FileManager = .default) throws {
         self.rootURL = rootURL.standardizedFileURL
-        self.fileManager = fileManager
         try fileManager.createDirectory(
             at: self.rootURL,
             withIntermediateDirectories: true,
@@ -71,7 +67,18 @@ public actor APFSLocalFileCheckpointStore {
         snapshotID: UUID,
         files: [URL]
     ) throws -> LocalFileCheckpointManifest {
-        let destination = snapshotURL(for: snapshotID)
+        try captureCoherently(snapshotID: snapshotID, files: files)
+    }
+
+    /// Synchronous entry point for a ContinuumRuntime resource callback. The
+    /// caller is responsible for serializing calls and keeping the target group
+    /// suspended for the duration of this operation.
+    public nonisolated func captureCoherently(
+        snapshotID: UUID,
+        files: [URL]
+    ) throws -> LocalFileCheckpointManifest {
+        let fileManager = FileManager.default
+        let destination = Self.snapshotURL(rootURL: rootURL, id: snapshotID)
         guard !fileManager.fileExists(atPath: destination.path) else {
             throw LocalFileCheckpointError.duplicateSnapshot(snapshotID)
         }
@@ -102,7 +109,7 @@ public actor APFSLocalFileCheckpointStore {
             var entries: [LocalFileCheckpointEntry] = []
             entries.reserveCapacity(uniqueFiles.count)
             for (index, source) in uniqueFiles.enumerated() {
-                let sourceStat = try regularFileStat(at: source)
+                let sourceStat = try Self.regularFileStat(at: source)
                 let relativePath = String(format: "files/%08d.clone", index)
                 let clone = staging.appendingPathComponent(relativePath)
                 let cloneResult = source.path.withCString { sourcePath in
@@ -137,13 +144,13 @@ public actor APFSLocalFileCheckpointStore {
                 createdAt: .now,
                 entries: entries
             )
-            let encoded = try encoder.encode(manifest)
+            let encoded = try JSONEncoder().encode(manifest)
             try AtomicFileWriter.write(
                 encoded,
                 to: staging.appendingPathComponent("manifest.json")
             )
             try fileManager.moveItem(at: staging, to: destination)
-            synchronizeDirectory(rootURL)
+            Self.synchronizeDirectory(rootURL)
             return manifest
         } catch {
             try? fileManager.removeItem(at: staging)
@@ -152,24 +159,38 @@ public actor APFSLocalFileCheckpointStore {
     }
 
     public func manifest(snapshotID: UUID) throws -> LocalFileCheckpointManifest {
-        let url = snapshotURL(for: snapshotID).appendingPathComponent("manifest.json")
+        try manifestCoherently(snapshotID: snapshotID)
+    }
+
+    public nonisolated func manifestCoherently(
+        snapshotID: UUID
+    ) throws -> LocalFileCheckpointManifest {
+        let fileManager = FileManager.default
+        let url = Self.snapshotURL(rootURL: rootURL, id: snapshotID)
+            .appendingPathComponent("manifest.json")
         guard fileManager.fileExists(atPath: url.path) else {
             throw LocalFileCheckpointError.snapshotNotFound(snapshotID)
         }
-        return try decoder.decode(
+        return try JSONDecoder().decode(
             LocalFileCheckpointManifest.self,
             from: Data(contentsOf: url)
         )
     }
 
     public func restore(snapshotID: UUID) throws -> LocalFileRestoreReport {
-        let manifest = try manifest(snapshotID: snapshotID)
-        let snapshotRoot = snapshotURL(for: snapshotID)
+        try restoreCoherently(snapshotID: snapshotID)
+    }
+
+    public nonisolated func restoreCoherently(
+        snapshotID: UUID
+    ) throws -> LocalFileRestoreReport {
+        let manifest = try manifestCoherently(snapshotID: snapshotID)
+        let snapshotRoot = Self.snapshotURL(rootURL: rootURL, id: snapshotID)
         var restoredBytes: Int64 = 0
 
         for entry in manifest.entries {
             let liveURL = URL(fileURLWithPath: entry.originalPath)
-            let liveStat = try regularFileStat(at: liveURL)
+            let liveStat = try Self.regularFileStat(at: liveURL)
             guard UInt64(liveStat.st_dev) == entry.device,
                 UInt64(liveStat.st_ino) == entry.inode
             else {
@@ -177,7 +198,11 @@ public actor APFSLocalFileCheckpointStore {
             }
 
             let cloneURL = snapshotRoot.appendingPathComponent(entry.cloneRelativePath)
-            try restoreBytes(from: cloneURL, to: liveURL, expectedBytes: entry.byteCount)
+            try Self.restoreBytes(
+                from: cloneURL,
+                to: liveURL,
+                expectedBytes: entry.byteCount
+            )
             restoredBytes += entry.byteCount
         }
 
@@ -188,15 +213,20 @@ public actor APFSLocalFileCheckpointStore {
     }
 
     public func delete(snapshotID: UUID) throws {
-        let url = snapshotURL(for: snapshotID)
+        try deleteCoherently(snapshotID: snapshotID)
+    }
+
+    public nonisolated func deleteCoherently(snapshotID: UUID) throws {
+        let fileManager = FileManager.default
+        let url = Self.snapshotURL(rootURL: rootURL, id: snapshotID)
         guard fileManager.fileExists(atPath: url.path) else {
             throw LocalFileCheckpointError.snapshotNotFound(snapshotID)
         }
         try fileManager.removeItem(at: url)
-        synchronizeDirectory(rootURL)
+        Self.synchronizeDirectory(rootURL)
     }
 
-    private func restoreBytes(
+    private static func restoreBytes(
         from source: URL,
         to destination: URL,
         expectedBytes: Int64
@@ -253,7 +283,7 @@ public actor APFSLocalFileCheckpointStore {
         }
     }
 
-    private func regularFileStat(at url: URL) throws -> stat {
+    private static func regularFileStat(at url: URL) throws -> stat {
         var value = stat()
         let result = url.path.withCString { Darwin.lstat($0, &value) }
         guard result == 0, (value.st_mode & S_IFMT) == S_IFREG else {
@@ -262,11 +292,11 @@ public actor APFSLocalFileCheckpointStore {
         return value
     }
 
-    private func snapshotURL(for id: UUID) -> URL {
+    private static func snapshotURL(rootURL: URL, id: UUID) -> URL {
         rootURL.appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
     }
 
-    private func synchronizeDirectory(_ directory: URL) {
+    private static func synchronizeDirectory(_ directory: URL) {
         let descriptor = directory.path.withCString {
             Darwin.open($0, O_RDONLY | O_CLOEXEC)
         }

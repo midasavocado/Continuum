@@ -199,6 +199,7 @@ final class ContinuumModel {
                 kind: .manual,
                 branchID: branchID
             )
+            try Self.validatePublishedAvailability(capture.snapshot)
             let namedCapture = SnapshotCaptureNaming.applyingAutomaticName(to: capture)
             let savedSnapshot = try await self.repository.save(namedCapture)
 
@@ -540,6 +541,7 @@ final class ContinuumModel {
             kind: .beforeRewind,
             branchID: sourceBranchID
         )
+        try Self.validatePublishedAvailability(safetyCapture.snapshot)
         guard safetyCapture.snapshot.availability != .unavailable else {
             throw ContinuumError.restoreUnavailable(
                 "Continuum could not create a restorable safety snapshot, so rewind did not begin."
@@ -1029,6 +1031,21 @@ final class ContinuumModel {
             return nameOrder == .orderedAscending
         }
         return lhs.updatedAt > rhs.updatedAt
+    }
+
+    private static func validatePublishedAvailability(
+        _ snapshot: SnapshotRecord
+    ) throws {
+        switch snapshot.availability {
+        case .instant, .replayRequired:
+            guard snapshot.hasCompleteResourceCoverage else {
+                throw ContinuumError.integrityFailure(
+                    "The checkpoint backend claimed exact restoration without complete resource reconstruction evidence."
+                )
+            }
+        case .experimentalHot, .unavailable:
+            break
+        }
     }
 
     private static func sourceKey(for app: AppIdentity) -> String {

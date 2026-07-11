@@ -1,5 +1,6 @@
 import ContinuumCore
 import ContinuumRuntime
+import ContinuumStore
 import Darwin
 import Foundation
 
@@ -12,15 +13,27 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
 
     private let maximumCapturedBytes: UInt64
     private let maximumRetainedSnapshots: Int
+    private let fileCheckpointStore: APFSLocalFileCheckpointStore?
     private var handles: [SnapshotID: HotProcessSnapshotHandle] = [:]
     private var retentionOrder: [SnapshotID] = []
 
     public init(
         maximumCapturedBytes: UInt64 = UInt64(ContinuumConstants.defaultHotMemoryBudgetBytes),
-        maximumRetainedSnapshots: Int = 8
+        maximumRetainedSnapshots: Int = 8,
+        fileCheckpointRootURL: URL? = nil
     ) {
         self.maximumCapturedBytes = maximumCapturedBytes
         self.maximumRetainedSnapshots = max(maximumRetainedSnapshots, 2)
+        if let fileCheckpointRootURL {
+            // Hot file roots cannot outlive their in-memory task snapshots.
+            // Clear leftovers from a prior Continuum process before arming.
+            try? FileManager.default.removeItem(at: fileCheckpointRootURL)
+            self.fileCheckpointStore = try? APFSLocalFileCheckpointStore(
+                rootURL: fileCheckpointRootURL
+            )
+        } else {
+            self.fileCheckpointStore = nil
+        }
     }
 
     public func capture(
@@ -36,19 +49,43 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             )
         }
 
+        let snapshotID = UUID()
         var rawSnapshot: OpaquePointer?
         var info = continuum_remote_process_group_snapshot_info()
-        let status = continuum_remote_process_group_capture(
+        let resourceBox = HotResourceInventoryCallbackBox(
+            fileCheckpointStore: fileCheckpointStore,
+            captureSnapshotID: snapshotID
+        )
+        let resourceContext = Unmanaged.passUnretained(resourceBox).toOpaque()
+        let status = continuum_remote_process_group_capture_with_resources(
             rootProcessIdentifier,
             maximumCapturedBytes,
+            continuumCaptureHotResourceInventory,
+            resourceContext,
             &rawSnapshot,
             &info
         )
         guard status == CONTINUUM_STATUS_OK, let rawSnapshot else {
+            if let failureDescription = resourceBox.failureDescription {
+                throw ContinuumError.runtimeUnsupported(failureDescription)
+            }
             throw captureError(status: status, appName: app.displayName)
         }
 
-        let handle = HotProcessSnapshotHandle(pointer: rawSnapshot)
+        guard let writableVnodes = resourceBox.inventory else {
+            continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+            throw ContinuumError.runtimeUnsupported(
+                "The coherent resource callback returned without a writable-file inventory."
+            )
+        }
+        let handle = HotProcessSnapshotHandle(
+            pointer: rawSnapshot,
+            writableVnodes: writableVnodes,
+            snapshotID: snapshotID,
+            appID: app.id,
+            kind: kind,
+            fileCheckpointStore: fileCheckpointStore
+        )
         do {
             let members = try groupMembers(in: rawSnapshot)
             guard !members.isEmpty,
@@ -59,7 +96,6 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             }
 
             let capturedAt = Date.now
-            let snapshotID = UUID()
             let checkpoint = CheckpointRecord(
                 capturedAt: capturedAt,
                 monotonicNanoseconds: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW),
@@ -85,8 +121,11 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 uniqueBytes: clampedInt64(info.captured_bytes),
                 hotMemoryBytes: clampedInt64(info.captured_bytes),
                 isPinned: kind != .automatic,
-                localFileCoverage: .unavailable,
-                allowsKeepingCurrentFiles: false
+                localFileCoverage: fileCheckpointStore == nil ? .unavailable : .openFiles,
+                allowsKeepingCurrentFiles: false,
+                resourceCoverage: Self.experimentalResourceCoverage(
+                    writableVnodeCount: writableVnodes.count
+                )
             )
 
             let manifest = HotProcessManifest(
@@ -97,7 +136,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 capturedRegionCount: info.captured_region_count,
                 excludedRegionCount: info.excluded_region_count,
                 threadCount: info.thread_count,
-                resourceCoverage: .guardedHotOnly
+                writableVnodes: writableVnodes,
+                resourceCoverage: Self.experimentalResourceCoverage(
+                    writableVnodeCount: writableVnodes.count
+                )
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
@@ -133,9 +175,35 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             )
         }
 
+        let rollbackHandle = retentionOrder.reversed().lazy
+            .compactMap { self.handles[$0] }
+            .first {
+                $0.appID == handle.appID && $0.kind == .beforeRewind
+            }
+        if handle.fileCheckpointStore != nil && rollbackHandle == nil {
+            return .failed(
+                "Continuum has no coherent file safety root for this restore. No memory was changed."
+            )
+        }
+
         var report = continuum_remote_process_group_restore_report()
-        let status = continuum_remote_process_group_restore(handle.pointer, &report)
+        let resourceBox = HotResourceInventoryCallbackBox(
+            expectedInventory: handle.writableVnodes,
+            fileCheckpointStore: handle.fileCheckpointStore,
+            restoreSnapshotID: handle.snapshotID,
+            rollbackSnapshotID: rollbackHandle?.snapshotID
+        )
+        let resourceContext = Unmanaged.passUnretained(resourceBox).toOpaque()
+        let status = continuum_remote_process_group_restore_with_resources(
+            handle.pointer,
+            continuumValidateHotResourceInventory,
+            resourceContext,
+            &report
+        )
         guard status == CONTINUUM_STATUS_OK else {
+            if let failureDescription = resourceBox.failureDescription {
+                return .failed(failureDescription)
+            }
             return .failed(restoreFailureDescription(status: status, report: report))
         }
         guard report.memory_readback_verified != 0,
@@ -250,17 +318,90 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
     private func clampedInt64(_ value: UInt64) -> Int64 {
         value > UInt64(Int64.max) ? Int64.max : Int64(value)
     }
+
+    private static func experimentalResourceCoverage(
+        writableVnodeCount: Int
+    ) -> [ResourceCoverage] {[
+        ResourceCoverage(
+            domain: .memory,
+            mode: .restored,
+            detail: "Readable+writable private/COW memory is restored with readback validation."
+        ),
+        ResourceCoverage(
+            domain: .threads,
+            mode: .restored,
+            detail: "ARM64 general and vector thread state is restored for the unchanged thread set."
+        ),
+        ResourceCoverage(
+            domain: .localFiles,
+            mode: .guarded,
+            detail: "\(writableVnodeCount) writable open file\(writableVnodeCount == 1 ? "" : "s") are APFS-cloned during the coherent cut. Rename/delete history, closed files, and external writers remain uncovered."
+        ),
+        ResourceCoverage(
+            domain: .descriptors,
+            mode: .guarded,
+            detail: "Descriptor topology and vnode identity must remain unchanged."
+        ),
+        ResourceCoverage(
+            domain: .sockets,
+            mode: .guarded,
+            detail: "Socket identity and buffer counts are checked, not recreated."
+        ),
+        ResourceCoverage(
+            domain: .machIPC,
+            mode: .guarded,
+            detail: "Mach right topology must remain unchanged; queued messages are not replayed."
+        ),
+        ResourceCoverage(
+            domain: .windowServer,
+            mode: .unavailable,
+            detail: "WindowServer state is not rebuilt in this checkpoint."
+        ),
+        ResourceCoverage(
+            domain: .graphicsGPU,
+            mode: .unavailable,
+            detail: "Core Animation, Metal, and OpenGL resources are not rebuilt yet."
+        ),
+        ResourceCoverage(
+            domain: .audioDevices,
+            mode: .unavailable,
+            detail: "Audio and device resources are not reopened yet."
+        ),
+        ResourceCoverage(
+            domain: .clocksRandomInput,
+            mode: .unavailable,
+            detail: "Clock, randomness, and input events are not replayed yet."
+        ),
+    ]}
 }
 
 private final class HotProcessSnapshotHandle: @unchecked Sendable {
     let pointer: OpaquePointer
+    let writableVnodes: [HotWritableVnode]
+    let snapshotID: SnapshotID
+    let appID: String
+    let kind: SnapshotKind
+    let fileCheckpointStore: APFSLocalFileCheckpointStore?
 
-    init(pointer: OpaquePointer) {
+    init(
+        pointer: OpaquePointer,
+        writableVnodes: [HotWritableVnode],
+        snapshotID: SnapshotID,
+        appID: String,
+        kind: SnapshotKind,
+        fileCheckpointStore: APFSLocalFileCheckpointStore?
+    ) {
         self.pointer = pointer
+        self.writableVnodes = writableVnodes
+        self.snapshotID = snapshotID
+        self.appID = appID
+        self.kind = kind
+        self.fileCheckpointStore = fileCheckpointStore
     }
 
     deinit {
         continuum_remote_process_group_snapshot_destroy(pointer)
+        try? fileCheckpointStore?.deleteCoherently(snapshotID: snapshotID)
     }
 }
 
@@ -277,38 +418,164 @@ private struct HotProcessManifest: Codable, Sendable {
     let capturedRegionCount: UInt64
     let excludedRegionCount: UInt64
     let threadCount: UInt64
-    let resourceCoverage: HotResourceCoverage
+    let writableVnodes: [HotWritableVnode]
+    let resourceCoverage: [ResourceCoverage]
 }
 
-/// This is the reconstruction contract that must be upgraded component by
-/// component. `guarded` means restore is rejected if the resource changed;
-/// it does not mean the resource has been serialized or recreated.
-private struct HotResourceCoverage: Codable, Sendable {
-    enum Level: String, Codable, Sendable {
-        case restored
-        case reconnected
-        case rebuilt
-        case guarded
-        case unavailable
+private struct HotWritableVnode: Codable, Hashable, Sendable, Comparable {
+    let processIdentifier: Int32
+    let fileDescriptor: Int32
+    let openFlags: UInt32
+    let offset: Int64
+    let device: UInt64
+    let inode: UInt64
+    let byteCount: UInt64
+    let mode: UInt32
+    let path: String
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        if lhs.processIdentifier != rhs.processIdentifier {
+            return lhs.processIdentifier < rhs.processIdentifier
+        }
+        if lhs.fileDescriptor != rhs.fileDescriptor {
+            return lhs.fileDescriptor < rhs.fileDescriptor
+        }
+        return lhs.path < rhs.path
+    }
+}
+
+private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
+    let expectedInventory: [HotWritableVnode]?
+    let fileCheckpointStore: APFSLocalFileCheckpointStore?
+    let captureSnapshotID: SnapshotID?
+    let restoreSnapshotID: SnapshotID?
+    let rollbackSnapshotID: SnapshotID?
+    var inventory: [HotWritableVnode]?
+    var failureDescription: String?
+
+    init(
+        expectedInventory: [HotWritableVnode]? = nil,
+        fileCheckpointStore: APFSLocalFileCheckpointStore? = nil,
+        captureSnapshotID: SnapshotID? = nil,
+        restoreSnapshotID: SnapshotID? = nil,
+        rollbackSnapshotID: SnapshotID? = nil
+    ) {
+        self.expectedInventory = expectedInventory
+        self.fileCheckpointStore = fileCheckpointStore
+        self.captureSnapshotID = captureSnapshotID
+        self.restoreSnapshotID = restoreSnapshotID
+        self.rollbackSnapshotID = rollbackSnapshotID
     }
 
-    let memory: Level
-    let threads: Level
-    let files: Level
-    let descriptorsAndSockets: Level
-    let machAndXPC: Level
-    let windowServer: Level
-    let graphicsAndGPU: Level
-    let audioAndDevices: Level
+    func capture(from snapshot: OpaquePointer) -> continuum_status {
+        var count = 0
+        var status = continuum_remote_process_group_copy_writable_vnodes(
+            snapshot,
+            nil,
+            0,
+            &count
+        )
+        guard status == CONTINUUM_STATUS_OK else { return status }
 
-    static let guardedHotOnly = HotResourceCoverage(
-        memory: .restored,
-        threads: .restored,
-        files: .unavailable,
-        descriptorsAndSockets: .guarded,
-        machAndXPC: .guarded,
-        windowServer: .unavailable,
-        graphicsAndGPU: .unavailable,
-        audioAndDevices: .unavailable
-    )
+        var rawEntries = Array(
+            repeating: continuum_remote_writable_vnode_info(),
+            count: count
+        )
+        var returnedCount = count
+        status = rawEntries.withUnsafeMutableBufferPointer { buffer in
+            continuum_remote_process_group_copy_writable_vnodes(
+                snapshot,
+                buffer.baseAddress,
+                buffer.count,
+                &returnedCount
+            )
+        }
+        guard status == CONTINUUM_STATUS_OK, returnedCount == count else {
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : status
+        }
+
+        let captured = rawEntries.map(Self.convert).sorted()
+        inventory = captured
+        if let expectedInventory, captured != expectedInventory {
+            return CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED
+        }
+
+        let files = Array(Set(captured.map(\.path)))
+            .map { URL(fileURLWithPath: $0) }
+            .sorted { $0.path < $1.path }
+        if let fileCheckpointStore, let captureSnapshotID {
+            do {
+                _ = try fileCheckpointStore.captureCoherently(
+                    snapshotID: captureSnapshotID,
+                    files: files
+                )
+            } catch {
+                failureDescription = "The coherent open-file checkpoint failed: \(error.localizedDescription)"
+                return CONTINUUM_STATUS_VALIDATION_FAILED
+            }
+        }
+        if let fileCheckpointStore, let restoreSnapshotID {
+            do {
+                _ = try fileCheckpointStore.restoreCoherently(
+                    snapshotID: restoreSnapshotID
+                )
+            } catch {
+                if let rollbackSnapshotID {
+                    _ = try? fileCheckpointStore.restoreCoherently(
+                        snapshotID: rollbackSnapshotID
+                    )
+                }
+                failureDescription = "Open-file restoration failed and the process memory safety cut was reapplied: \(error.localizedDescription)"
+                return CONTINUUM_STATUS_VALIDATION_FAILED
+            }
+        }
+        return CONTINUUM_STATUS_OK
+    }
+
+    private static func convert(
+        _ rawValue: continuum_remote_writable_vnode_info
+    ) -> HotWritableVnode {
+        var rawValue = rawValue
+        let path = withUnsafePointer(to: &rawValue.path) { pathPointer in
+            pathPointer.withMemoryRebound(
+                to: CChar.self,
+                capacity: Int(CONTINUUM_REMOTE_PATH_MAX)
+            ) {
+                String(cString: $0)
+            }
+        }
+        return HotWritableVnode(
+            processIdentifier: rawValue.process_id,
+            fileDescriptor: rawValue.file_descriptor,
+            openFlags: rawValue.open_flags,
+            offset: rawValue.offset,
+            device: rawValue.device,
+            inode: rawValue.inode,
+            byteCount: rawValue.byte_count,
+            mode: rawValue.mode,
+            path: path
+        )
+    }
+}
+
+private func continuumCaptureHotResourceInventory(
+    _ snapshot: OpaquePointer?,
+    _ context: UnsafeMutableRawPointer?
+) -> continuum_status {
+    guard let snapshot, let context else {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT
+    }
+    let box = Unmanaged<HotResourceInventoryCallbackBox>
+        .fromOpaque(context)
+        .takeUnretainedValue()
+    return box.capture(from: snapshot)
+}
+
+private func continuumValidateHotResourceInventory(
+    _ snapshot: OpaquePointer?,
+    _ context: UnsafeMutableRawPointer?
+) -> continuum_status {
+    continuumCaptureHotResourceInventory(snapshot, context)
 }

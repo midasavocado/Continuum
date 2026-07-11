@@ -128,6 +128,8 @@ final class ModelRoundTripTests: XCTestCase {
         try assertRoundTrips(CompatibilityTier.allCases)
         try assertRoundTrips(PermissionKind.allCases)
         try assertRoundTrips(ExternalEffectKind.allCases)
+        try assertRoundTrips(ResourceDomain.allCases)
+        try assertRoundTrips(ResourceRestoreMode.allCases)
         try assertRoundTrips([
             CheckpointValidation.provisional,
             .validating,
@@ -151,6 +153,28 @@ final class ModelRoundTripTests: XCTestCase {
             .nondeterminismEvent,
             .metadata,
         ])
+    }
+
+    func testCompleteResourceCoverageRejectsMissingGuardedAndDuplicateDomains() {
+        let complete = ResourceDomain.allCases.map {
+            ResourceCoverage(domain: $0, mode: .restored, detail: "fixture")
+        }
+        var snapshot = makeSnapshot()
+        snapshot.resourceCoverage = complete
+        XCTAssertTrue(snapshot.hasCompleteResourceCoverage)
+
+        snapshot.resourceCoverage = Array(complete.dropLast())
+        XCTAssertFalse(snapshot.hasCompleteResourceCoverage)
+
+        snapshot.resourceCoverage = complete.map {
+            $0.domain == .sockets
+                ? ResourceCoverage(domain: .sockets, mode: .guarded, detail: "guard only")
+                : $0
+        }
+        XCTAssertFalse(snapshot.hasCompleteResourceCoverage)
+
+        snapshot.resourceCoverage = complete + [complete[0]]
+        XCTAssertFalse(snapshot.hasCompleteResourceCoverage)
     }
 
     private func makeApp() -> AppIdentity {
@@ -200,7 +224,10 @@ final class ModelRoundTripTests: XCTestCase {
             uniqueBytes: 16_384,
             hotMemoryBytes: 65_536,
             isPinned: true,
-            externalEffects: [effect]
+            externalEffects: [effect],
+            resourceCoverage: ResourceDomain.allCases.map {
+                ResourceCoverage(domain: $0, mode: .restored, detail: "fixture")
+            }
         )
     }
 

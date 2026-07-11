@@ -10,6 +10,7 @@
 #include <mach/arm/thread_status.h>
 #endif
 #include <limits.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -2639,6 +2640,8 @@ void continuum_remote_process_group_snapshot_destroy(
 static continuum_status continuum_capture_process_group_attempt(
     int32_t root_process_id,
     uint64_t maximum_captured_bytes,
+    continuum_remote_resource_capture_callback resource_callback,
+    void *resource_context,
     continuum_remote_process_group_snapshot **out_snapshot
 ) {
     continuum_remote_process_tree_entry *tree = NULL;
@@ -2730,6 +2733,10 @@ static continuum_status continuum_capture_process_group_attempt(
         group->info.thread_count += info.thread_count;
     }
 
+    if (status == CONTINUUM_STATUS_OK && resource_callback != NULL) {
+        status = resource_callback(group, resource_context);
+    }
+
     continuum_status resume_status = continuum_resume_process_group(
         group,
         suspended_count
@@ -2749,9 +2756,11 @@ static continuum_status continuum_capture_process_group_attempt(
     return CONTINUUM_STATUS_OK;
 }
 
-continuum_status continuum_remote_process_group_capture(
+static continuum_status continuum_remote_process_group_capture_internal(
     int32_t root_process_id,
     uint64_t maximum_captured_bytes,
+    continuum_remote_resource_capture_callback resource_callback,
+    void *resource_context,
     continuum_remote_process_group_snapshot **out_snapshot,
     continuum_remote_process_group_snapshot_info *out_info
 ) {
@@ -2768,6 +2777,8 @@ continuum_status continuum_remote_process_group_capture(
         status = continuum_capture_process_group_attempt(
             root_process_id,
             maximum_captured_bytes,
+            resource_callback,
+            resource_context,
             out_snapshot
         );
         if (status != CONTINUUM_STATUS_PROCESS_TREE_CHANGED
@@ -2780,6 +2791,43 @@ continuum_status continuum_remote_process_group_capture(
     }
     *out_info = (*out_snapshot)->info;
     return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_process_group_capture(
+    int32_t root_process_id,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+) {
+    return continuum_remote_process_group_capture_internal(
+        root_process_id,
+        maximum_captured_bytes,
+        NULL,
+        NULL,
+        out_snapshot,
+        out_info
+    );
+}
+
+continuum_status continuum_remote_process_group_capture_with_resources(
+    int32_t root_process_id,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_resource_capture_callback callback,
+    void *callback_context,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+) {
+    if (callback == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_remote_process_group_capture_internal(
+        root_process_id,
+        maximum_captured_bytes,
+        callback,
+        callback_context,
+        out_snapshot,
+        out_info
+    );
 }
 
 size_t continuum_remote_process_group_member_count(
@@ -2818,6 +2866,127 @@ continuum_status continuum_remote_process_group_copy_member_info(
     return CONTINUUM_STATUS_OK;
 }
 
+continuum_status continuum_remote_process_group_copy_writable_vnodes(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_writable_vnode_info *entries,
+    size_t entry_capacity,
+    size_t *out_entry_count
+) {
+    if (snapshot == NULL || out_entry_count == NULL
+        || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_entry_count = 0;
+    size_t result_count = 0;
+
+    for (size_t member_index = 0;
+         member_index < snapshot->member_count;
+         member_index += 1) {
+        const continuum_remote_process_group_member *member =
+            &snapshot->members[member_index];
+        if (member->session == NULL) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        const int32_t process_id = member->session->identity.process_id;
+        int required_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            NULL,
+            0
+        );
+        if (required_bytes < 0) {
+            return CONTINUUM_STATUS_MACH_ERROR;
+        }
+        size_t capacity = (size_t)required_bytes
+            + 32U * sizeof(struct proc_fdinfo);
+        if (capacity < sizeof(struct proc_fdinfo) || capacity > INT_MAX) {
+            return CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        struct proc_fdinfo *descriptors = calloc(1, capacity);
+        if (descriptors == NULL) {
+            return CONTINUUM_STATUS_OUT_OF_MEMORY;
+        }
+        int returned_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            descriptors,
+            (int)capacity
+        );
+        if (returned_bytes < 0
+            || returned_bytes % (int)sizeof(struct proc_fdinfo) != 0) {
+            free(descriptors);
+            return CONTINUUM_STATUS_MACH_ERROR;
+        }
+        const size_t descriptor_count =
+            (size_t)returned_bytes / sizeof(struct proc_fdinfo);
+        qsort(
+            descriptors,
+            descriptor_count,
+            sizeof(*descriptors),
+            continuum_fd_info_compare
+        );
+
+        for (size_t descriptor_index = 0;
+             descriptor_index < descriptor_count;
+             descriptor_index += 1) {
+            const struct proc_fdinfo descriptor = descriptors[descriptor_index];
+            if (descriptor.proc_fdtype != PROX_FDTYPE_VNODE) {
+                continue;
+            }
+            struct vnode_fdinfowithpath info;
+            memset(&info, 0, sizeof(info));
+            int bytes = proc_pidfdinfo(
+                process_id,
+                descriptor.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                &info,
+                sizeof(info)
+            );
+            if (bytes != (int)sizeof(info)) {
+                free(descriptors);
+                return CONTINUUM_STATUS_MACH_ERROR;
+            }
+            const uint32_t open_flags = (uint32_t)info.pfi.fi_openflags;
+            const uint32_t mode = info.pvip.vip_vi.vi_stat.vst_mode;
+            if ((open_flags & O_ACCMODE) == O_RDONLY
+                || (mode & S_IFMT) != S_IFREG
+                || info.pvip.vip_path[0] == '\0') {
+                continue;
+            }
+
+            if (entries != NULL) {
+                if (result_count >= entry_capacity) {
+                    free(descriptors);
+                    return CONTINUUM_STATUS_RANGE_ERROR;
+                }
+                continuum_remote_writable_vnode_info *result =
+                    &entries[result_count];
+                memset(result, 0, sizeof(*result));
+                result->process_id = process_id;
+                result->file_descriptor = descriptor.proc_fd;
+                result->open_flags = open_flags;
+                result->offset = info.pfi.fi_offset;
+                result->device = info.pvip.vip_vi.vi_stat.vst_dev;
+                result->inode = info.pvip.vip_vi.vi_stat.vst_ino;
+                result->byte_count = info.pvip.vip_vi.vi_stat.vst_size;
+                result->mode = mode;
+                (void)strlcpy(
+                    result->path,
+                    info.pvip.vip_path,
+                    sizeof(result->path)
+                );
+            }
+            result_count += 1;
+        }
+        free(descriptors);
+    }
+
+    *out_entry_count = result_count;
+    return CONTINUUM_STATUS_OK;
+}
+
 size_t continuum_remote_process_group_member_region_count(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t member_index
@@ -2845,8 +3014,10 @@ continuum_status continuum_remote_process_group_copy_member_region_info(
     );
 }
 
-continuum_status continuum_remote_process_group_restore(
+static continuum_status continuum_remote_process_group_restore_internal(
     continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_resource_restore_callback resource_callback,
+    void *resource_context,
     continuum_remote_process_group_restore_report *out_report
 ) {
     if (snapshot == NULL || out_report == NULL || snapshot->member_count == 0) {
@@ -2930,6 +3101,9 @@ continuum_status continuum_remote_process_group_restore(
     if (status == CONTINUUM_STATUS_OK) {
         out_report->memory_readback_verified = 1;
     }
+    if (status == CONTINUUM_STATUS_OK && resource_callback != NULL) {
+        status = resource_callback(snapshot, resource_context);
+    }
 
     if (status != CONTINUUM_STATUS_OK && touched_count > 0) {
         continuum_status original_status = status;
@@ -2977,6 +3151,35 @@ continuum_status continuum_remote_process_group_restore(
         return resume_status;
     }
     return status;
+}
+
+continuum_status continuum_remote_process_group_restore(
+    continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_process_group_restore_report *out_report
+) {
+    return continuum_remote_process_group_restore_internal(
+        snapshot,
+        NULL,
+        NULL,
+        out_report
+    );
+}
+
+continuum_status continuum_remote_process_group_restore_with_resources(
+    continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_resource_restore_callback callback,
+    void *callback_context,
+    continuum_remote_process_group_restore_report *out_report
+) {
+    if (callback == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_remote_process_group_restore_internal(
+        snapshot,
+        callback,
+        callback_context,
+        out_report
+    );
 }
 
 continuum_status continuum_remote_session_restore(

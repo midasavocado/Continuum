@@ -326,6 +326,7 @@ enum ExternalHotProof {
             "  kernel resources:    \(resourceSummary(resourceStateA))"
         )
         print("  resource A->B gate:  unchanged")
+        print("  coherent open files: root + helper APFS bytes restored")
         print("  descriptor mutation: rejected before memory write")
         print("  app backend adapter: captured + restored Experimental Hot state")
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
@@ -345,9 +346,16 @@ enum ExternalHotProof {
         helperSession: OpaquePointer,
         expectedStateB: String
     ) async throws {
+        let fileCheckpointRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "continuum-shipping-hot-proof-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: fileCheckpointRoot) }
         let service = HotProcessCheckpointService(
             maximumCapturedBytes: fullProcessCaptureBudget,
-            maximumRetainedSnapshots: 2
+            maximumRetainedSnapshots: 2,
+            fileCheckpointRootURL: fileCheckpointRoot
         )
         let app = AppIdentity(
             bundleIdentifier: nil,
@@ -362,12 +370,27 @@ enum ExternalHotProof {
         let capture = try await service.capture(
             app: app,
             processIdentifiers: [targetPID, helperPID],
-            kind: .manual,
+            kind: .beforeRewind,
             branchID: UUID()
         )
         try require(
             capture.snapshot.availability == .experimentalHot,
             "shipping backend did not publish Experimental Hot availability"
+        )
+        try require(
+            capture.snapshot.resourceCoverage?.count == ResourceDomain.allCases.count,
+            "shipping backend omitted a resource coverage domain"
+        )
+        try require(
+            !capture.snapshot.hasCompleteResourceCoverage,
+            "Experimental Hot incorrectly claimed complete resource reconstruction"
+        )
+        let fileCoverage = capture.snapshot.resourceCoverage?.first {
+            $0.domain == .localFiles
+        }
+        try require(
+            fileCoverage?.mode == .guarded,
+            "shipping backend did not run coherent writable-file inventory"
         )
         let liveAvailability = await service.currentRestoreAvailability(
             for: capture.snapshot
@@ -377,6 +400,11 @@ enum ExternalHotProof {
             "shipping backend expired its live snapshot immediately"
         )
 
+        let changedFiles = try target.send(command: "mutate-file", state: "A")
+        try require(
+            changedFiles.valid == true && changedFiles.helperValid == true,
+            "target did not mutate both stable open files"
+        )
         try restore(rootStateA, into: rootSession, label: "adapter staging root A", cycle: 0)
         try restore(helperStateA, into: helperSession, label: "adapter staging helper A", cycle: 0)
 
@@ -393,6 +421,11 @@ enum ExternalHotProof {
             expected: "B",
             digest: expectedStateB,
             cycle: 0
+        )
+        let restoredFiles = try target.send(command: "validate-file", state: "B")
+        try require(
+            restoredFiles.valid == true && restoredFiles.helperValid == true,
+            "shipping backend did not restore both open files from APFS clones"
         )
     }
 
