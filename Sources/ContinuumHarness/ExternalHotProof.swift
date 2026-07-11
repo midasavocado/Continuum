@@ -6,7 +6,7 @@ import Foundation
 enum ExternalHotProof {
     static let minimumCycleCount = 100
     private static let fullProcessCycleCount = 1
-    private static let fullProcessCaptureBudget: UInt64 = 512 * 1_024 * 1_024
+    private static let fullProcessCaptureBudget: UInt64 = 1_024 * 1_024 * 1_024
 
     static func run(targetPath: String, cycles: Int) throws {
         guard cycles >= minimumCycleCount else {
@@ -38,6 +38,18 @@ enum ExternalHotProof {
             )
         }
         try require(ready.state == "A", "target did not start in state A")
+        guard let helperPID = ready.helperProcessIdentifier,
+            helperPID > 0,
+            let helperAddress = ready.helperAddress,
+            let helperLength = ready.helperLength,
+            helperLength > 0,
+            ready.helperState == "A",
+            ready.helperValid == nil
+        else {
+            throw ExternalHotProofFailure.protocolViolation(
+                "ready handshake did not identify the target helper"
+            )
+        }
         try require(
             address % UInt64(Int(sysconf(_SC_PAGESIZE))) == 0,
             "target arena is not page-aligned"
@@ -54,8 +66,8 @@ enum ExternalHotProof {
             )
             let checkedB = try target.send(command: "validate", state: "B")
             try require(
-                checkedB.valid == true,
-                "target warm-up \(pass) did not validate state B"
+                checkedB.valid == true && checkedB.helperValid == true,
+                "target warm-up \(pass) did not validate group state B"
             )
             let warmA = try target.send(command: "mutate", state: "A")
             try require(
@@ -64,8 +76,8 @@ enum ExternalHotProof {
             )
             let checkedA = try target.send(command: "validate", state: "A")
             try require(
-                checkedA.valid == true,
-                "target warm-up \(pass) did not validate state A"
+                checkedA.valid == true && checkedA.helperValid == true,
+                "target warm-up \(pass) did not validate group state A"
             )
         }
         usleep(100_000)
@@ -80,13 +92,42 @@ enum ExternalHotProof {
         }
         defer { continuum_remote_session_destroy(session) }
 
+        var helperSession: OpaquePointer?
+        try check(
+            continuum_remote_session_open(helperPID, &helperSession),
+            operation: "open helper task session for PID \(helperPID)"
+        )
+        guard let helperSession else {
+            throw ExternalHotProofFailure.invariant(
+                "runtime returned a nil helper session"
+            )
+        }
+        defer { continuum_remote_session_destroy(helperSession) }
+
         try check(
             continuum_remote_session_register_region(session, address, UInt64(length)),
             operation: "register target arena"
         )
+        try check(
+            continuum_remote_session_register_region(
+                helperSession,
+                helperAddress,
+                UInt64(helperLength)
+            ),
+            operation: "register helper arena"
+        )
 
         let stateA = try capture(session: session, expectedAddress: address, expectedLength: length)
         try require(stateA.digest == ready.digest, "captured A bytes differ from target handshake")
+        let helperStateA = try capture(
+            session: helperSession,
+            expectedAddress: helperAddress,
+            expectedLength: helperLength
+        )
+        try require(
+            helperStateA.digest == ready.helperDigest,
+            "captured helper A bytes differ from its handshake"
+        )
 
         let mutated = try target.send(command: "mutate", state: "B")
         try require(mutated.event == "mutated", "target did not acknowledge mutation to B")
@@ -94,49 +135,104 @@ enum ExternalHotProof {
         usleep(100_000)
 
         let safetyB = try capture(session: session, expectedAddress: address, expectedLength: length)
+        let helperSafetyB = try capture(
+            session: helperSession,
+            expectedAddress: helperAddress,
+            expectedLength: helperLength
+        )
         try require(stateA.bytes != safetyB.bytes, "target mutation did not change captured bytes")
         try require(safetyB.digest == mutated.digest, "captured safety B differs from target state")
         try require(
             stateA.descriptor.thread_set_hash == safetyB.descriptor.thread_set_hash,
             "target thread set changed between A and safety B captures"
         )
-        // Establish both whole-process images from one stable VM topology. The
-        // target command above supplies real target-owned B bytes; the runtime
-        // then moves only the registered arena between A and B while the target
-        // remains parked, avoiding transient Foundation allocator mappings.
-        try restore(stateA, into: session, label: "staging A", cycle: 0)
+        // Stage both group images through the already validated arena restore
+        // primitive while the protocol loops remain parked. This changes real
+        // target-owned state without adding allocator mappings between cuts.
+        try restore(stateA, into: session, label: "staging root A", cycle: 0)
+        try restore(
+            helperStateA,
+            into: helperSession,
+            label: "staging helper A",
+            cycle: 0
+        )
         var resourceStateA = try captureResources(session: session)
         let processStateAStart = DispatchTime.now().uptimeNanoseconds
-        let processStateA = try captureProcess(session: session)
+        let processStateA = try captureProcessGroup(rootProcessID: targetPID)
         progress(
-            "full-process A snapshot: \(milliseconds(since: processStateAStart)) ms"
+            "process-group A snapshot: \(milliseconds(since: processStateAStart)) ms"
         )
-        defer { continuum_remote_process_snapshot_destroy(processStateA.snapshot) }
+        defer {
+            continuum_remote_process_group_snapshot_destroy(processStateA.snapshot)
+        }
 
-        try restore(safetyB, into: session, label: "staging B", cycle: 0)
+        try restore(safetyB, into: session, label: "staging root B", cycle: 0)
+        try restore(
+            helperSafetyB,
+            into: helperSession,
+            label: "staging helper B",
+            cycle: 0
+        )
         var resourceSafetyB = try captureResources(session: session)
         let processSafetyBStart = DispatchTime.now().uptimeNanoseconds
-        let processSafetyB = try captureProcess(session: session)
+        let processSafetyB = try captureProcessGroup(rootProcessID: targetPID)
         progress(
-            "full-process B snapshot: \(milliseconds(since: processSafetyBStart)) ms"
+            "process-group B snapshot: \(milliseconds(since: processSafetyBStart)) ms"
         )
-        defer { continuum_remote_process_snapshot_destroy(processSafetyB.snapshot) }
-
-        if processStateA.info.vm_layout_hash != processSafetyB.info.vm_layout_hash {
-            let difference = try processLayoutDifference(processStateA, processSafetyB)
-            throw ExternalHotProofFailure.invariant(
-                "target VM layout changed between full-process captures "
-                    + "(A captured=\(processStateA.info.captured_region_count)/\(processStateA.info.captured_bytes), "
-                    + "excluded=\(processStateA.info.excluded_region_count)/\(processStateA.info.excluded_bytes); "
-                    + "B captured=\(processSafetyB.info.captured_region_count)/\(processSafetyB.info.captured_bytes), "
-                    + "excluded=\(processSafetyB.info.excluded_region_count)/\(processSafetyB.info.excluded_bytes); "
-                    + difference + ")"
-            )
+        defer {
+            continuum_remote_process_group_snapshot_destroy(processSafetyB.snapshot)
         }
         try require(
-            processStateA.info.thread_set_hash == processSafetyB.info.thread_set_hash,
-            "target thread set changed between full-process captures"
+            processStateA.info.process_count == processSafetyB.info.process_count,
+            "target process count changed between group captures"
         )
+        try require(
+            processStateA.info.process_count >= 2,
+            "group capture did not include the target helper"
+        )
+        try require(
+            processStateA.members.contains { $0.processID == targetPID }
+                && processStateA.members.contains {
+                    $0.processID == helperPID && $0.parentProcessID == targetPID
+                },
+            "group capture did not preserve the root/helper parent edge"
+        )
+        for memberA in processStateA.members {
+            guard let memberB = processSafetyB.members.first(where: {
+                $0.processID == memberA.processID
+            }) else {
+                throw ExternalHotProofFailure.invariant(
+                    "process \(memberA.processID) was missing from group state B"
+                )
+            }
+            if memberA.vmLayoutHash != memberB.vmLayoutHash {
+                let difference = try processGroupLayoutDifference(
+                    processStateA,
+                    member: memberA,
+                    processSafetyB,
+                    member: memberB
+                )
+                throw ExternalHotProofFailure.invariant(
+                    "\(memberA.processID == targetPID ? "root" : "helper") process "
+                        + "\(memberA.processID) VM layout changed between A and B "
+                        + "(A=\(String(memberA.vmLayoutHash, radix: 16)), "
+                        + "B=\(String(memberB.vmLayoutHash, radix: 16)); "
+                        + difference + ")"
+                )
+            }
+            try require(
+                memberA.threadSetHash == memberB.threadSetHash,
+                "process \(memberA.processID) thread set changed between A and B"
+            )
+            try require(
+                memberA.descriptorTableHash == memberB.descriptorTableHash,
+                "process \(memberA.processID) descriptors changed between A and B"
+            )
+            try require(
+                memberA.machSpaceHash == memberB.machSpaceHash,
+                "process \(memberA.processID) Mach namespace changed between A and B"
+            )
+        }
         let resourceChanges = continuum_remote_resource_fingerprint_changes(
             &resourceStateA,
             &resourceSafetyB
@@ -148,11 +244,29 @@ enum ExternalHotProof {
         )
 
         for cycle in 1...fullProcessCycleCount {
-            try restoreProcess(processStateA, into: session, label: "A", cycle: cycle)
-            try validate(target: target, expected: "A", digest: stateA.digest, cycle: cycle)
+            try restoreProcessGroup(processStateA, label: "A", cycle: cycle)
+            try validateCapturedArena(
+                session: session,
+                expectedAddress: address,
+                expectedLength: length,
+                digest: stateA.digest,
+                label: "root A"
+            )
+            try validateCapturedArena(
+                session: helperSession,
+                expectedAddress: helperAddress,
+                expectedLength: helperLength,
+                digest: stateA.digest,
+                label: "helper A"
+            )
 
-            try restoreProcess(processSafetyB, into: session, label: "B", cycle: cycle)
-            try validate(target: target, expected: "B", digest: safetyB.digest, cycle: cycle)
+            try restoreProcessGroup(processSafetyB, label: "B", cycle: cycle)
+            try validateGroup(
+                target: target,
+                expected: "B",
+                digest: safetyB.digest,
+                cycle: cycle
+            )
         }
 
         for cycle in 1...cycles {
@@ -169,8 +283,7 @@ enum ExternalHotProof {
             "target did not open the descriptor-change probe"
         )
         try verifyDescriptorMutationIsRejected(
-            processSafetyB,
-            by: session
+            processSafetyB
         )
         try validate(
             target: target,
@@ -189,9 +302,10 @@ enum ExternalHotProof {
 
         print("external-hot-proof: PASS")
         print("  target binary:       \(target.executablePath)")
-        print("  target PID:          \(targetPID)")
+        print("  target PIDs:         root=\(targetPID), helper=\(helperPID)")
         print("  registered arena:    0x\(String(address, radix: 16)) + \(length) bytes")
         print("  captured threads:    A=\(stateA.threadCount), B=\(safetyB.threadCount)")
+        print("  captured processes:  \(processStateA.info.process_count)")
         print("  full VM regions:     \(processStateA.info.captured_region_count)")
         print("  full captured bytes: \(processStateA.info.captured_bytes)")
         print("  excluded VM regions: \(processStateA.info.excluded_region_count)")
@@ -200,7 +314,7 @@ enum ExternalHotProof {
         )
         print("  resource A->B gate:  unchanged")
         print("  descriptor mutation: rejected before memory write")
-        print("  restore cycles:      \(fullProcessCycleCount) full-process + \(cycles) arena-only")
+        print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
         )
@@ -208,12 +322,10 @@ enum ExternalHotProof {
     }
 
     private static func verifyDescriptorMutationIsRejected(
-        _ capture: RemoteProcessCapture,
-        by session: OpaquePointer
+        _ capture: RemoteProcessGroupCapture
     ) throws {
-        var report = continuum_remote_process_restore_report()
-        let status = continuum_remote_session_restore_process(
-            session,
+        var report = continuum_remote_process_group_restore_report()
+        let status = continuum_remote_process_group_restore(
             capture.snapshot,
             &report
         )
@@ -291,6 +403,103 @@ enum ExternalHotProof {
         return names.isEmpty ? "none" : names.joined(separator: ", ")
     }
 
+    private static func captureProcessGroup(
+        rootProcessID: Int32
+    ) throws -> RemoteProcessGroupCapture {
+        var snapshot: OpaquePointer?
+        var info = continuum_remote_process_group_snapshot_info()
+        try check(
+            continuum_remote_process_group_capture(
+                rootProcessID,
+                fullProcessCaptureBudget,
+                &snapshot,
+                &info
+            ),
+            operation: "capture external process group"
+        )
+        guard let snapshot else {
+            throw ExternalHotProofFailure.invariant(
+                "runtime returned a nil process-group snapshot"
+            )
+        }
+        do {
+            try require(info.process_count > 0, "group capture had no processes")
+            try require(info.captured_region_count > 0, "group capture had no regions")
+            try require(info.captured_bytes > 0, "group capture had no bytes")
+            try require(info.thread_count > 0, "group capture had no threads")
+
+            let count = continuum_remote_process_group_member_count(snapshot)
+            try require(count == info.process_count, "group member count disagreed with info")
+            var members: [RemoteProcessGroupMember] = []
+            for index in 0..<count {
+                var member = continuum_remote_process_group_member_info()
+                try check(
+                    continuum_remote_process_group_copy_member_info(
+                        snapshot,
+                        index,
+                        &member
+                    ),
+                    operation: "inspect process-group member \(index)"
+                )
+                try require(member.captured_bytes > 0, "group member had no bytes")
+                try require(member.thread_count > 0, "group member had no threads")
+                members.append(RemoteProcessGroupMember(
+                    snapshotIndex: index,
+                    processID: member.process_id,
+                    parentProcessID: member.parent_process_id,
+                    capturedBytes: member.captured_bytes,
+                    threadCount: member.thread_count,
+                    vmLayoutHash: member.vm_layout_hash,
+                    threadSetHash: member.thread_set_hash,
+                    descriptorTableHash: member.descriptor_table_hash,
+                    machSpaceHash: member.mach_space_hash
+                ))
+            }
+            return RemoteProcessGroupCapture(
+                snapshot: snapshot,
+                info: info,
+                members: members
+            )
+        } catch {
+            continuum_remote_process_group_snapshot_destroy(snapshot)
+            throw error
+        }
+    }
+
+    private static func restoreProcessGroup(
+        _ capture: RemoteProcessGroupCapture,
+        label: String,
+        cycle: Int
+    ) throws {
+        let started = DispatchTime.now().uptimeNanoseconds
+        var report = continuum_remote_process_group_restore_report()
+        try check(
+            continuum_remote_process_group_restore(capture.snapshot, &report),
+            operation: "restore process group \(label) on cycle \(cycle)"
+        )
+        try require(
+            report.processes_restored == capture.info.process_count,
+            "group restore \(label) missed a process"
+        )
+        try require(
+            report.thread_states_restored == capture.info.thread_count,
+            "group restore \(label) missed a thread"
+        )
+        try require(
+            report.memory_readback_verified == 1,
+            "group restore \(label) lacked readback verification"
+        )
+        try require(
+            report.rollback_attempted == 0,
+            "group restore \(label) unexpectedly needed rollback"
+        )
+        progress(
+            "process-group restore \(label) cycle \(cycle): "
+                + "\(milliseconds(since: started)) ms, "
+                + "\(report.bytes_written) dirty bytes"
+        )
+    }
+
     private static func captureProcess(session: OpaquePointer) throws -> RemoteProcessCapture {
         var snapshot: OpaquePointer?
         var info = continuum_remote_process_snapshot_info()
@@ -314,6 +523,70 @@ enum ExternalHotProof {
         try require(info.vm_layout_hash != 0, "full-process capture had no VM hash")
         try require(info.thread_set_hash != 0, "full-process capture had no thread hash")
         return RemoteProcessCapture(snapshot: snapshot, info: info)
+    }
+
+    private static func processGroupLayoutDifference(
+        _ left: RemoteProcessGroupCapture,
+        member leftMember: RemoteProcessGroupMember,
+        _ right: RemoteProcessGroupCapture,
+        member rightMember: RemoteProcessGroupMember
+    ) throws -> String {
+        func regions(
+            _ capture: RemoteProcessGroupCapture,
+            member: RemoteProcessGroupMember
+        ) throws -> [continuum_remote_process_region_info] {
+            let count = continuum_remote_process_group_member_region_count(
+                capture.snapshot,
+                member.snapshotIndex
+            )
+            var result: [continuum_remote_process_region_info] = []
+            for regionIndex in 0..<count {
+                var info = continuum_remote_process_region_info()
+                try check(
+                    continuum_remote_process_group_copy_member_region_info(
+                        capture.snapshot,
+                        member.snapshotIndex,
+                        regionIndex,
+                        &info
+                    ),
+                    operation: "inspect group region \(regionIndex)"
+                )
+                result.append(info)
+            }
+            return result
+        }
+
+        let leftRegions = try regions(left, member: leftMember)
+        let rightRegions = try regions(right, member: rightMember)
+        let count = max(leftRegions.count, rightRegions.count)
+        for index in 0..<count {
+            let a = index < leftRegions.count ? leftRegions[index] : nil
+            let b = index < rightRegions.count ? rightRegions[index] : nil
+            guard a?.address != b?.address
+                || a?.length != b?.length
+                || a?.protection != b?.protection
+                || a?.maximum_protection != b?.maximum_protection
+                || a?.inheritance != b?.inheritance
+                || canonicalShareMode(a?.share_mode) != canonicalShareMode(b?.share_mode)
+                || a?.user_tag != b?.user_tag
+            else { continue }
+            let aText = a.map {
+                "A=\($0.length)b/p\($0.protection)/m\($0.maximum_protection)"
+                    + "/i\($0.inheritance)/s\($0.share_mode)/tag\($0.user_tag)"
+            } ?? "A=missing"
+            let bText = b.map {
+                "B=\($0.length)b/p\($0.protection)/m\($0.maximum_protection)"
+                    + "/i\($0.inheritance)/s\($0.share_mode)/tag\($0.user_tag)"
+            } ?? "B=missing"
+            let address = a?.address ?? b?.address ?? 0
+            return "region \(index) at 0x\(String(address, radix: 16)) \(aText) \(bText)"
+        }
+        return "eligible regions match; an excluded mapping changed"
+    }
+
+    private static func canonicalShareMode(_ mode: UInt32?) -> UInt32? {
+        guard let mode else { return nil }
+        return mode == UInt32(SM_PRIVATE) || mode == UInt32(SM_COW) ? 1 : mode
     }
 
     private static func processLayoutDifference(
@@ -526,7 +799,7 @@ enum ExternalHotProof {
         digest: String,
         cycle: Int
     ) throws {
-        let reply = try target.send(command: "validate", state: expected)
+        let reply = try target.send(command: "validate-root", state: expected)
         try require(reply.event == "validated", "target did not validate cycle \(cycle)")
         try require(reply.valid == true, "target rejected state \(expected) on cycle \(cycle)")
         try require(reply.state == expected, "target observed the wrong state on cycle \(cycle)")
@@ -534,6 +807,40 @@ enum ExternalHotProof {
             reply.digest == digest,
             "target digest differed after restoring \(expected) on cycle \(cycle)"
         )
+    }
+
+    private static func validateCapturedArena(
+        session: OpaquePointer,
+        expectedAddress: UInt64,
+        expectedLength: Int,
+        digest: String,
+        label: String
+    ) throws {
+        let captured = try capture(
+            session: session,
+            expectedAddress: expectedAddress,
+            expectedLength: expectedLength
+        )
+        try require(
+            captured.digest == digest,
+            "\(label) arena digest differed after process-group restore"
+        )
+    }
+
+    private static func validateGroup(
+        target: ExternalTargetProcess,
+        expected: String,
+        digest: String,
+        cycle: Int
+    ) throws {
+        let reply = try target.send(command: "validate", state: expected)
+        try require(reply.event == "validated", "target did not validate group cycle \(cycle)")
+        try require(reply.valid == true, "target root rejected state \(expected)")
+        try require(reply.helperValid == true, "target helper rejected state \(expected)")
+        try require(reply.state == expected, "target root observed the wrong group state")
+        try require(reply.helperState == expected, "target helper observed the wrong group state")
+        try require(reply.digest == digest, "target root digest differed after group restore")
+        try require(reply.helperDigest == digest, "target helper digest differed after group restore")
     }
 
     private static func check(_ status: continuum_status, operation: String) throws {
@@ -572,6 +879,24 @@ private struct RemoteCapture {
 private struct RemoteProcessCapture {
     let snapshot: OpaquePointer
     let info: continuum_remote_process_snapshot_info
+}
+
+private struct RemoteProcessGroupCapture {
+    let snapshot: OpaquePointer
+    let info: continuum_remote_process_group_snapshot_info
+    let members: [RemoteProcessGroupMember]
+}
+
+private struct RemoteProcessGroupMember {
+    let snapshotIndex: Int
+    let processID: Int32
+    let parentProcessID: Int32
+    let capturedBytes: UInt64
+    let threadCount: UInt64
+    let vmLayoutHash: UInt64
+    let threadSetHash: UInt64
+    let descriptorTableHash: UInt64
+    let machSpaceHash: UInt64
 }
 
 private final class ExternalTargetProcess {
@@ -799,6 +1124,12 @@ private struct TargetReply: Decodable {
     let digest: String?
     let expectedState: String?
     let valid: Bool?
+    let helperProcessIdentifier: Int32?
+    let helperAddress: UInt64?
+    let helperLength: Int?
+    let helperState: String?
+    let helperDigest: String?
+    let helperValid: Bool?
     let error: String?
 }
 

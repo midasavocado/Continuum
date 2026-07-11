@@ -222,6 +222,47 @@ final class ContinuumRuntimeTests: XCTestCase {
         )
     }
 
+    func testProcessGroupAPIsRejectInvalidOrSelfTargets() {
+        var snapshot: OpaquePointer?
+        var info = continuum_remote_process_group_snapshot_info()
+        XCTAssertEqual(
+            continuum_remote_process_group_capture(
+                getpid(),
+                1_024,
+                &snapshot,
+                &info
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertNil(snapshot)
+        XCTAssertEqual(continuum_remote_process_group_member_count(nil), 0)
+
+        var member = continuum_remote_process_group_member_info()
+        XCTAssertEqual(
+            continuum_remote_process_group_copy_member_info(nil, 0, &member),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(
+            continuum_remote_process_group_member_region_count(nil, 0),
+            0
+        )
+        var region = continuum_remote_process_region_info()
+        XCTAssertEqual(
+            continuum_remote_process_group_copy_member_region_info(
+                nil,
+                0,
+                0,
+                &region
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        var report = continuum_remote_process_group_restore_report()
+        XCTAssertEqual(
+            continuum_remote_process_group_restore(nil, &report),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+    }
+
     func testRemoteSelfSessionCapturesThreadEvidenceAndRestoresArenaBytes() {
         let length = 16_384
         guard let memory = mmap(
@@ -598,7 +639,8 @@ final class ContinuumRuntimeTests: XCTestCase {
             CONTINUUM_STATUS_THREAD_RESTORE_FAILED,
             CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED,
             CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED,
-            CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR
+            CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR,
+            CONTINUUM_STATUS_PROCESS_TREE_CHANGED
         ]
 
         for status in statuses {

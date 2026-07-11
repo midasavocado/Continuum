@@ -35,7 +35,8 @@ typedef enum continuum_status {
     CONTINUUM_STATUS_THREAD_RESTORE_FAILED = 23,
     CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED = 24,
     CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED = 25,
-    CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR = 26
+    CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR = 26,
+    CONTINUUM_STATUS_PROCESS_TREE_CHANGED = 27
 } continuum_status;
 
 typedef struct continuum_runtime_info {
@@ -53,6 +54,8 @@ typedef struct continuum_tracked_region continuum_tracked_region;
 typedef struct continuum_remote_session continuum_remote_session;
 typedef struct continuum_remote_thread_snapshot continuum_remote_thread_snapshot;
 typedef struct continuum_remote_process_snapshot continuum_remote_process_snapshot;
+typedef struct continuum_remote_process_group_snapshot
+    continuum_remote_process_group_snapshot;
 
 typedef struct continuum_remote_identity {
     int32_t process_id;
@@ -146,6 +149,39 @@ typedef struct continuum_remote_resource_fingerprint {
     uint64_t thread_count;
     uint64_t thread_set_hash;
 } continuum_remote_resource_fingerprint;
+
+typedef struct continuum_remote_process_group_snapshot_info {
+    uint64_t process_count;
+    uint64_t captured_region_count;
+    uint64_t captured_bytes;
+    uint64_t excluded_region_count;
+    uint64_t excluded_bytes;
+    uint64_t thread_count;
+} continuum_remote_process_group_snapshot_info;
+
+typedef struct continuum_remote_process_group_member_info {
+    int32_t process_id;
+    int32_t parent_process_id;
+    uint64_t captured_region_count;
+    uint64_t captured_bytes;
+    uint64_t thread_count;
+    uint64_t vm_layout_hash;
+    uint64_t thread_set_hash;
+    uint64_t file_descriptor_count;
+    uint64_t descriptor_table_hash;
+    uint64_t mach_name_count;
+    uint64_t mach_space_hash;
+} continuum_remote_process_group_member_info;
+
+typedef struct continuum_remote_process_group_restore_report {
+    uint64_t processes_restored;
+    uint64_t regions_written;
+    uint64_t bytes_written;
+    uint64_t thread_states_restored;
+    uint8_t memory_readback_verified;
+    uint8_t rollback_attempted;
+    uint8_t rollback_verified;
+} continuum_remote_process_group_restore_report;
 
 typedef enum continuum_resource_change {
     CONTINUUM_RESOURCE_CHANGE_NONE = 0,
@@ -290,6 +326,53 @@ continuum_status continuum_remote_session_restore_process(
     continuum_remote_session *session,
     const continuum_remote_process_snapshot *snapshot,
     continuum_remote_process_restore_report *out_report
+);
+
+/// Captures the root process and every descendant as one coherent hot group.
+/// Continuum discovers the tree, opens and pins every task, suspends the group
+/// root-first, verifies membership again, then captures each process while all
+/// members remain stopped. A membership race retries internally and otherwise
+/// fails closed. The returned object owns the hot task sessions needed later.
+continuum_status continuum_remote_process_group_capture(
+    int32_t root_process_id,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+);
+
+/// Restores a hot process group only while the exact original tasks, parent
+/// relationships, VM layouts, resource fingerprints, and thread identities
+/// remain present. All safety cuts validate before the first write. A partial
+/// multi-process write rolls every touched member back before resuming them.
+continuum_status continuum_remote_process_group_restore(
+    continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_process_group_restore_report *out_report
+);
+
+size_t continuum_remote_process_group_member_count(
+    const continuum_remote_process_group_snapshot *snapshot
+);
+
+continuum_status continuum_remote_process_group_copy_member_info(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t index,
+    continuum_remote_process_group_member_info *out_info
+);
+
+size_t continuum_remote_process_group_member_region_count(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index
+);
+
+continuum_status continuum_remote_process_group_copy_member_region_info(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t region_index,
+    continuum_remote_process_region_info *out_info
+);
+
+void continuum_remote_process_group_snapshot_destroy(
+    continuum_remote_process_group_snapshot *snapshot
 );
 
 void continuum_remote_process_snapshot_destroy(
