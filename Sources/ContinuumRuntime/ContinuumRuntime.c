@@ -77,11 +77,19 @@ struct continuum_remote_thread_snapshot {
     uint64_t set_hash;
 };
 
+typedef struct continuum_remote_mach_right_entry {
+    mach_port_name_t name;
+    mach_port_type_t type;
+    natural_t object;
+} continuum_remote_mach_right_entry;
+
 struct continuum_remote_process_snapshot {
     continuum_remote_identity identity;
     continuum_remote_process_region *regions;
     size_t region_count;
     continuum_remote_thread_snapshot *threads;
+    continuum_remote_mach_right_entry *mach_rights;
+    size_t mach_right_count;
     continuum_remote_resource_fingerprint resources;
     continuum_remote_process_snapshot_info info;
 };
@@ -105,6 +113,113 @@ struct continuum_remote_process_group_snapshot {
     size_t member_count;
     continuum_remote_process_group_snapshot_info info;
 };
+
+static continuum_status continuum_capture_mach_rights(
+    mach_port_t task,
+    continuum_remote_mach_right_entry **out_entries,
+    size_t *out_count
+) {
+    if (task == MACH_PORT_NULL || out_entries == NULL || out_count == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_entries = NULL;
+    *out_count = 0;
+
+    ipc_info_space_t space_info;
+    memset(&space_info, 0, sizeof(space_info));
+    ipc_info_name_array_t table = NULL;
+    mach_msg_type_number_t table_count = 0;
+    ipc_info_tree_name_array_t tree = NULL;
+    mach_msg_type_number_t tree_count = 0;
+    kern_return_t result = mach_port_space_info(
+        task,
+        &space_info,
+        &table,
+        &table_count,
+        &tree,
+        &tree_count
+    );
+    if (result != KERN_SUCCESS) {
+        return CONTINUUM_STATUS_MACH_ERROR;
+    }
+
+    continuum_remote_mach_right_entry *entries = table_count == 0
+        ? NULL
+        : calloc(table_count, sizeof(*entries));
+    continuum_status status = table_count > 0 && entries == NULL
+        ? CONTINUUM_STATUS_OUT_OF_MEMORY
+        : CONTINUUM_STATUS_OK;
+    size_t count = 0;
+    for (mach_msg_type_number_t index = 0;
+         status == CONTINUUM_STATUS_OK && index < table_count;
+         index += 1) {
+        if (table[index].iin_type == MACH_PORT_TYPE_NONE) {
+            continue;
+        }
+        entries[count].name = table[index].iin_name;
+        entries[count].type = table[index].iin_type;
+        entries[count].object = table[index].iin_object;
+        count += 1;
+    }
+    if (table != NULL) {
+        (void)vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)table,
+            (vm_size_t)(table_count * sizeof(*table))
+        );
+    }
+    if (tree != NULL) {
+        (void)vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)tree,
+            (vm_size_t)(tree_count * sizeof(*tree))
+        );
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        free(entries);
+        return status;
+    }
+    *out_entries = entries;
+    *out_count = count;
+    return CONTINUUM_STATUS_OK;
+}
+
+static int continuum_saved_mach_rights_remain_valid(
+    const continuum_remote_process_snapshot *saved,
+    const continuum_remote_process_snapshot *current
+) {
+    if (saved == NULL || current == NULL) {
+        return 0;
+    }
+    const mach_port_type_t identity_types = MACH_PORT_TYPE_SEND
+        | MACH_PORT_TYPE_RECEIVE
+        | MACH_PORT_TYPE_SEND_ONCE
+        | MACH_PORT_TYPE_PORT_SET
+        | MACH_PORT_TYPE_DEAD_NAME;
+    for (size_t saved_index = 0;
+         saved_index < saved->mach_right_count;
+         saved_index += 1) {
+        const continuum_remote_mach_right_entry *required =
+            &saved->mach_rights[saved_index];
+        int found = 0;
+        for (size_t current_index = 0;
+             current_index < current->mach_right_count;
+             current_index += 1) {
+            const continuum_remote_mach_right_entry *candidate =
+                &current->mach_rights[current_index];
+            if (candidate->name == required->name) {
+                found = candidate->object == required->object
+                    && (candidate->type & identity_types)
+                        == (required->type & identity_types);
+                break;
+            }
+        }
+        if (!found) {
+            return 0;
+        }
+    }
+    return 1;
+}
 
 static continuum_status continuum_capture_resource_fingerprint_suspended(
     continuum_remote_session *session,
@@ -604,6 +719,7 @@ void continuum_remote_process_snapshot_destroy(
     }
     free(snapshot->regions);
     continuum_remote_thread_snapshot_destroy(snapshot->threads);
+    free(snapshot->mach_rights);
     memset(snapshot, 0, sizeof(*snapshot));
     free(snapshot);
 }
@@ -982,6 +1098,13 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         status = continuum_capture_resource_fingerprint_suspended(
             session,
             &snapshot->resources
+        );
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_capture_mach_rights(
+            session->task,
+            &snapshot->mach_rights,
+            &snapshot->mach_right_count
         );
     }
     if (status == CONTINUUM_STATUS_OK) {
@@ -1529,7 +1652,8 @@ static continuum_status continuum_validate_process_snapshot_layout(
     if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE) != 0) {
         return CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED;
     }
-    if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_MACH_SPACE) != 0) {
+    if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_MACH_SPACE) != 0
+        && !continuum_saved_mach_rights_remain_valid(saved, current)) {
         return CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED;
     }
     if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_THREAD_SET) != 0) {

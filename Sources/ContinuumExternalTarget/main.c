@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <mach/mach.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@ typedef struct target_state {
     char state;
     int probe_descriptor;
     int stable_descriptor;
+    mach_port_t additive_port;
     char stable_path[PATH_MAX];
     int is_helper;
     pid_t helper_pid;
@@ -306,6 +308,23 @@ static int run_server(target_state *target) {
                 command,
                 valid,
                 valid ? NULL : "file mutation failed"
+            );
+        } else if (strcmp(command, "add-mach-port") == 0) {
+            int helper_valid = target->is_helper
+                || (helper_exchange(target, command, '\0')
+                    && target->helper_valid == 1);
+            kern_return_t result = mach_port_allocate(
+                mach_task_self(),
+                MACH_PORT_RIGHT_RECEIVE,
+                &target->additive_port
+            );
+            int valid = helper_valid && result == KERN_SUCCESS;
+            send_reply(
+                target,
+                "mach-port-added",
+                command,
+                valid,
+                valid ? NULL : "Mach port allocation failed"
             );
         } else if (strcmp(command, "validate-file") == 0) {
             int helper_valid = target->is_helper

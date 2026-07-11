@@ -326,6 +326,7 @@ enum ExternalHotProof {
             "  kernel resources:    \(resourceSummary(resourceStateA))"
         )
         print("  resource A->B gate:  unchanged")
+        print("  additive Mach rights: accepted; saved rights remained identity-valid")
         print("  coherent open files: root + helper APFS bytes restored")
         print("  descriptor mutation: rejected before memory write")
         print("  app backend adapter: captured + restored Experimental Hot state")
@@ -400,6 +401,11 @@ enum ExternalHotProof {
             "shipping backend expired its live snapshot immediately"
         )
 
+        let addedMachRights = try target.send(command: "add-mach-port")
+        try require(
+            addedMachRights.valid == true && addedMachRights.helperValid == true,
+            "target did not add the root/helper Mach-right probe"
+        )
         let changedFiles = try target.send(command: "mutate-file", state: "A")
         try require(
             changedFiles.valid == true && changedFiles.helperValid == true,

@@ -350,7 +350,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         ResourceCoverage(
             domain: .machIPC,
             mode: .guarded,
-            detail: "Mach right topology must remain unchanged; queued messages are not replayed."
+            detail: "Every saved Mach name/right/object must remain valid. Additive XPC rights are allowed; queued messages are not replayed."
         ),
         ResourceCoverage(
             domain: .windowServer,
