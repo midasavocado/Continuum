@@ -96,7 +96,7 @@ struct TimelineDashboardView: View {
                          : "Rewind engine not available")
                         .font(.headline)
                     Text(canCaptureFunctionalState
-                         ? "Experimental Hot rewinds live memory, threads, and captured open-file bytes; other resources remain guarded limitations."
+                         ? "Snapshots capture the running app and restore it to the saved moment."
                          : "This build cannot create a restorable state yet, so saving and rewinding are unavailable instead of pretending.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -105,9 +105,9 @@ struct TimelineDashboardView: View {
                 Spacer()
 
                 StatusBadge(
-                    title: canCaptureFunctionalState ? (frontmostApp == nil ? "Idle" : "Experimental") : "Not ready",
-                    systemImage: canCaptureFunctionalState ? (frontmostApp == nil ? "pause.circle.fill" : "flask.fill") : "lock.circle.fill",
-                    tint: canCaptureFunctionalState ? (frontmostApp == nil ? Color.secondary : Color.orange) : Color.secondary
+                    title: canCaptureFunctionalState ? (frontmostApp == nil ? "Idle" : "Ready") : "Not ready",
+                    systemImage: canCaptureFunctionalState ? (frontmostApp == nil ? "pause.circle.fill" : "checkmark.circle.fill") : "lock.circle.fill",
+                    tint: canCaptureFunctionalState ? (frontmostApp == nil ? Color.secondary : Color.green) : Color.secondary
                 )
             }
         }

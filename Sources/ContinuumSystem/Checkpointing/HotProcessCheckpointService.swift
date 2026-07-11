@@ -167,7 +167,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         artifacts: [CapturedArtifact]
     ) async -> RestoreResult {
         guard snapshot.availability == .experimentalHot else {
-            return .failed("This backend only restores Experimental Hot snapshots.")
+            return .failed("This snapshot is not available to the live restore engine.")
         }
         guard let handle = handles[snapshot.id] else {
             return .failed(
@@ -175,14 +175,29 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             )
         }
 
-        let rollbackHandle = retentionOrder.reversed().lazy
-            .compactMap { self.handles[$0] }
-            .first {
-                $0.appID == handle.appID && $0.kind == .beforeRewind
+        let rollbackSnapshotID = UUID()
+        if let fileCheckpointStore = handle.fileCheckpointStore {
+            let safetyBox = HotResourceInventoryCallbackBox(
+                expectedInventory: handle.writableVnodes,
+                fileCheckpointStore: fileCheckpointStore,
+                captureSnapshotID: rollbackSnapshotID
+            )
+            let safetyContext = Unmanaged.passUnretained(safetyBox).toOpaque()
+            let safetyStatus = continuum_remote_process_group_with_suspended_resources(
+                handle.pointer,
+                continuumCaptureHotResourceInventory,
+                safetyContext
+            )
+            guard safetyStatus == CONTINUUM_STATUS_OK else {
+                return .failed(
+                    safetyBox.failureDescription
+                        ?? "Continuum could not secure the live files before restoring. No memory was changed."
+                )
             }
-        if handle.fileCheckpointStore != nil && rollbackHandle == nil {
-            return .failed(
-                "Continuum has no coherent file safety root for this restore. No memory was changed."
+        }
+        defer {
+            try? handle.fileCheckpointStore?.deleteCoherently(
+                snapshotID: rollbackSnapshotID
             )
         }
 
@@ -191,7 +206,9 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             expectedInventory: handle.writableVnodes,
             fileCheckpointStore: handle.fileCheckpointStore,
             restoreSnapshotID: handle.snapshotID,
-            rollbackSnapshotID: rollbackHandle?.snapshotID
+            rollbackSnapshotID: handle.fileCheckpointStore == nil
+                ? nil
+                : rollbackSnapshotID
         )
         let resourceContext = Unmanaged.passUnretained(resourceBox).toOpaque()
         let status = continuum_remote_process_group_restore_with_resources(

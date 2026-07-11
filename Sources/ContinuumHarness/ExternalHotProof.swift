@@ -329,7 +329,7 @@ enum ExternalHotProof {
         print("  additive Mach rights: accepted; saved rights remained identity-valid")
         print("  coherent open files: root + helper APFS bytes restored")
         print("  descriptor mutation: rejected before memory write")
-        print("  app backend adapter: captured + restored Experimental Hot state")
+        print("  app backend adapter: captured + restored live snapshot state")
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -376,7 +376,7 @@ enum ExternalHotProof {
         )
         try require(
             capture.snapshot.availability == .experimentalHot,
-            "shipping backend did not publish Experimental Hot availability"
+            "shipping backend did not publish live restore availability"
         )
         try require(
             capture.snapshot.resourceCoverage?.count == ResourceDomain.allCases.count,
@@ -384,7 +384,7 @@ enum ExternalHotProof {
         )
         try require(
             !capture.snapshot.hasCompleteResourceCoverage,
-            "Experimental Hot incorrectly claimed complete resource reconstruction"
+            "live snapshot incorrectly claimed complete resource reconstruction"
         )
         let fileCoverage = capture.snapshot.resourceCoverage?.first {
             $0.domain == .localFiles

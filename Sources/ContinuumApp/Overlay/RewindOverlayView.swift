@@ -181,14 +181,6 @@ struct RewindOverlayView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                } else if snapshot.availability == .experimentalHot {
-                    Label {
-                        Text("Experimental Hot restores live memory, threads, and captured open-file bytes. Closed or renamed files, connections, windows, and GPU resources are not reconstructed yet.")
-                    } icon: {
-                        Image(systemName: "flask.fill")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.orange)
                 } else if case let .failed(message) = state.phase {
                     Label(message, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)

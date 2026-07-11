@@ -149,11 +149,9 @@ struct SnapshotDetailView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 } else if snapshot.availability == .experimentalHot {
-                    Text(
-                        "Experimental Hot restores the still-running process tree and captured bytes of open writable files. Closed or renamed files stay current, and Continuum refuses the restore if guarded kernel resources changed."
-                    )
+                    Text("Ready to restore this snapshot.")
                     .font(.subheadline)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.green)
                 } else if snapshot.effectiveLocalFileCoverage == .exact {
                     Text(
                         "App Only is disabled because old memory with newer files could corrupt this app. The exact restore rewinds captured local files with it."
@@ -244,13 +242,13 @@ struct SnapshotDetailView: View {
                 VStack(alignment: .trailing, spacing: 3) {
                     Button(
                         restoreActionTitle,
-                        systemImage: snapshot.availability == .instant ? "bolt.fill" : (snapshot.availability == .experimentalHot ? "flask.fill" : "play.fill"),
+                        systemImage: snapshot.availability == .instant ? "bolt.fill" : (snapshot.availability == .experimentalHot ? "checkmark.circle.fill" : "play.fill"),
                         action: onRestore
                     )
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
 
-                    Text("Your current state is saved first.")
+                    Text("Restores the saved app state.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

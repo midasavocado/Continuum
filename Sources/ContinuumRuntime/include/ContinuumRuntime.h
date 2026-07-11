@@ -382,6 +382,14 @@ continuum_status continuum_remote_process_group_capture_with_resources(
     continuum_remote_process_group_snapshot_info *out_info
 );
 
+/// Invokes a resource callback while the captured process group is coherently
+/// suspended and its membership is unchanged. No process memory is modified.
+continuum_status continuum_remote_process_group_with_suspended_resources(
+    continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_resource_capture_callback callback,
+    void *callback_context
+);
+
 /// Restores a hot process group only while the exact original tasks, parent
 /// relationships, VM layouts, resource fingerprints, and thread identities
 /// remain present. All safety cuts validate before the first write. A partial

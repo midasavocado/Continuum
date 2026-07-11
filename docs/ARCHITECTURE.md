@@ -9,7 +9,7 @@ Continuum v0.3 is a native macOS per-app rewind research prototype. The current 
 | `ContinuumCore` | Sendable domain models, identifiers, errors, display naming, and protocols | AppKit, persistence, Mach calls, permission prompts, or presentation state |
 | `ContinuumStore` | Durable index, content-addressed chunks, APFS per-file COW roots, in-place file-byte restoration, integrity checks, and atomic snapshot/rewind transactions | File discovery/attribution, process inspection, UI, permission prompts, or claims that unvalidated bytes are restorable |
 | `ContinuumRuntime` | Mach task/tree identity, coherent descendant-group suspension, nested VM-map byte capture, ARM64 register cuts, safety snapshots, group rollback, batched page restore/readback, writable-vnode inventory callbacks, and fail-closed topology/resource validation | Descriptor/IPC/GPU reconstruction, product policy, user consent, arbitrary-app compatibility claims, or durable storage |
-| `ContinuumSystem` | Window-owner/app inventory, code-signing inspection, permission requests/status, generic setup/recovery, global hotkeys, and the Experimental Hot adapter over `ContinuumRuntime` | Snapshot indexing, branch policy, SwiftUI state, source-app mutation, or bypassing SIP/TCC |
+| `ContinuumSystem` | Window-owner/app inventory, code-signing inspection, permission requests/status, generic setup/recovery, global hotkeys, and the live snapshot adapter over `ContinuumRuntime` | Snapshot indexing, branch policy, SwiftUI state, source-app mutation, or bypassing SIP/TCC |
 | `ContinuumApp` | SwiftUI/AppKit consumer shell, onboarding, Snapshot Library, timeline/branch presentation, explicit user actions, and evidence-based capability labels | Raw store file mutation, Mach implementation details, or silently requesting broad permissions |
 | `ContinuumHarness` | Reproducible command-line proofs for setup, VM-region inspection, the owned/external registered-arena experiments, and store transactions | Shipping UI behavior or compatibility certification |
 | `ContinuumExternalTarget` | Cooperative signed proof process with one page-aligned arena and a tiny validation protocol | General app behavior, production instrumentation, or a compatibility shortcut |
@@ -31,7 +31,7 @@ flowchart LR
     H --> T["ContinuumExternalTarget\ncooperative arena"]
 ```
 
-The UI talks to protocol-shaped coordinators and never infers restoration from a screenshot or successful metadata write. A snapshot's `RestoreAvailability` is the user-facing gate. `Experimental Hot` means memory and thread restoration into the original live tasks under strict resource guards; `Unavailable` means inspectable but not playable; `Instant` remains reserved for certified exact restoration.
+The UI talks to protocol-shaped coordinators and never infers restoration from a screenshot or successful metadata write. A snapshot's `RestoreAvailability` is the user-facing gate. `Ready` means the original live tasks and guarded resources remain restorable; `Unavailable` means inspectable but not restorable.
 
 ## Snapshot transaction invariants
 
@@ -45,7 +45,7 @@ These invariants apply even while the runtime remains experimental:
 6. **Content is addressed by digest.** A committed chunk's bytes must match its recorded digest; duplicate content reuses one physical object.
 7. **References outlive branches.** Deleting a snapshot or branch may reclaim only chunks with no remaining snapshot reference.
 8. **Index publication comes last.** Chunk files are fully written and made durable before an index can reference them. Readers either observe the old complete state or the new complete state.
-9. **Availability is evidence-based.** The live process adapter may publish only `Experimental Hot`; `Instant` requires complete certified local-state coverage. Metadata-only or expired hot checkpoints remain `Unavailable`.
+9. **Availability is evidence-based.** The live process adapter publishes `Ready` only while its retained process state remains valid. Metadata-only or expired checkpoints remain `Unavailable`.
 10. **External effects remain external.** A local restore cannot unsend a message, reverse a purchase, or change a remote server. Crossing recorded effects produces a warning, never a success claim.
 11. **Storage pressure fails closed.** If permanent safety data cannot fit, rewind does not start. Pinned manual and pre-rewind snapshots are not silently evicted.
 12. **Unknown state is not fabricated.** Missing process, descriptor, graphics, helper, or IPC state makes the snapshot unavailable; visual continuity is never presented as functional restoration.
@@ -72,7 +72,7 @@ The store owns an index plus content-addressed chunk files. Index replacement us
 
 Snapshot material should be treated like an unlocked session of the captured application. It may include document text, credentials in memory, file paths, window titles, or personal screen content. The consumer UI must state the selected scope and destination before capture, keep data local by default, and make destructive deletion explicit.
 
-The future scheduler defaults to 100 ms active epochs, conditionally tightens to 50 ms for games only when performance gates pass, and backs off to one second while idle. Its default budgets are 2 GB for 90 seconds of hot history and 20 GB for a 30-minute rolling disk window. The current Experimental Hot adapter retains full process images rather than page deltas, so those cadence targets are not active yet. Product surfaces report retained hot RAM separately from durable encrypted bytes.
+The future scheduler defaults to 100 ms active epochs, conditionally tightens to 50 ms for games only when performance gates pass, and backs off to one second while idle. Its default budgets are 2 GB for 90 seconds of hot history and 20 GB for a 30-minute rolling disk window. The current live adapter retains full process images rather than page deltas, so those cadence targets are not active yet. Product surfaces report retained RAM separately from durable encrypted bytes.
 
 The application does not silently change SIP, edit the selected vendor source, or grant itself TCC permissions. Its opt-in setup coordinator clones a verified `Original.app` and a separate `Managed.app` into Application Support. On this development Mac, SIP is user-disabled for research against unmodified tasks; a consumer build still needs a supported authorization/instrumentation route and Apple-granted system-extension entitlements.
 

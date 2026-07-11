@@ -3289,6 +3289,45 @@ continuum_status continuum_remote_process_group_restore(
     );
 }
 
+continuum_status continuum_remote_process_group_with_suspended_resources(
+    continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_resource_capture_callback callback,
+    void *callback_context
+) {
+    if (snapshot == NULL || callback == NULL || snapshot->member_count == 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+
+    size_t suspended_count = 0;
+    continuum_status status = continuum_suspend_process_group(
+        snapshot,
+        &suspended_count
+    );
+    continuum_remote_process_tree_entry *tree = NULL;
+    size_t tree_count = 0;
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_discover_process_tree(
+            snapshot->root_process_id,
+            &tree,
+            &tree_count
+        );
+    }
+    if (status == CONTINUUM_STATUS_OK
+        && !continuum_process_tree_matches_group(tree, tree_count, snapshot)) {
+        status = CONTINUUM_STATUS_PROCESS_TREE_CHANGED;
+    }
+    free(tree);
+    if (status == CONTINUUM_STATUS_OK) {
+        status = callback(snapshot, callback_context);
+    }
+
+    continuum_status resume_status = continuum_resume_process_group(
+        snapshot,
+        suspended_count
+    );
+    return resume_status == CONTINUUM_STATUS_OK ? status : resume_status;
+}
+
 continuum_status continuum_remote_process_group_restore_with_resources(
     continuum_remote_process_group_snapshot *snapshot,
     continuum_remote_resource_restore_callback callback,

@@ -129,18 +129,18 @@ struct AppsCompatibilityView: View {
                     number: 3,
                     title: "Try",
                     detail: experimentalHotEnabled
-                        ? "Running apps can attempt Experimental Hot."
+                        ? "Running apps can be captured and restored."
                         : "Rewind appears when a runtime is ready."
                 )
             }
 
             if experimentalHotEnabled {
                 Label(
-                    "Experimental Hot is active. It restores live memory and threads, then refuses the rewind if guarded process resources changed.",
-                    systemImage: "flask.fill"
+                    "Snapshot restore is active for running apps.",
+                    systemImage: "checkmark.circle.fill"
                 )
                 .font(.caption)
-                .foregroundStyle(.orange)
+                .foregroundStyle(.green)
             }
 
             HStack(spacing: 8) {
@@ -355,7 +355,7 @@ private struct AppSetupDetailView: View {
                 factRow("Running", isRunning ? "Yes" : "No")
                 factRow("Original app", "Never changed")
                 factRow(
-                    "Experimental Hot",
+                    "Snapshot restore",
                     experimentalHotEnabled
                         ? (isRunning ? "Available to try" : "Launch the app first")
                         : "Runtime unavailable"

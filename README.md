@@ -2,7 +2,7 @@
 
 Continuum is a native macOS research prototype for safe, branching app snapshots: save a moment, preserve the current future before rewinding, and never label a screenshot as restorable state.
 
-> **Current status: v0.3 research build.** Continuum now connects its consumer app to the live process-group checkpoint runtime as **Experimental Hot**. It discovers a root process and descendant helper tree, identity-pins and suspends every task, copies every readable+writable private/COW mapping plus ARM64 register state, and restores helpers-first with an all-member safety cut and rollback. In that same suspended cut it inventories open writable regular files and creates APFS copy-on-write clones; restore writes their captured bytes back through the existing vnode so live descriptors keep their identity. The signed shipping-adapter proof rewinds both root and helper, restores both processes' open-file bytes, tolerates additive Mach/XPC rights while identity-validating all saved rights, then completes 100 additional arena cycles. Its current two-process snapshot is roughly 200–1,050 ms and hot restore roughly 250–410 ms for about 635 MB of retained RAM. Before writing memory, the restore compares file descriptors, vnode identity/offsets, sockets, pipes, kqueues, saved Mach names/right types/kernel objects, threads, process membership, and parent topology; a deliberate extra-FD test is rejected with zero bytes written. It still does **not** certify arbitrary apps or games because closed-file and namespace history remain uncovered, other resources are guarded rather than recreated, and XPC message queues, WindowServer, GPU, audio, and device reconstruction remain unfinished. The tiny time machine now reaches the app; several tracks still end at cliffs.
+> **Current status: v0.3 research build.** Continuum connects its consumer app to the live process-group checkpoint runtime. It discovers a root process and descendant helper tree, identity-pins and suspends every task, copies every readable+writable private/COW mapping plus ARM64 register state, and restores helpers-first with an all-member safety cut and rollback. In that same suspended cut it inventories open writable regular files and creates APFS copy-on-write clones; restore writes their captured bytes back through the existing vnode so live descriptors keep their identity. The signed shipping-adapter proof rewinds both root and helper, restores both processes' open-file bytes, tolerates additive Mach/XPC rights while identity-validating all saved rights, then completes 100 additional arena cycles. Its current two-process snapshot is roughly 200–1,050 ms and restore roughly 250–410 ms for about 635 MB of retained RAM. Before writing memory, the restore compares file descriptors, vnode identity/offsets, sockets, pipes, kqueues, saved Mach names/right types/kernel objects, threads, process membership, and parent topology; a deliberate extra-FD test is rejected with zero bytes written. It still does **not** certify arbitrary apps or games because closed-file and namespace history remain uncovered, other resources are guarded rather than recreated, and XPC message queues, WindowServer, GPU, audio, and device reconstruction remain unfinished.
 
 Continuum requires macOS 15 or later. The cooperative signed proof works through explicit development entitlements and verifies that it never changes SIP state. Testing unmodified third-party processes on this development Mac currently relies on the user's SIP-disabled configuration; that is not a consumer distribution plan or proof of universal compatibility.
 
@@ -12,7 +12,7 @@ Continuum requires macOS 15 or later. The cooperative signed proof works through
 - A broad inventory of running window owners and installed `.app` bundles, plus explicit selection of an app or executable anywhere on disk.
 - One generic managed-copy setup pipeline for eligible app bundles: probe, preserve a verified original, clone a separate managed copy, add only Continuum's marker, ad-hoc sign it with `get-task-allow`, validate every artifact, persist the result, and roll back partial failures.
 - Exact blockers for Apple platform binaries, sandbox or identity-bound apps, App Store/DRM targets, restricted entitlements, unsupported nested code, malformed bundles, and standalone executables that cannot use the current bundle route.
-- A floating native rewind timeline opened by a configurable global shortcut, with arrow-key navigation, Return to commit, Escape to cancel, and distinct **Experimental Hot** and unavailable states.
+- A floating native snapshot picker opened by a configurable global shortcut, with arrow-key navigation, Return to restore, Escape to cancel, and clear Ready or Unavailable states.
 - Global `Control–Option–Command–S` hot-snapshot registration plus safe rewind-shortcut presets while Continuum is running.
 - A shipping `HotProcessCheckpointService` that retains live process-group snapshots, expires them after relaunch/eviction, refuses changed resource topology, and never promotes them to exact local restoration.
 - Typed snapshot, checkpoint, branch, compatibility, storage, and external-effect models shared by the app, store, and test harness.
@@ -33,7 +33,7 @@ The app deliberately distinguishes **Managed Copy Prepared** from rewind certifi
 - Recreation of file descriptors, closed/renamed/deleted files, Mach ports, XPC, sockets, pipes, kqueues, launchd-reparented/XPC helpers, WindowServer, GPU, audio, devices, or input state. Stable descendant helpers and bytes of currently open writable regular files are now captured; changing or external helpers remain blockers.
 - File discovery/attribution, namespace journaling, SQLite WAL/SHM lock restoration, or automatic connection of the APFS byte layer to arbitrary apps.
 - Deterministic replay, outbound-effect suppression, crash interception, or cold restore after reboot.
-- Resource reconstruction for sockets, Mach/XPC, WindowServer/Core Animation, GPU/Metal/OpenGL, audio, input, and devices. Experimental Hot currently guards or rejects these instead.
+- Resource reconstruction for sockets, Mach/XPC, WindowServer/Core Animation, GPU/Metal/OpenGL, audio, input, and devices. The current live restore engine guards or rejects these instead.
 - Runtime injection or launch of prepared managed copies, a privileged helper, or app-specific bridges.
 - A certified KSP, browser, IDE, Apple-app, DRM, or anti-cheat integration.
 - Developer ID distribution, notarization, automatic updates, or a production installer.
@@ -111,7 +111,7 @@ Continuum never grants itself access. Every prompt follows a user click, and onb
 - Open the overlay with the configured rewind shortcut; the default is `Control–Option–Command–R`.
 - Move through saved moments with Left and Right Arrow. Settings controls the time step.
 - Press Return to choose **Play from Here**, or Escape to close/cancel safely.
-- Expired and old metadata-only points remain visible but disabled. Experimental Hot points are labeled as such and never presented as exact local restoration.
+- Expired and old metadata-only points remain visible but disabled. Live snapshots are labeled Ready only while their original process state remains available.
 - Settings also stores active, game, and idle checkpoint intervals plus hot/rolling retention targets. Those scheduler controls are clearly marked inactive until a restore backend is certified.
 
 ## Snapshot semantics
@@ -123,7 +123,7 @@ Continuum never grants itself access. Every prompt follows a user click, and onb
 - Undoing a rewind follows the same preserve-first rule; it never overwrites the path being left.
 - Content chunks are deduplicated and encrypted at rest. Deleting one snapshot reclaims only chunks no other snapshot references.
 - Settings includes **Delete All Snapshot Data**, which atomically clears snapshots, branches, manifests, and content chunks when no rewind transaction is active.
-- `Unavailable` snapshots may be inspected but cannot be played. `Experimental Hot` means the original live process tree is still retained, while `Instant` remains reserved for certified exact restoration.
+- `Unavailable` snapshots may be inspected but cannot be restored. `Ready` means the original live process tree is still retained.
 - Local restoration can never unsend messages, undo purchases, retract uploads, or reverse changes already accepted by a remote service.
 - Capture is per app, not full-device: the selected app, its helpers, and certified dependent writers form one capture group. Unrelated apps and system services do not rewind.
 - Exact restore defaults to **App + Local Files**. APFS clones preserve file preimages and restoration writes through the same inode so open descriptors remain valid.

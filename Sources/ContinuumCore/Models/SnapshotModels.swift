@@ -25,7 +25,7 @@ public enum RestoreAvailability: String, Codable, CaseIterable, Sendable {
     public var displayName: String {
         switch self {
         case .instant: "Instant"
-        case .experimentalHot: "Experimental Hot"
+        case .experimentalHot: "Ready"
         case .replayRequired: "Replay required"
         case .unavailable: "Unavailable"
         }
