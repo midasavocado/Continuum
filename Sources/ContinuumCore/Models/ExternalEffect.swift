@@ -34,6 +34,7 @@ public struct ExternalEffect: Codable, Hashable, Identifiable, Sendable {
 
 public enum RestoreResult: Sendable, Equatable {
     case exactLocal
+    case experimentalHot
     case exactLocalWithOnlineWarning([ExternalEffect])
     case failed(String)
 }

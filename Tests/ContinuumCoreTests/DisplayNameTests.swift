@@ -11,6 +11,7 @@ final class DisplayNameTests: XCTestCase {
 
     func testRestoreAvailabilityDisplayNamesAreConsumerFacing() {
         XCTAssertEqual(RestoreAvailability.instant.displayName, "Instant")
+        XCTAssertEqual(RestoreAvailability.experimentalHot.displayName, "Experimental Hot")
         XCTAssertEqual(RestoreAvailability.replayRequired.displayName, "Replay required")
         XCTAssertEqual(RestoreAvailability.unavailable.displayName, "Unavailable")
     }

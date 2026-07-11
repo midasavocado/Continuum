@@ -24,7 +24,7 @@ struct ContinuumMainView: View {
                 }
                 .disabled(model.isLoading || model.isPerformingAction)
 
-                if model.canCaptureRestorableState {
+                if model.canCaptureFunctionalState {
                     Button {
                         Task { await model.saveManualSnapshot() }
                     } label: {
@@ -46,7 +46,7 @@ struct ContinuumMainView: View {
                 rewindPhase: model.rewindPhase,
                 onlineWarning: model.onlineWarning,
                 isPerformingAction: model.isPerformingAction,
-                canCaptureRestorableState: model.canCaptureRestorableState,
+                canCaptureFunctionalState: model.canCaptureFunctionalState,
                 onSaveSnapshot: { Task { await model.saveManualSnapshot() } },
                 onBeginRewind: { snapshot in
                     model.selectedSnapshotID = snapshot.id
@@ -96,6 +96,7 @@ struct ContinuumMainView: View {
                 reports: model.appReports,
                 setupRecords: model.setupRecords,
                 runningProcesses: model.runningProcesses,
+                experimentalHotEnabled: model.canCaptureFunctionalState,
                 isBatchSetupInProgress: model.isBatchSetupInProgress,
                 setupOperation: { model.setupOperation(for: $0) },
                 onCheckSetup: { app in

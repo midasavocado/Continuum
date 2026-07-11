@@ -7,7 +7,7 @@ struct TimelineDashboardView: View {
     let rewindPhase: RewindPhase
     let onlineWarning: [ExternalEffect]?
     let isPerformingAction: Bool
-    let canCaptureRestorableState: Bool
+    let canCaptureFunctionalState: Bool
     let onSaveSnapshot: () -> Void
     let onBeginRewind: (SnapshotRecord) -> Void
     let onCommitRewind: (SnapshotRecord) -> Void
@@ -66,7 +66,7 @@ struct TimelineDashboardView: View {
 
             Spacer()
 
-            if canCaptureRestorableState {
+            if canCaptureFunctionalState {
                 Button(action: onSaveSnapshot) {
                     Label("Save Snapshot", systemImage: "bookmark.fill")
                 }
@@ -91,12 +91,12 @@ struct TimelineDashboardView: View {
                 .frame(width: 46, height: 46)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(canCaptureRestorableState
+                    Text(canCaptureFunctionalState
                          ? (frontmostApp == nil ? "Waiting for an app" : "Ready for \(frontmostApp?.displayName ?? "the frontmost app")")
                          : "Rewind engine not available")
                         .font(.headline)
-                    Text(canCaptureRestorableState
-                         ? "Continuum saves only moments it can actually restore."
+                    Text(canCaptureFunctionalState
+                         ? "Experimental Hot rewinds live memory and threads; files and external resources remain guarded limitations."
                          : "This build cannot create a restorable state yet, so saving and rewinding are unavailable instead of pretending.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -105,9 +105,9 @@ struct TimelineDashboardView: View {
                 Spacer()
 
                 StatusBadge(
-                    title: canCaptureRestorableState ? (frontmostApp == nil ? "Idle" : "Ready") : "Not ready",
-                    systemImage: canCaptureRestorableState ? (frontmostApp == nil ? "pause.circle.fill" : "checkmark.circle.fill") : "lock.circle.fill",
-                    tint: canCaptureRestorableState ? (frontmostApp == nil ? Color.secondary : Color.green) : Color.secondary
+                    title: canCaptureFunctionalState ? (frontmostApp == nil ? "Idle" : "Experimental") : "Not ready",
+                    systemImage: canCaptureFunctionalState ? (frontmostApp == nil ? "pause.circle.fill" : "flask.fill") : "lock.circle.fill",
+                    tint: canCaptureFunctionalState ? (frontmostApp == nil ? Color.secondary : Color.orange) : Color.secondary
                 )
             }
         }
@@ -132,7 +132,7 @@ struct TimelineDashboardView: View {
                     ContentUnavailableView {
                         Label("No saved moments yet", systemImage: "clock.badge.questionmark")
                     } description: {
-                        Text(canCaptureRestorableState
+                        Text(canCaptureFunctionalState
                              ? "Save a snapshot to create a restorable moment."
                              : "No restorable moments yet. Older diagnostic records are kept in Snapshots, but cannot be rewound.")
                     }

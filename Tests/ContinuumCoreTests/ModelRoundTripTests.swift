@@ -198,6 +198,7 @@ final class ModelRoundTripTests: XCTestCase {
             chunkHashes: ["abc123", "def456"],
             logicalBytes: 32_768,
             uniqueBytes: 16_384,
+            hotMemoryBytes: 65_536,
             isPinned: true,
             externalEffects: [effect]
         )

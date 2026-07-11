@@ -6,6 +6,7 @@ struct AppsCompatibilityView: View {
     let reports: [CompatibilityReport]
     let setupRecords: [AppSetupRecord]
     let runningProcesses: [ProcessDescriptor]
+    let experimentalHotEnabled: Bool
     let isBatchSetupInProgress: Bool
     let setupOperation: (AppIdentity) -> AppSetupOperation?
     let onCheckSetup: (AppIdentity) -> Void
@@ -67,6 +68,7 @@ struct AppsCompatibilityView: View {
                     AppSetupDetailView(
                         entry: selectedEntry,
                         isRunning: isRunning(selectedEntry.app),
+                        experimentalHotEnabled: experimentalHotEnabled,
                         operation: setupOperation(selectedEntry.app),
                         isBatchSetupInProgress: isBatchSetupInProgress,
                         onCheckSetup: { onCheckSetup(selectedEntry.app) },
@@ -125,9 +127,20 @@ struct AppsCompatibilityView: View {
                 )
                 RewindExplainerStep(
                     number: 3,
-                    title: "Rewind",
-                    detail: "Only certified apps ever get Play From Here."
+                    title: "Try",
+                    detail: experimentalHotEnabled
+                        ? "Running apps can attempt Experimental Hot."
+                        : "Rewind appears when a runtime is ready."
                 )
+            }
+
+            if experimentalHotEnabled {
+                Label(
+                    "Experimental Hot is active. It restores live memory and threads, then refuses the rewind if guarded process resources changed.",
+                    systemImage: "flask.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
 
             HStack(spacing: 8) {
@@ -231,6 +244,7 @@ struct AppsCompatibilityView: View {
 private struct AppSetupDetailView: View {
     let entry: AppSetupEntry
     let isRunning: Bool
+    let experimentalHotEnabled: Bool
     let operation: AppSetupOperation?
     let isBatchSetupInProgress: Bool
     let onCheckSetup: () -> Void
@@ -340,6 +354,12 @@ private struct AppSetupDetailView: View {
                 factRow("Selected app", entry.sourceURL.path)
                 factRow("Running", isRunning ? "Yes" : "No")
                 factRow("Original app", "Never changed")
+                factRow(
+                    "Experimental Hot",
+                    experimentalHotEnabled
+                        ? (isRunning ? "Available to try" : "Launch the app first")
+                        : "Runtime unavailable"
+                )
 
                 if let record = entry.record {
                     factRow("Last checked", record.updatedAt.formatted(date: .abbreviated, time: .shortened))

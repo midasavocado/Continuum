@@ -9,8 +9,8 @@ Continuum v0.3 is a native macOS per-app rewind research prototype. The current 
 | `ContinuumCore` | Sendable domain models, identifiers, errors, display naming, and protocols | AppKit, persistence, Mach calls, permission prompts, or presentation state |
 | `ContinuumStore` | Durable index, content-addressed chunks, APFS per-file COW roots, in-place file-byte restoration, integrity checks, and atomic snapshot/rewind transactions | File discovery/attribution, process inspection, UI, permission prompts, or claims that unvalidated bytes are restorable |
 | `ContinuumRuntime` | Mach task/tree identity, coherent descendant-group suspension, nested VM-map byte capture, ARM64 register cuts, safety snapshots, group rollback, batched page restore/readback, and fail-closed topology/resource validation | Descriptor/IPC/GPU reconstruction, product policy, user consent, arbitrary-app compatibility claims, or durable storage |
-| `ContinuumSystem` | Window-owner/app inventory, code-signing inspection, permission requests/status, generic managed-copy setup/recovery, compatibility probing, and global hotkeys | Snapshot indexing, branch policy, SwiftUI state, source-app mutation, or bypassing SIP/TCC |
-| `ContinuumApp` | SwiftUI/AppKit consumer shell, onboarding, Snapshot Library, timeline/branch presentation, explicit user actions, and the honest metadata-only checkpoint fallback | Raw store file mutation, Mach implementation details, or silently requesting broad permissions |
+| `ContinuumSystem` | Window-owner/app inventory, code-signing inspection, permission requests/status, generic setup/recovery, global hotkeys, and the Experimental Hot adapter over `ContinuumRuntime` | Snapshot indexing, branch policy, SwiftUI state, source-app mutation, or bypassing SIP/TCC |
+| `ContinuumApp` | SwiftUI/AppKit consumer shell, onboarding, Snapshot Library, timeline/branch presentation, explicit user actions, and evidence-based capability labels | Raw store file mutation, Mach implementation details, or silently requesting broad permissions |
 | `ContinuumHarness` | Reproducible command-line proofs for setup, VM-region inspection, the owned/external registered-arena experiments, and store transactions | Shipping UI behavior or compatibility certification |
 | `ContinuumExternalTarget` | Cooperative signed proof process with one page-aligned arena and a tiny validation protocol | General app behavior, production instrumentation, or a compatibility shortcut |
 
@@ -31,7 +31,7 @@ flowchart LR
     H --> T["ContinuumExternalTarget\ncooperative arena"]
 ```
 
-The UI talks to protocol-shaped coordinators and never infers restoration from a screenshot or successful metadata write. A snapshot's `RestoreAvailability` is the only user-facing restoration gate. `Unavailable` means inspectable but not playable.
+The UI talks to protocol-shaped coordinators and never infers restoration from a screenshot or successful metadata write. A snapshot's `RestoreAvailability` is the user-facing gate. `Experimental Hot` means memory and thread restoration into the original live tasks under strict resource guards; `Unavailable` means inspectable but not playable; `Instant` remains reserved for certified exact restoration.
 
 ## Snapshot transaction invariants
 
@@ -45,7 +45,7 @@ These invariants apply even while the runtime remains experimental:
 6. **Content is addressed by digest.** A committed chunk's bytes must match its recorded digest; duplicate content reuses one physical object.
 7. **References outlive branches.** Deleting a snapshot or branch may reclaim only chunks with no remaining snapshot reference.
 8. **Index publication comes last.** Chunk files are fully written and made durable before an index can reference them. Readers either observe the old complete state or the new complete state.
-9. **Availability is evidence-based.** Only a capture adapter that can validate restoration may publish `Instant` or `Replay required`. Metadata-only checkpoints remain `Unavailable`.
+9. **Availability is evidence-based.** The live process adapter may publish only `Experimental Hot`; `Instant` requires complete certified local-state coverage. Metadata-only or expired hot checkpoints remain `Unavailable`.
 10. **External effects remain external.** A local restore cannot unsend a message, reverse a purchase, or change a remote server. Crossing recorded effects produces a warning, never a success claim.
 11. **Storage pressure fails closed.** If permanent safety data cannot fit, rewind does not start. Pinned manual and pre-rewind snapshots are not silently evicted.
 12. **Unknown state is not fabricated.** Missing process, descriptor, graphics, helper, or IPC state makes the snapshot unavailable; visual continuity is never presented as functional restoration.
@@ -72,17 +72,18 @@ The store owns an index plus content-addressed chunk files. Index replacement us
 
 Snapshot material should be treated like an unlocked session of the captured application. It may include document text, credentials in memory, file paths, window titles, or personal screen content. The consumer UI must state the selected scope and destination before capture, keep data local by default, and make destructive deletion explicit.
 
-The future scheduler defaults to 100 ms active epochs, conditionally tightens to 50 ms for games only when performance gates pass, and backs off to one second while idle. Its default budgets are 2 GB for 90 seconds of hot history and 20 GB for a 30-minute rolling disk window. A first restorable baseline may cost hundreds of megabytes to multiple gigabytes; later points reference content-addressed deltas. Product surfaces must report logical/shared and physically unique bytes separately. None of these cadence or retention targets are active in the current metadata-only app capturer.
+The future scheduler defaults to 100 ms active epochs, conditionally tightens to 50 ms for games only when performance gates pass, and backs off to one second while idle. Its default budgets are 2 GB for 90 seconds of hot history and 20 GB for a 30-minute rolling disk window. The current Experimental Hot adapter retains full process images rather than page deltas, so those cadence targets are not active yet. Product surfaces report retained hot RAM separately from durable encrypted bytes.
 
 The application does not silently change SIP, edit the selected vendor source, or grant itself TCC permissions. Its opt-in setup coordinator clones a verified `Original.app` and a separate `Managed.app` into Application Support. On this development Mac, SIP is user-disabled for research against unmodified tasks; a consumer build still needs a supported authorization/instrumentation route and Apple-granted system-extension entitlements.
 
 ## Research boundary
 
-The runtime now has three proof levels:
+The runtime now has four proof levels:
 
 1. The self-process proof checkpoints memory allocated by the harness.
 2. The registered-arena external proof alternates two target-owned states with readback validation for at least 100 cycles.
 3. The process-group proof discovers and freezes a root plus descendant helper, walks each nested VM map, copies every readable+writable private/COW mapping without leaving aliases in the target, captures general/NEON registers, creates safety cuts for every member before the first write, restores helpers-first, and rolls touched members back in reverse order on failure. It inventories descriptors, Mach rights, threads, membership, and parent edges at each cut. The current two-process proof captures about 627 MB: a stabilized cut is roughly 200–250 ms after a slower first-cut retry, and hot group restore is roughly 250–400 ms.
+4. The shipping-adapter proof captures that target through `HotProcessCheckpointService`, mutates both root and helper, restores the app-facing snapshot, and validates both target-owned states. This proves the consumer backend reaches the real runtime; it does not prove arbitrary GUI resource reconstruction.
 
 The proof calls `thread_set_state`, but it requires the same tasks, parent topology, thread identities, captured VM topology, descriptor tables, and Mach namespaces. An added vnode descriptor is rejected before memory is written. A post-read VM rewalk prevents a cut from being published if faulting lazy pages changed its own layout. Fingerprinting is a safety gate, not kernel-resource reconstruction, so this still does not prove restoration of an arbitrary GUI process. A general native-app rewind engine must separately solve or reject:
 

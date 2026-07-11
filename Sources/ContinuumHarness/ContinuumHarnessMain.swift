@@ -15,7 +15,7 @@ struct ContinuumHarnessMain {
             case .transactionProof:
                 try await TransactionProof.run()
             case let .externalHotProof(target, cycles):
-                try ExternalHotProof.run(targetPath: target, cycles: cycles)
+                try await ExternalHotProof.run(targetPath: target, cycles: cycles)
             case let .setupApp(target, root, checkOnly):
                 try await ManagedAppSetupCommand.run(
                     targetPath: target,

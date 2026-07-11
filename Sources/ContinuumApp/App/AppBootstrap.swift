@@ -17,7 +17,7 @@ enum AppBootstrap {
             repository: repository,
             inventory: MacAppInventoryService(),
             permissionProvider: MacPermissionService(),
-            checkpointCapturer: LocalMetadataCheckpointService(),
+            checkpointCapturer: HotProcessCheckpointService(),
             appSetupCoordinator: MacAppSetupCoordinator(
                 rootDirectory: try? appSetupStoreURL()
             )

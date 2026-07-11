@@ -181,6 +181,14 @@ struct RewindOverlayView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .transition(.opacity.combined(with: .move(edge: .top)))
+                } else if snapshot.availability == .experimentalHot {
+                    Label {
+                        Text("Experimental Hot restores live memory and threads. Files, connections, windows, and GPU resources are not reconstructed yet.")
+                    } icon: {
+                        Image(systemName: "flask.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 } else if case let .failed(message) = state.phase {
                     Label(message, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
@@ -203,7 +211,7 @@ struct RewindOverlayView: View {
                     HStack(spacing: 8) {
                         Text("↩")
                             .font(.system(.body, design: .rounded, weight: .bold))
-                        Text(snapshot.availability == .unavailable ? "Unavailable" : "Play from Here")
+                        Text(commitTitle(for: snapshot))
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
@@ -221,6 +229,14 @@ struct RewindOverlayView: View {
             }
         }
         .frame(minHeight: 32)
+    }
+
+    private func commitTitle(for snapshot: SnapshotRecord) -> String {
+        switch snapshot.availability {
+        case .unavailable: "Unavailable"
+        case .experimentalHot: "Try from Here"
+        case .instant, .replayRequired: "Play from Here"
+        }
     }
 
     @ViewBuilder

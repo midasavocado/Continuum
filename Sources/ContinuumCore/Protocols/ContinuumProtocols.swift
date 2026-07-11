@@ -37,14 +37,21 @@ public protocol PermissionProviding: Sendable {
 }
 
 public protocol CheckpointCapturing: Sendable {
-    /// Whether this capturer can create a state that Continuum may truthfully restore.
-    /// Diagnostic-only capturers must return `false` so the consumer UI never
-    /// creates a pretend rewind point.
-    var supportsExactRestore: Bool { get }
+    /// Whether this capturer can create a state that changes the live target
+    /// when restored. Exact and explicitly experimental backends return true;
+    /// diagnostic-only capturers return false.
+    var supportsFunctionalRestore: Bool { get }
     func capture(app: AppIdentity, processIdentifiers: [Int32], kind: SnapshotKind, branchID: BranchID) async throws -> SnapshotCapture
     func restore(snapshot: SnapshotRecord, artifacts: [CapturedArtifact]) async -> RestoreResult
+    /// Hot snapshots may expire when the target exits or Continuum relaunches.
+    /// The UI asks the backend again whenever it reloads the durable index.
+    func currentRestoreAvailability(for snapshot: SnapshotRecord) async -> RestoreAvailability
 }
 
 public extension CheckpointCapturing {
-    var supportsExactRestore: Bool { true }
+    var supportsFunctionalRestore: Bool { true }
+
+    func currentRestoreAvailability(for snapshot: SnapshotRecord) async -> RestoreAvailability {
+        snapshot.availability
+    }
 }

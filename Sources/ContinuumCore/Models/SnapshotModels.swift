@@ -18,12 +18,14 @@ public enum SnapshotKind: String, Codable, CaseIterable, Sendable {
 
 public enum RestoreAvailability: String, Codable, CaseIterable, Sendable {
     case instant
+    case experimentalHot
     case replayRequired
     case unavailable
 
     public var displayName: String {
         switch self {
         case .instant: "Instant"
+        case .experimentalHot: "Experimental Hot"
         case .replayRequired: "Replay required"
         case .unavailable: "Unavailable"
         }
@@ -127,6 +129,9 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
     public var chunkHashes: [String]
     public var logicalBytes: Int64
     public var uniqueBytes: Int64
+    /// Live RAM retained by an in-process hot backend. Nil/zero means the
+    /// snapshot has no separately retained hot image.
+    public var hotMemoryBytes: Int64?
     public var isPinned: Bool
     public var externalEffects: [ExternalEffect]
     /// Nil decodes old store records as unavailable without a schema-breaking
@@ -147,6 +152,7 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         chunkHashes: [String] = [],
         logicalBytes: Int64 = 0,
         uniqueBytes: Int64 = 0,
+        hotMemoryBytes: Int64? = nil,
         isPinned: Bool = true,
         externalEffects: [ExternalEffect] = [],
         localFileCoverage: LocalFileCoverage? = .unavailable,
@@ -164,6 +170,7 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         self.chunkHashes = chunkHashes
         self.logicalBytes = logicalBytes
         self.uniqueBytes = uniqueBytes
+        self.hotMemoryBytes = hotMemoryBytes
         self.isPinned = isPinned
         self.externalEffects = externalEffects
         self.localFileCoverage = localFileCoverage

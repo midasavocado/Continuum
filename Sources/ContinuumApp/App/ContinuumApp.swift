@@ -32,7 +32,7 @@ struct ContinuumApp: App {
         .defaultSize(width: 1_160, height: 760)
         .commands {
             CommandMenu("Continuum") {
-                if model.canCaptureRestorableState {
+                if model.canCaptureFunctionalState {
                     Button("Save Snapshot (⌃⌥⌘S)") {
                         Task { await model.saveManualSnapshot() }
                     }

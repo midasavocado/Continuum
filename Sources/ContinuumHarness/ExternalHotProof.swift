@@ -1,4 +1,6 @@
+import ContinuumCore
 import ContinuumRuntime
+import ContinuumSystem
 import Darwin
 import Dispatch
 import Foundation
@@ -8,7 +10,7 @@ enum ExternalHotProof {
     private static let fullProcessCycleCount = 1
     private static let fullProcessCaptureBudget: UInt64 = 1_024 * 1_024 * 1_024
 
-    static func run(targetPath: String, cycles: Int) throws {
+    static func run(targetPath: String, cycles: Int) async throws {
         guard cycles >= minimumCycleCount else {
             throw HarnessFailure.usage(
                 "external-hot-proof requires at least \(minimumCycleCount) cycles; received \(cycles)."
@@ -277,6 +279,17 @@ enum ExternalHotProof {
             try validate(target: target, expected: "B", digest: safetyB.digest, cycle: cycle)
         }
 
+        try await verifyShippingHotBackend(
+            target: target,
+            targetPID: targetPID,
+            helperPID: helperPID,
+            rootStateA: stateA,
+            helperStateA: helperStateA,
+            rootSession: session,
+            helperSession: helperSession,
+            expectedStateB: safetyB.digest
+        )
+
         let opened = try target.send(command: "open-resource")
         try require(
             opened.event == "resource-opened",
@@ -314,11 +327,73 @@ enum ExternalHotProof {
         )
         print("  resource A->B gate:  unchanged")
         print("  descriptor mutation: rejected before memory write")
+        print("  app backend adapter: captured + restored Experimental Hot state")
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
         )
         print("  safety state B was captured before the first rewind and restored last")
+    }
+
+    private static func verifyShippingHotBackend(
+        target: ExternalTargetProcess,
+        targetPID: Int32,
+        helperPID: Int32,
+        rootStateA: RemoteCapture,
+        helperStateA: RemoteCapture,
+        rootSession: OpaquePointer,
+        helperSession: OpaquePointer,
+        expectedStateB: String
+    ) async throws {
+        let service = HotProcessCheckpointService(
+            maximumCapturedBytes: fullProcessCaptureBudget,
+            maximumRetainedSnapshots: 2
+        )
+        let app = AppIdentity(
+            bundleIdentifier: nil,
+            displayName: "Continuum External Target",
+            bundleURL: nil,
+            executableURL: URL(fileURLWithPath: target.executablePath),
+            version: "proof",
+            signingIdentifier: nil,
+            teamIdentifier: nil,
+            isApplePlatformBinary: false
+        )
+        let capture = try await service.capture(
+            app: app,
+            processIdentifiers: [targetPID, helperPID],
+            kind: .manual,
+            branchID: UUID()
+        )
+        try require(
+            capture.snapshot.availability == .experimentalHot,
+            "shipping backend did not publish Experimental Hot availability"
+        )
+        let liveAvailability = await service.currentRestoreAvailability(
+            for: capture.snapshot
+        )
+        try require(
+            liveAvailability == .experimentalHot,
+            "shipping backend expired its live snapshot immediately"
+        )
+
+        try restore(rootStateA, into: rootSession, label: "adapter staging root A", cycle: 0)
+        try restore(helperStateA, into: helperSession, label: "adapter staging helper A", cycle: 0)
+
+        let result = await service.restore(
+            snapshot: capture.snapshot,
+            artifacts: capture.artifacts
+        )
+        try require(
+            result == .experimentalHot,
+            "shipping backend restore returned \(String(describing: result))"
+        )
+        try validateGroup(
+            target: target,
+            expected: "B",
+            digest: expectedStateB,
+            cycle: 0
+        )
     }
 
     private static func verifyDescriptorMutationIsRejected(

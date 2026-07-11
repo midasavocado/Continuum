@@ -7,8 +7,13 @@ import ContinuumCore
 struct LocalMetadataCheckpointService: CheckpointCapturing {
     private let exactBackend: (any CheckpointCapturing)?
 
-    var supportsExactRestore: Bool {
-        exactBackend?.supportsExactRestore ?? false
+    var supportsFunctionalRestore: Bool {
+        exactBackend?.supportsFunctionalRestore ?? false
+    }
+
+    func currentRestoreAvailability(for snapshot: SnapshotRecord) async -> RestoreAvailability {
+        guard let exactBackend else { return .unavailable }
+        return await exactBackend.currentRestoreAvailability(for: snapshot)
     }
 
     init(exactBackend: (any CheckpointCapturing)? = nil) {

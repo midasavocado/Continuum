@@ -25,6 +25,7 @@ extension RestoreAvailability {
     var continuumSymbol: String {
         switch self {
         case .instant: "bolt.fill"
+        case .experimentalHot: "flask.fill"
         case .replayRequired: "play.circle.fill"
         case .unavailable: "nosign"
         }
@@ -33,6 +34,7 @@ extension RestoreAvailability {
     var continuumTint: Color {
         switch self {
         case .instant: .green
+        case .experimentalHot: .orange
         case .replayRequired: .orange
         case .unavailable: .secondary
         }

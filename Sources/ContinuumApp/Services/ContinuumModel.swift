@@ -103,8 +103,8 @@ final class ContinuumModel {
             && activeProvisional == nil
     }
 
-    var canCaptureRestorableState: Bool {
-        checkpointCapturer.supportsExactRestore
+    var canCaptureFunctionalState: Bool {
+        checkpointCapturer.supportsFunctionalRestore
     }
 
     var appSetupIssueCount: Int {
@@ -165,7 +165,7 @@ final class ContinuumModel {
 
     func saveManualSnapshot() async {
         await performAction {
-            guard self.checkpointCapturer.supportsExactRestore else {
+            guard self.checkpointCapturer.supportsFunctionalRestore else {
                 throw ContinuumError.runtimeUnsupported(
                     "No app has a certified rewind engine in this build, so Continuum will not create a snapshot that only looks usable."
                 )
@@ -585,6 +585,8 @@ final class ContinuumModel {
         switch restoreResult {
         case .exactLocal:
             warningEffects = target.externalEffects
+        case .experimentalHot:
+            warningEffects = target.externalEffects
         case let .exactLocalWithOnlineWarning(effects):
             warningEffects = effects.isEmpty ? target.externalEffects : effects
         case let .failed(detail):
@@ -637,6 +639,8 @@ final class ContinuumModel {
         switch result {
         case .exactLocal:
             onlineWarning = nil
+        case .experimentalHot:
+            onlineWarning = nil
         case let .exactLocalWithOnlineWarning(effects):
             onlineWarning = effects.isEmpty ? nil : effects
         case let .failed(detail):
@@ -662,7 +666,7 @@ final class ContinuumModel {
                   let safetySnapshot = index.snapshots.first(where: {
                       $0.id == provisional.safetySnapshotID
                   }) else {
-                apply(index: index)
+                await apply(index: index)
                 return
             }
 
@@ -673,7 +677,7 @@ final class ContinuumModel {
             )
 
             switch result {
-            case .exactLocal, .exactLocalWithOnlineWarning:
+            case .exactLocal, .experimentalHot, .exactLocalWithOnlineWarning:
                 try await repository.cancelRewind(provisional.id)
                 activeProvisional = nil
                 pendingTargetSnapshotID = nil
@@ -768,7 +772,7 @@ final class ContinuumModel {
             discoveredApplications + explicitApplications + loadedSetups.map(\.app)
         )
 
-        apply(index: loadedIndex)
+        await apply(index: loadedIndex)
         runningProcesses = loadedProcesses.sorted(by: Self.processSort)
         installedApps = loadedApplications.sorted(by: Self.appSort)
         setupRecords = loadedSetups.sorted(by: Self.setupRecordSort)
@@ -850,7 +854,7 @@ final class ContinuumModel {
 
     private func refreshIndex() async throws {
         let index = try await repository.loadIndex()
-        apply(index: index)
+        await apply(index: index)
     }
 
     private func ensureIndexIsLoaded() async throws {
@@ -859,8 +863,17 @@ final class ContinuumModel {
         }
     }
 
-    private func apply(index: StoreIndex) {
-        snapshots = index.snapshots.sorted {
+    private func apply(index: StoreIndex) async {
+        var liveSnapshots: [SnapshotRecord] = []
+        liveSnapshots.reserveCapacity(index.snapshots.count)
+        for var snapshot in index.snapshots {
+            snapshot.availability = await checkpointCapturer.currentRestoreAvailability(
+                for: snapshot
+            )
+            liveSnapshots.append(snapshot)
+        }
+
+        snapshots = liveSnapshots.sorted {
             if $0.createdAt == $1.createdAt { return $0.name < $1.name }
             return $0.createdAt > $1.createdAt
         }
@@ -940,11 +953,14 @@ final class ContinuumModel {
                 inTreeRootedAt: root.processIdentifier
             )
             if !identifiers.isEmpty {
-                return identifiers
+                return [root.processIdentifier]
+                    + identifiers.filter { $0 != root.processIdentifier }.sorted()
             }
         }
 
-        return ProcessGroupResolver.identifiers(rootedAt: root, among: processes)
+        let identifiers = ProcessGroupResolver.identifiers(rootedAt: root, among: processes)
+        return [root.processIdentifier]
+            + identifiers.filter { $0 != root.processIdentifier }.sorted()
     }
 
     private func activeBranchID() throws -> BranchID {

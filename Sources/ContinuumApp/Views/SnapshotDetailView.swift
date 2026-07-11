@@ -120,6 +120,9 @@ struct SnapshotDetailView: View {
                 detailRow("Processes", value: snapshot.checkpoint.processIdentifiers.count.formatted())
                 detailRow("Scope", value: "This app + helpers")
                 detailRow("Threads", value: snapshot.checkpoint.threadCount.formatted())
+                if let hotMemoryBytes = snapshot.hotMemoryBytes, hotMemoryBytes > 0 {
+                    detailRow("Hot memory", value: continuumByteCount(hotMemoryBytes))
+                }
                 detailRow("Stored", value: continuumByteCount(snapshot.uniqueBytes))
                 detailRow("Logical state", value: continuumByteCount(snapshot.logicalBytes))
                 detailRow("Validation", value: validationTitle)
@@ -144,6 +147,12 @@ struct SnapshotDetailView: View {
                     )
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                } else if snapshot.availability == .experimentalHot {
+                    Text(
+                        "Experimental Hot restores the still-running process tree only. Local files stay current, and Continuum refuses the restore if guarded kernel resources changed."
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.orange)
                 } else if snapshot.effectiveLocalFileCoverage == .exact {
                     Text(
                         "App Only is disabled because old memory with newer files could corrupt this app. The exact restore rewinds captured local files with it."
@@ -206,8 +215,8 @@ struct SnapshotDetailView: View {
             if snapshot.availability != .unavailable {
                 VStack(alignment: .trailing, spacing: 3) {
                     Button(
-                        snapshot.availability == .instant ? "Open App From Here" : "Open by Replay",
-                        systemImage: snapshot.availability == .instant ? "bolt.fill" : "play.fill",
+                        restoreActionTitle,
+                        systemImage: snapshot.availability == .instant ? "bolt.fill" : (snapshot.availability == .experimentalHot ? "flask.fill" : "play.fill"),
                         action: onRestore
                     )
                     .buttonStyle(.borderedProminent)
@@ -227,6 +236,15 @@ struct SnapshotDetailView: View {
         case .validating: "Validating"
         case .valid: "Validated"
         case .invalid: "Invalid"
+        }
+    }
+
+    private var restoreActionTitle: String {
+        switch snapshot.availability {
+        case .instant: "Open App From Here"
+        case .experimentalHot: "Try Hot Rewind"
+        case .replayRequired: "Open by Replay"
+        case .unavailable: "Unavailable"
         }
     }
 
