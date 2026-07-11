@@ -37,6 +37,14 @@ public protocol PermissionProviding: Sendable {
 }
 
 public protocol CheckpointCapturing: Sendable {
+    /// Whether this capturer can create a state that Continuum may truthfully restore.
+    /// Diagnostic-only capturers must return `false` so the consumer UI never
+    /// creates a pretend rewind point.
+    var supportsExactRestore: Bool { get }
     func capture(app: AppIdentity, processIdentifiers: [Int32], kind: SnapshotKind, branchID: BranchID) async throws -> SnapshotCapture
     func restore(snapshot: SnapshotRecord, artifacts: [CapturedArtifact]) async -> RestoreResult
+}
+
+public extension CheckpointCapturing {
+    var supportsExactRestore: Bool { true }
 }

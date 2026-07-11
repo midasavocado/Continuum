@@ -22,11 +22,18 @@ final class RewindOverlayController {
     func present(model: ContinuumModel) {
         self.model = model
 
+        let restorableSnapshots = model.snapshots.filter { $0.availability != .unavailable }
+        guard !restorableSnapshots.isEmpty else {
+            model.presentedError = "There are no restorable moments yet. Continuum will not open a rewind picker for diagnostic records."
+            NSSound.beep()
+            return
+        }
+
         if transactionTask == nil, !rewindTransactionStarted {
             cancellationRequested = false
             rewindTransactionStarted = false
             selection.prepare(
-                snapshots: model.snapshots,
+                snapshots: restorableSnapshots,
                 stepMilliseconds: preferences.timelineArrowStep.milliseconds
             )
         }
@@ -41,7 +48,7 @@ final class RewindOverlayController {
             guard let self, let model else { return }
             await model.refresh()
             guard !Task.isCancelled, self.transactionTask == nil else { return }
-            self.selection.replaceSnapshots(model.snapshots)
+            self.selection.replaceSnapshots(model.snapshots.filter { $0.availability != .unavailable })
         }
     }
 

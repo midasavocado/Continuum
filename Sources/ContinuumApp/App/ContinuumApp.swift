@@ -32,8 +32,10 @@ struct ContinuumApp: App {
         .defaultSize(width: 1_160, height: 760)
         .commands {
             CommandMenu("Continuum") {
-                Button("Save Diagnostic Snapshot (⌃⌥⌘S)") {
-                    Task { await model.saveManualSnapshot() }
+                if model.canCaptureRestorableState {
+                    Button("Save Snapshot (⌃⌥⌘S)") {
+                        Task { await model.saveManualSnapshot() }
+                    }
                 }
 
                 Button("Open Rewind Timeline…") {

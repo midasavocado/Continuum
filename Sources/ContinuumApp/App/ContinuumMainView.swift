@@ -24,12 +24,14 @@ struct ContinuumMainView: View {
                 }
                 .disabled(model.isLoading || model.isPerformingAction)
 
-                Button {
-                    Task { await model.saveManualSnapshot() }
-                } label: {
-                    Label("Save Snapshot", systemImage: "bookmark.fill")
+                if model.canCaptureRestorableState {
+                    Button {
+                        Task { await model.saveManualSnapshot() }
+                    } label: {
+                        Label("Save Snapshot", systemImage: "bookmark.fill")
+                    }
+                    .disabled(model.isPerformingAction)
                 }
-                .disabled(model.isPerformingAction)
             }
         }
     }
@@ -44,6 +46,7 @@ struct ContinuumMainView: View {
                 rewindPhase: model.rewindPhase,
                 onlineWarning: model.onlineWarning,
                 isPerformingAction: model.isPerformingAction,
+                canCaptureRestorableState: model.canCaptureRestorableState,
                 onSaveSnapshot: { Task { await model.saveManualSnapshot() } },
                 onBeginRewind: { snapshot in
                     model.selectedSnapshotID = snapshot.id

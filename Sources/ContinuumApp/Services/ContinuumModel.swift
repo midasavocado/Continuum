@@ -103,6 +103,10 @@ final class ContinuumModel {
             && activeProvisional == nil
     }
 
+    var canCaptureRestorableState: Bool {
+        checkpointCapturer.supportsExactRestore
+    }
+
     var appSetupIssueCount: Int {
         let recordsBySource = Dictionary(
             setupRecords.map { ($0.sourceURL.standardizedFileURL.path, $0) },
@@ -161,6 +165,11 @@ final class ContinuumModel {
 
     func saveManualSnapshot() async {
         await performAction {
+            guard self.checkpointCapturer.supportsExactRestore else {
+                throw ContinuumError.runtimeUnsupported(
+                    "No app has a certified rewind engine in this build, so Continuum will not create a snapshot that only looks usable."
+                )
+            }
             try await self.ensureIndexIsLoaded()
 
             guard let frontmost = await self.inventory.frontmostApplication() else {

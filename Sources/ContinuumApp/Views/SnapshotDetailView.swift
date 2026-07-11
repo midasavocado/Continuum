@@ -36,15 +36,14 @@ struct SnapshotDetailView: View {
                 titleBlock
 
                 if snapshot.availability == .unavailable {
-                    unavailableCard
+                    archivedDiagnosticCard
+                } else {
+                    if !snapshot.externalEffects.isEmpty {
+                        OnlineEffectsWarning(effects: snapshot.externalEffects)
+                    }
+                    detailsCard
+                    localStateCard
                 }
-
-                if !snapshot.externalEffects.isEmpty {
-                    OnlineEffectsWarning(effects: snapshot.externalEffects)
-                }
-
-                detailsCard
-                localStateCard
                 notesCard
                 actionBar
             }
@@ -82,21 +81,25 @@ struct SnapshotDetailView: View {
             }
 
             Spacer()
-            SnapshotAvailabilityBadge(availability: snapshot.availability)
+            if snapshot.availability == .unavailable {
+                StatusBadge(title: "Archived record", systemImage: "archivebox", tint: .secondary)
+            } else {
+                SnapshotAvailabilityBadge(availability: snapshot.availability)
+            }
         }
     }
 
-    private var unavailableCard: some View {
+    private var archivedDiagnosticCard: some View {
         SurfaceCard {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "nosign")
+                Image(systemName: "archivebox")
                     .font(.title2)
                     .foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("This state cannot be restored")
+                    Text("Older diagnostic record")
                         .font(.headline)
                     Text(
-                        "The metadata remains available for context, but Continuum will not present a screenshot or visual replay as if the app itself had returned."
+                        "This was saved before a restore engine was available. It is kept only for its name and note—Continuum will never offer it as a rewind point."
                     )
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -219,9 +222,6 @@ struct SnapshotDetailView: View {
     }
 
     private var validationTitle: String {
-        if snapshot.availability == .unavailable {
-            return "Metadata only"
-        }
         return switch snapshot.checkpoint.validation {
         case .provisional: "Provisional"
         case .validating: "Validating"

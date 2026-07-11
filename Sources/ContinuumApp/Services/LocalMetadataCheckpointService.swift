@@ -7,6 +7,10 @@ import ContinuumCore
 struct LocalMetadataCheckpointService: CheckpointCapturing {
     private let exactBackend: (any CheckpointCapturing)?
 
+    var supportsExactRestore: Bool {
+        exactBackend?.supportsExactRestore ?? false
+    }
+
     init(exactBackend: (any CheckpointCapturing)? = nil) {
         self.exactBackend = exactBackend
     }

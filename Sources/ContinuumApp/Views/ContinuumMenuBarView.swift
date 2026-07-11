@@ -29,17 +29,21 @@ struct ContinuumMenuBarView: View {
 
         if let frontmostAppName {
             Text("Frontmost: \(shortTitle(frontmostAppName))")
-            Text("Metadata snapshots only in this build")
+            Text(model.canCaptureRestorableState ? "Ready to save a restorable state" : "No certified rewind engine yet")
         } else {
             Text("Waiting for a frontmost app")
         }
 
-        Button("Save Diagnostic Snapshot") {
-            Task { await model.saveManualSnapshot() }
+        if model.canCaptureRestorableState {
+            Button("Save Snapshot") {
+                Task { await model.saveManualSnapshot() }
+            }
+            .disabled(frontmostAppName == nil || model.isPerformingAction)
         }
-        .disabled(frontmostAppName == nil || model.isPerformingAction)
 
-        Text("Use the Rewind shortcut to open the timeline")
+        Text(model.canCaptureRestorableState
+             ? "Use the Rewind shortcut to open the timeline"
+             : "Rewind opens when an app engine is ready")
 
         if model.canUndoRewind {
             Button("Undo Rewind") {

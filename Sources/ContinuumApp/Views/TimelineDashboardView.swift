@@ -7,6 +7,7 @@ struct TimelineDashboardView: View {
     let rewindPhase: RewindPhase
     let onlineWarning: [ExternalEffect]?
     let isPerformingAction: Bool
+    let canCaptureRestorableState: Bool
     let onSaveSnapshot: () -> Void
     let onBeginRewind: (SnapshotRecord) -> Void
     let onCommitRewind: (SnapshotRecord) -> Void
@@ -16,7 +17,9 @@ struct TimelineDashboardView: View {
     @State private var scrubPosition = 0.0
 
     private var orderedSnapshots: [SnapshotRecord] {
-        snapshots.sorted { $0.createdAt < $1.createdAt }
+        snapshots
+            .filter { $0.availability != .unavailable }
+            .sorted { $0.createdAt < $1.createdAt }
     }
 
     private var selectedSnapshot: SnapshotRecord? {
@@ -63,13 +66,15 @@ struct TimelineDashboardView: View {
 
             Spacer()
 
-            Button(action: onSaveSnapshot) {
-                Label("Save Diagnostic Snapshot", systemImage: "bookmark.fill")
+            if canCaptureRestorableState {
+                Button(action: onSaveSnapshot) {
+                    Label("Save Snapshot", systemImage: "bookmark.fill")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(frontmostApp == nil || isPerformingAction)
+                .help("Save the frontmost app (⌃⌥⌘S)")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
-            .disabled(frontmostApp == nil || isPerformingAction)
-            .help("Save the frontmost app (⌃⌥⌘S)")
         }
     }
 
@@ -86,11 +91,13 @@ struct TimelineDashboardView: View {
                 .frame(width: 46, height: 46)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(frontmostApp == nil ? "Waiting for an app" : "Inspecting \(frontmostApp?.displayName ?? "frontmost app")")
+                    Text(canCaptureRestorableState
+                         ? (frontmostApp == nil ? "Waiting for an app" : "Ready for \(frontmostApp?.displayName ?? "the frontmost app")")
+                         : "Rewind engine not available")
                         .font(.headline)
-                    Text(frontmostApp == nil
-                         ? "Open an app to record an encrypted diagnostic snapshot."
-                         : "Automatic functional rewind is not active yet. Save Snapshot records process diagnostics only.")
+                    Text(canCaptureRestorableState
+                         ? "Continuum saves only moments it can actually restore."
+                         : "This build cannot create a restorable state yet, so saving and rewinding are unavailable instead of pretending.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -98,9 +105,9 @@ struct TimelineDashboardView: View {
                 Spacer()
 
                 StatusBadge(
-                    title: frontmostApp == nil ? "Idle" : "Metadata only",
-                    systemImage: frontmostApp == nil ? "pause.circle.fill" : "exclamationmark.circle.fill",
-                    tint: frontmostApp == nil ? Color.secondary : Color.orange
+                    title: canCaptureRestorableState ? (frontmostApp == nil ? "Idle" : "Ready") : "Not ready",
+                    systemImage: canCaptureRestorableState ? (frontmostApp == nil ? "pause.circle.fill" : "checkmark.circle.fill") : "lock.circle.fill",
+                    tint: canCaptureRestorableState ? (frontmostApp == nil ? Color.secondary : Color.green) : Color.secondary
                 )
             }
         }
@@ -125,7 +132,9 @@ struct TimelineDashboardView: View {
                     ContentUnavailableView {
                         Label("No saved moments yet", systemImage: "clock.badge.questionmark")
                     } description: {
-                        Text("Save a diagnostic snapshot to inspect what Continuum can currently record.")
+                        Text(canCaptureRestorableState
+                             ? "Save a snapshot to create a restorable moment."
+                             : "No restorable moments yet. Older diagnostic records are kept in Snapshots, but cannot be rewound.")
                     }
                     .frame(maxWidth: .infinity, minHeight: 180)
                 } else {
