@@ -9,7 +9,7 @@ struct ContinuumMainView: View {
             ContinuumSidebarView(
                 selection: $model.selectedSection,
                 snapshotCount: model.snapshots.count,
-                appIssueCount: model.appSetupIssueCount
+                appTargetCount: model.setupRecords.count
             )
             .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 270)
         } detail: {

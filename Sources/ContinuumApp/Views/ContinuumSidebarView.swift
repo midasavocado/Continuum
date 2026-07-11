@@ -4,7 +4,7 @@ import ContinuumCore
 struct ContinuumSidebarView: View {
     @Binding var selection: ContinuumSection
     let snapshotCount: Int
-    let appIssueCount: Int
+    let appTargetCount: Int
 
     var body: some View {
         List(selection: $selection) {
@@ -36,7 +36,7 @@ struct ContinuumSidebarView: View {
     private func badgeCount(for section: ContinuumSection) -> Int? {
         switch section {
         case .snapshots: snapshotCount
-        case .apps: appIssueCount
+        case .apps: appTargetCount
         default: nil
         }
     }

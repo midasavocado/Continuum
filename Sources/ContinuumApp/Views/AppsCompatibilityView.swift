@@ -17,7 +17,7 @@ struct AppsCompatibilityView: View {
 
     @State private var searchText = ""
     @State private var selectedEntryID: String?
-    @State private var isConfirmingBatchSetup = false
+    @State private var showsEveryApp = false
 
     private var entries: [AppSetupEntry] {
         AppSetupEntry.merging(reports: reports, setupRecords: setupRecords)
@@ -25,6 +25,11 @@ struct AppsCompatibilityView: View {
 
     private var filteredEntries: [AppSetupEntry] {
         entries
+            .filter { entry in
+                showsEveryApp
+                    || entry.record != nil
+                    || isRunning(entry.app)
+            }
             .filter {
                 searchText.isEmpty
                     || $0.app.displayName.localizedStandardContains(searchText)
@@ -51,7 +56,7 @@ struct AppsCompatibilityView: View {
     var body: some View {
         VStack(spacing: 0) {
             summary
-                .padding(20)
+                .padding(24)
             Divider()
 
             HSplitView {
@@ -78,98 +83,65 @@ struct AppsCompatibilityView: View {
                     .frame(minWidth: 430, maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView {
-                        Label("Choose an app", systemImage: "app.badge.checkmark")
+                        Label("Choose an app to check", systemImage: "arrow.counterclockwise.circle")
                     } description: {
-                        Text("Check an app, prepare a reversible managed copy, and see any macOS protection that prevents setup.")
+                        Text("Continuum never installs inside the app you select. It first checks whether the running app can safely participate in a future rewind.")
                     }
                     .frame(minWidth: 430, maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
         .navigationTitle("Apps")
-        .searchable(text: $searchText, prompt: "Search apps and executables")
+        .searchable(text: $searchText, prompt: "Search apps you want to rewind")
         .onAppear(perform: ensureSelection)
         .onChange(of: filteredEntries.map(\.id)) { _, _ in ensureSelection() }
-        .confirmationDialog(
-            "Prepare every eligible app bundle?",
-            isPresented: $isConfirmingBatchSetup,
-            titleVisibility: .visible
-        ) {
-            Button("Set Up Eligible Apps", action: onSetupEligibleApps)
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Continuum will inspect all unreviewed targets and create verified Original.app and Managed.app copies for each eligible bundle. This can use substantial disk space. Selected source apps remain untouched.")
-        }
     }
 
     private var summary: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Choose what you want to rewind")
+                        .font(.title2.weight(.semibold))
+                    Text("Continuum checks the app you choose. It does not install anything inside that app.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Choose App…", action: chooseTarget)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isBatchSetupInProgress)
+            }
+
             HStack(spacing: 12) {
-                MetricTile(
-                    title: "Managed Copies",
-                    value: entries.filter { $0.status == .prepared }.count.formatted(),
-                    detail: "Prepared, not rewind-certified",
-                    systemImage: "checkmark.seal.fill",
-                    tint: .green
+                RewindExplainerStep(
+                    number: 1,
+                    title: "Choose",
+                    detail: "Select a running app or an app on disk."
                 )
-                MetricTile(
-                    title: "Needs Attention",
-                    value: entries.filter { $0.status == .needsAttention }.count.formatted(),
-                    detail: "Check or refresh setup",
-                    systemImage: "wrench.adjustable.fill",
-                    tint: .orange
+                RewindExplainerStep(
+                    number: 2,
+                    title: "Check",
+                    detail: "Continuum measures what it can safely capture."
                 )
-                MetricTile(
-                    title: "Protected",
-                    value: entries.filter { $0.status == .protected }.count.formatted(),
-                    detail: "macOS or app identity blocks setup",
-                    systemImage: "lock.shield.fill",
-                    tint: .secondary
+                RewindExplainerStep(
+                    number: 3,
+                    title: "Rewind",
+                    detail: "Only certified apps ever get Play From Here."
                 )
             }
 
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Setup only creates a reversible managed copy.")
-                        .font(.subheadline.weight(.medium))
-                    Text("It never edits the app you selected, and prepared does not mean rewind-certified.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    chooseTarget()
-                } label: {
-                    Label("Add Target…", systemImage: "plus")
-                }
-                .disabled(isBatchSetupInProgress)
-
-                Button {
-                    isConfirmingBatchSetup = true
-                } label: {
-                    if isBatchSetupInProgress {
-                        Label {
-                            Text("Setting Up…")
-                        } icon: {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                    } else {
-                        Label(
-                            "Set Up Eligible Apps",
-                            systemImage: "square.stack.3d.up.badge.automatic"
-                        )
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(isBatchSetupInProgress || batchCandidateCount == 0)
-                .help(
-                    batchCandidateCount == 0
-                        ? "No unchecked or eligible apps are waiting for setup."
-                        : "Checks unreviewed targets and prepares only the app bundles that prove eligible, one at a time."
+            HStack(spacing: 8) {
+                Label(
+                    "Advanced setup is optional and creates a separate Continuum-owned test copy. Your original app is never edited.",
+                    systemImage: "shield.lefthalf.filled"
                 )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Spacer()
+                Button(showsEveryApp ? "Show My Targets" : "Show All Apps") {
+                    showsEveryApp.toggle()
+                }
+                .buttonStyle(.borderless)
             }
         }
     }
@@ -179,11 +151,11 @@ struct AppsCompatibilityView: View {
         if filteredEntries.isEmpty {
             if searchText.isEmpty {
                 ContentUnavailableView {
-                    Label("No apps found", systemImage: "app.dashed")
+                    Label("No targets yet", systemImage: "app.dashed")
                 } description: {
-                    Text("Add any .app bundle or runnable executable from disk. Standalone executables are inspected and may report that the managed-copy route needs an app bundle.")
+                    Text("Choose an app you actually want to rewind. System helpers stay out of the way unless you choose Show All Apps.")
                 } actions: {
-                    Button("Add Target…", action: chooseTarget)
+                    Button("Choose App…", action: chooseTarget)
                 }
             } else {
                 ContentUnavailableView.search(text: searchText)
@@ -218,7 +190,7 @@ struct AppsCompatibilityView: View {
                     .tag(entry.id)
                 }
             }
-            .listStyle(.inset)
+            .listStyle(.inset(alternatesRowBackgrounds: true))
         }
     }
 
@@ -241,9 +213,9 @@ struct AppsCompatibilityView: View {
 
     private func chooseTarget() {
         let panel = NSOpenPanel()
-        panel.title = "Add a Continuum Target"
-        panel.message = "Choose any macOS .app bundle or runnable executable. Continuum checks it first; only eligible app bundles can use the current managed-copy route."
-        panel.prompt = "Check Setup"
+        panel.title = "Choose an App to Check"
+        panel.message = "Choose a macOS app or runnable executable. Continuum will inspect it first and will never modify the app you select."
+        panel.prompt = "Choose App"
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.treatsFilePackagesAsDirectories = false
@@ -326,6 +298,16 @@ private struct AppSetupDetailView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
+                    if entry.record?.state == .prepared {
+                        Label(
+                            "This is a separate test copy in Continuum’s own storage—not an installation inside \(entry.app.displayName).",
+                            systemImage: "checkmark.shield.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 2)
+                    }
+
                     if case let .blocked(blockers) = entry.record?.state {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(Array(blockers.enumerated()), id: \.offset) { _, blocker in
@@ -353,16 +335,14 @@ private struct AppSetupDetailView: View {
     private var setupFacts: some View {
         SurfaceCard {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Setup details")
+                Text("What Continuum knows")
                     .font(.headline)
-                factRow("Source", entry.sourceURL.path)
+                factRow("Selected app", entry.sourceURL.path)
                 factRow("Running", isRunning ? "Yes" : "No")
-                factRow("Method", "Reversible managed copy")
+                factRow("Original app", "Never changed")
 
                 if let record = entry.record {
                     factRow("Last checked", record.updatedAt.formatted(date: .abbreviated, time: .shortened))
-                    factRow("Original backup", record.originalCloneURL?.path ?? "Not created")
-                    factRow("Managed copy", record.managedBundleURL?.path ?? "Not created")
                     factRow(
                         "Source unchanged",
                         record.validation?.sourceUnchanged == true ? "Verified" : "Not yet verified"
@@ -377,11 +357,22 @@ private struct AppSetupDetailView: View {
                         "Rewind certification",
                         record.validation?.restoreCertificationPassed == true
                             ? "Passed"
-                            : "Not passed — rewind remains disabled"
+                            : "Not certified yet — rewind remains disabled"
                     )
+                    DisclosureGroup("Advanced copy details") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            factRow("Original backup", record.originalCloneURL?.path ?? "Not created")
+                            factRow("Test copy", record.managedBundleURL?.path ?? "Not created")
+                            Text("These are Continuum-owned copies outside the selected app. Remove Setup deletes only these copies.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.top, 6)
+                    }
+                    .padding(.top, 2)
                 } else {
                     factRow("Last checked", "Never")
-                    factRow("Rewind certification", "Not passed — rewind remains disabled")
+                    factRow("Rewind certification", "Not certified yet — rewind remains disabled")
                 }
             }
         }
@@ -398,12 +389,19 @@ private struct AppSetupDetailView: View {
             } else {
                 switch entry.record?.state {
                 case nil, .rolledBack:
-                    Button("Check Setup", action: onCheckSetup)
+                    Button("Check Compatibility", action: onCheckSetup)
                         .buttonStyle(.borderedProminent)
 
                 case .discovered:
-                    Button("Set Up Managed Copy", action: onSetupManagedCopy)
-                        .buttonStyle(.borderedProminent)
+                    DisclosureGroup("Advanced setup") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Optional. Continuum creates a separate test copy in its own storage. It never edits this app, and it does not make rewind work by itself.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button("Prepare Separate Test Copy", action: onSetupManagedCopy)
+                        }
+                        .frame(maxWidth: 360, alignment: .leading)
+                    }
 
                 case .preparing:
                     ProgressView()
@@ -411,14 +409,14 @@ private struct AppSetupDetailView: View {
                     Text("Recovering setup…")
 
                 case .prepared, .stale:
-                    Button("Recheck Setup", action: onRecheckSetup)
+                    Button("Check Again", action: onRecheckSetup)
                         .buttonStyle(.borderedProminent)
-                    Button("Remove Setup…", role: .destructive) {
+                    Button("Remove Test Copy…", role: .destructive) {
                         isConfirmingRemoval = true
                     }
 
                 case .blocked, .failed:
-                    Button("Check Again", action: onCheckSetup)
+                    Button("Check Compatibility Again", action: onCheckSetup)
                         .buttonStyle(.borderedProminent)
                     Button("Remove Setup…", role: .destructive) {
                         isConfirmingRemoval = true
@@ -429,7 +427,7 @@ private struct AppSetupDetailView: View {
             Spacer()
 
             if entry.status == .prepared {
-                Label("Prepared, not rewind-certified", systemImage: "info.circle")
+                Label("Separate test copy only", systemImage: "info.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -440,9 +438,9 @@ private struct AppSetupDetailView: View {
     private var stateTitle: String {
         switch entry.record?.state {
         case nil: "Ready to check"
-        case .discovered: "Managed-copy setup is available"
+        case .discovered: "Optional test copy is available"
         case let .preparing(stage): stage.title
-        case .prepared: "Managed copy prepared"
+        case .prepared: "Separate test copy ready"
         case .stale: "Setup needs to be refreshed"
         case .blocked: "Setup is protected"
         case .rolledBack: "Setup was safely removed"
@@ -455,11 +453,11 @@ private struct AppSetupDetailView: View {
         case nil:
             "Continuum has not changed anything. Check Setup performs a read-only compatibility probe."
         case .discovered:
-            "Continuum can clone the source into its private workspace, preserve a verified original, and prepare a separately signed managed copy."
+            "Compatibility check passed for the optional test-copy route. You do not need this to choose or inspect the app."
         case let .preparing(stage):
             "Continuum is \(stage.progressDescription). The selected source remains untouched."
         case .prepared:
-            "The attach-enabled managed copy passed source, clone, marker, and signature checks. Functional rewind stays disabled until restore certification passes."
+            "Continuum’s separate test copy passed its own checks. The selected app is untouched, and rewind stays disabled until restore certification passes."
         case .stale:
             "The source app changed after setup. Recheck it before using the managed copy."
         case .blocked:
@@ -515,6 +513,33 @@ private struct AppBundleIcon: View {
         NSWorkspace.shared.icon(
             forFile: (app.bundleURL ?? app.executableURL).standardizedFileURL.path
         )
+    }
+}
+
+private struct RewindExplainerStep: View {
+    let number: Int
+    let title: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(number.formatted())
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+                .frame(width: 22, height: 22)
+                .background(Color.accentColor, in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(.quinary, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
