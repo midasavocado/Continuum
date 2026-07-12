@@ -1,6 +1,7 @@
 import ContinuumCore
 import ContinuumRuntime
 import ContinuumStore
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -146,15 +147,22 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             let manifestData = try encoder.encode(manifest)
 
             retain(handle, for: snapshotID)
+            var artifacts = try durableArtifacts(
+                snapshot: rawSnapshot,
+                checkpoint: checkpoint,
+                app: app,
+                writableVnodes: writableVnodes
+            )
+            artifacts.append(
+                CapturedArtifact(
+                    kind: .metadata,
+                    logicalName: "live-checkpoint-manifest.json",
+                    data: manifestData
+                )
+            )
             return SnapshotCapture(
                 snapshot: snapshot,
-                artifacts: [
-                    CapturedArtifact(
-                        kind: .metadata,
-                        logicalName: "experimental-hot-manifest.json",
-                        data: manifestData
-                    )
-                ]
+                artifacts: artifacts
             )
         } catch {
             // `handle` owns and destroys the C snapshot when this scope exits.
@@ -251,6 +259,221 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             let expiredID = retentionOrder.removeFirst()
             handles.removeValue(forKey: expiredID)
         }
+    }
+
+    private func durableArtifacts(
+        snapshot: OpaquePointer,
+        checkpoint: CheckpointRecord,
+        app: AppIdentity,
+        writableVnodes: [HotWritableVnode]
+    ) throws -> [CapturedArtifact] {
+        let chunkSize = 1_024 * 1_024
+        var artifacts: [CapturedArtifact] = []
+        var processImages: [DurableProcessImage] = []
+        let memberCount = continuum_remote_process_group_member_count(snapshot)
+
+        for memberIndex in 0..<memberCount {
+            var member = continuum_remote_process_group_member_info()
+            try requireRuntimeOK(
+                continuum_remote_process_group_copy_member_info(
+                    snapshot, memberIndex, &member
+                ),
+                operation: "export process metadata"
+            )
+
+            var regions: [DurableMemoryRegion] = []
+            let regionCount = continuum_remote_process_group_member_region_count(
+                snapshot, memberIndex
+            )
+            for regionIndex in 0..<regionCount {
+                var region = continuum_remote_process_region_info()
+                try requireRuntimeOK(
+                    continuum_remote_process_group_copy_member_region_info(
+                        snapshot, memberIndex, regionIndex, &region
+                    ),
+                    operation: "export memory-region metadata"
+                )
+                var references: [DurableChunkReference] = []
+                var offset: UInt64 = 0
+                while offset < region.length {
+                    let length = Int(min(UInt64(chunkSize), region.length - offset))
+                    var data = Data(count: length)
+                    let status = data.withUnsafeMutableBytes { buffer in
+                        continuum_remote_process_group_copy_member_region_bytes_range(
+                            snapshot,
+                            memberIndex,
+                            regionIndex,
+                            offset,
+                            buffer.baseAddress,
+                            buffer.count
+                        )
+                    }
+                    try requireRuntimeOK(status, operation: "export memory bytes")
+                    let hash = Self.sha256(data)
+                    let logicalName = String(
+                        format: "memory/%d/%016llx/%016llx.bin",
+                        member.process_id,
+                        region.address,
+                        offset
+                    )
+                    artifacts.append(CapturedArtifact(
+                        kind: .memoryPage,
+                        logicalName: logicalName,
+                        data: data
+                    ))
+                    references.append(DurableChunkReference(
+                        hash: hash,
+                        logicalBytes: UInt64(length),
+                        storedBytes: 0,
+                        compression: .none
+                    ))
+                    offset += UInt64(length)
+                }
+                regions.append(DurableMemoryRegion(
+                    address: region.address,
+                    length: region.length,
+                    protection: region.protection,
+                    maximumProtection: region.maximum_protection,
+                    inheritance: region.inheritance,
+                    shareMode: region.share_mode,
+                    userTag: region.user_tag,
+                    chunks: references
+                ))
+            }
+
+            var threads: [DurableThreadImage] = []
+            let threadCount = continuum_remote_process_group_member_thread_count(
+                snapshot, memberIndex
+            )
+            for threadIndex in 0..<threadCount {
+                var thread = continuum_remote_thread_state_info()
+                try requireRuntimeOK(
+                    continuum_remote_process_group_copy_member_thread_info(
+                        snapshot, memberIndex, threadIndex, &thread
+                    ),
+                    operation: "export thread metadata"
+                )
+                let general = try copyThreadState(
+                    snapshot: snapshot,
+                    memberIndex: memberIndex,
+                    threadIndex: threadIndex,
+                    length: thread.general_state_length,
+                    vector: false
+                )
+                let vector = try copyThreadState(
+                    snapshot: snapshot,
+                    memberIndex: memberIndex,
+                    threadIndex: threadIndex,
+                    length: thread.vector_state_length,
+                    vector: true
+                )
+                let generalName = "threads/\(member.process_id)/\(thread.thread_identifier)-general.bin"
+                let vectorName = "threads/\(member.process_id)/\(thread.thread_identifier)-vector.bin"
+                artifacts.append(CapturedArtifact(
+                    kind: .threadState,
+                    logicalName: generalName,
+                    data: general
+                ))
+                artifacts.append(CapturedArtifact(
+                    kind: .threadState,
+                    logicalName: vectorName,
+                    data: vector
+                ))
+                threads.append(DurableThreadImage(
+                    threadIdentifier: thread.thread_identifier,
+                    generalStateFlavor: thread.general_state_flavor,
+                    generalState: DurableChunkReference(
+                        hash: Self.sha256(general),
+                        logicalBytes: UInt64(general.count),
+                        storedBytes: 0,
+                        compression: .none
+                    ),
+                    vectorStateFlavor: thread.vector_state_flavor,
+                    vectorState: DurableChunkReference(
+                        hash: Self.sha256(vector),
+                        logicalBytes: UInt64(vector.count),
+                        storedBytes: 0,
+                        compression: .none
+                    )
+                ))
+            }
+
+            processImages.append(DurableProcessImage(
+                processIdentifier: member.process_id,
+                parentProcessIdentifier: member.parent_process_id,
+                executableDevice: member.executable_device,
+                executableInode: member.executable_inode,
+                vmLayoutHash: member.vm_layout_hash,
+                regions: regions,
+                threads: threads
+            ))
+        }
+
+        let image = DurableCheckpointImage(
+            checkpointID: checkpoint.id,
+            createdAt: checkpoint.capturedAt,
+            architecture: "arm64",
+            operatingSystemBuild: ProcessInfo.processInfo.operatingSystemVersionString,
+            pageSize: UInt64(getpagesize()),
+            rootProcessIdentifier: checkpoint.processIdentifiers.first ?? 0,
+            app: app,
+            members: processImages,
+            writableFiles: []
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        artifacts.append(CapturedArtifact(
+            kind: .metadata,
+            logicalName: "durable-checkpoint-v1.json",
+            data: try encoder.encode(image)
+        ))
+        return artifacts
+    }
+
+    private func copyThreadState(
+        snapshot: OpaquePointer,
+        memberIndex: Int,
+        threadIndex: Int,
+        length: Int,
+        vector: Bool
+    ) throws -> Data {
+        var data = Data(count: length)
+        var requiredLength = 0
+        let status = data.withUnsafeMutableBytes { buffer in
+            if vector {
+                continuum_remote_process_group_copy_member_thread_vector_state(
+                    snapshot, memberIndex, threadIndex,
+                    buffer.baseAddress, buffer.count, &requiredLength
+                )
+            } else {
+                continuum_remote_process_group_copy_member_thread_general_state(
+                    snapshot, memberIndex, threadIndex,
+                    buffer.baseAddress, buffer.count, &requiredLength
+                )
+            }
+        }
+        try requireRuntimeOK(status, operation: "export thread registers")
+        guard requiredLength == length else {
+            throw ContinuumError.runtimeUnsupported(
+                "The runtime exported an incomplete thread register bank."
+            )
+        }
+        return data
+    }
+
+    private func requireRuntimeOK(
+        _ status: continuum_status,
+        operation: String
+    ) throws {
+        guard status == CONTINUUM_STATUS_OK else {
+            throw ContinuumError.runtimeUnsupported(
+                "Could not \(operation): \(statusDescription(status))."
+            )
+        }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private func groupMembers(

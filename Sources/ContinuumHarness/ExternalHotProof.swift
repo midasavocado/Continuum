@@ -1,5 +1,6 @@
 import ContinuumCore
 import ContinuumRuntime
+import ContinuumStore
 import ContinuumSystem
 import Darwin
 import Dispatch
@@ -374,6 +375,45 @@ enum ExternalHotProof {
             processIdentifiers: [targetPID, helperPID],
             kind: .beforeRewind,
             branchID: UUID()
+        )
+        let durableStoreRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "continuum-durable-proof-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: durableStoreRoot) }
+        let durableKey = Data(repeating: 0x5A, count: 32)
+        let durableStore = try EncryptedSnapshotStore(
+            rootURL: durableStoreRoot,
+            encryptionKey: durableKey
+        )
+        let saved = try await durableStore.save(capture)
+        let reopenedStore = try EncryptedSnapshotStore(
+            rootURL: durableStoreRoot,
+            encryptionKey: durableKey
+        )
+        let durableManifest = try await reopenedStore.artifact(
+            for: saved.id,
+            logicalName: "durable-checkpoint-v1.json"
+        )
+        let durableImage = try JSONDecoder().decode(
+            DurableCheckpointImage.self,
+            from: durableManifest.data
+        )
+        try require(
+            durableImage.members.count == 2
+                && durableImage.members.allSatisfy {
+                    !$0.regions.isEmpty && !$0.threads.isEmpty
+                },
+            "reopened durable checkpoint omitted process memory or registers"
+        )
+        let durableMemoryChunks = durableImage.members.reduce(into: 0) {
+            total, member in
+            total += member.regions.reduce(0) { $0 + $1.chunks.count }
+        }
+        progress(
+            "durable image reopened: \(durableImage.members.count) processes, "
+                + "\(durableMemoryChunks) memory chunks"
         )
         try require(
             capture.snapshot.availability == .experimentalHot,

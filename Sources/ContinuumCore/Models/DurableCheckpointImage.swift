@@ -78,6 +78,26 @@ public struct DurableMemoryRegion: Codable, Hashable, Sendable {
     public let shareMode: UInt32
     public let userTag: UInt32
     public let chunks: [DurableChunkReference]
+
+    public init(
+        address: UInt64,
+        length: UInt64,
+        protection: Int32,
+        maximumProtection: Int32,
+        inheritance: Int32,
+        shareMode: UInt32,
+        userTag: UInt32,
+        chunks: [DurableChunkReference]
+    ) {
+        self.address = address
+        self.length = length
+        self.protection = protection
+        self.maximumProtection = maximumProtection
+        self.inheritance = inheritance
+        self.shareMode = shareMode
+        self.userTag = userTag
+        self.chunks = chunks
+    }
 }
 
 public struct DurableThreadImage: Codable, Hashable, Sendable {
@@ -86,6 +106,20 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
     public let generalState: DurableChunkReference
     public let vectorStateFlavor: UInt32
     public let vectorState: DurableChunkReference
+
+    public init(
+        threadIdentifier: UInt64,
+        generalStateFlavor: UInt32,
+        generalState: DurableChunkReference,
+        vectorStateFlavor: UInt32,
+        vectorState: DurableChunkReference
+    ) {
+        self.threadIdentifier = threadIdentifier
+        self.generalStateFlavor = generalStateFlavor
+        self.generalState = generalState
+        self.vectorStateFlavor = vectorStateFlavor
+        self.vectorState = vectorState
+    }
 }
 
 public struct DurableFileImage: Codable, Hashable, Sendable {
@@ -94,6 +128,20 @@ public struct DurableFileImage: Codable, Hashable, Sendable {
     public let inode: UInt64
     public let byteCount: UInt64
     public let chunks: [DurableChunkReference]
+
+    public init(
+        originalPath: String,
+        device: UInt64,
+        inode: UInt64,
+        byteCount: UInt64,
+        chunks: [DurableChunkReference]
+    ) {
+        self.originalPath = originalPath
+        self.device = device
+        self.inode = inode
+        self.byteCount = byteCount
+        self.chunks = chunks
+    }
 }
 
 public struct DurableChunkReference: Codable, Hashable, Sendable {

@@ -3177,6 +3177,33 @@ continuum_status continuum_remote_process_group_copy_member_region_bytes(
     return CONTINUUM_STATUS_OK;
 }
 
+continuum_status continuum_remote_process_group_copy_member_region_bytes_range(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t region_index,
+    uint64_t offset,
+    void *destination,
+    size_t length
+) {
+    if (snapshot == NULL || destination == NULL || length == 0
+        || member_index >= snapshot->member_count
+        || snapshot->members[member_index].snapshot == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    const continuum_remote_process_snapshot *process =
+        snapshot->members[member_index].snapshot;
+    if (region_index >= process->region_count) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    const continuum_remote_process_region *region = &process->regions[region_index];
+    if (region->bytes == NULL || offset > region->length
+        || length > region->length - offset) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    memcpy(destination, region->bytes + offset, length);
+    return CONTINUUM_STATUS_OK;
+}
+
 size_t continuum_remote_process_group_member_thread_count(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t member_index

@@ -295,6 +295,33 @@ public actor EncryptedSnapshotStore: SnapshotRepository {
         }
     }
 
+    public func artifact(
+        for snapshotID: SnapshotID,
+        logicalName: String
+    ) async throws -> CapturedArtifact {
+        guard index.snapshots.contains(where: { $0.id == snapshotID }) else {
+            throw SnapshotStoreError.snapshotNotFound(snapshotID)
+        }
+        let manifest = try loadManifest(for: snapshotID)
+        guard let reference = manifest.artifacts.first(where: {
+            $0.logicalName == logicalName
+        }) else {
+            throw SnapshotStoreError.corruptData(
+                "artifact \(logicalName) is missing from snapshot \(snapshotID)"
+            )
+        }
+        let encrypted = try Data(contentsOf: chunkURL(for: reference.chunkHash))
+        let plaintext = try codec.open(encrypted)
+        guard Self.hash(plaintext) == reference.chunkHash else {
+            throw SnapshotStoreError.integrityFailure("chunk \(reference.chunkHash)")
+        }
+        return CapturedArtifact(
+            kind: reference.kind,
+            logicalName: reference.logicalName,
+            data: plaintext
+        )
+    }
+
     public func switchBranch(to branchID: BranchID) async throws {
         guard index.branches.contains(where: { $0.id == branchID }) else {
             throw SnapshotStoreError.branchNotFound(branchID)

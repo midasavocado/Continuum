@@ -455,6 +455,15 @@ continuum_status continuum_remote_process_group_copy_member_region_bytes(
     size_t *out_required_length
 );
 
+continuum_status continuum_remote_process_group_copy_member_region_bytes_range(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    size_t region_index,
+    uint64_t offset,
+    void *destination,
+    size_t length
+);
+
 size_t continuum_remote_process_group_member_thread_count(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t member_index
