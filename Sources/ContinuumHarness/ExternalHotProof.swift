@@ -329,6 +329,7 @@ enum ExternalHotProof {
         )
         print("  resource A->B gate:  unchanged")
         print("  additive Mach rights: accepted; saved rights remained identity-valid")
+        print("  additive descendant: accepted; captured process identities remained valid")
         print("  coherent open files: root + helper APFS bytes restored")
         print("  descriptor mutation: rejected before memory write")
         print("  app backend adapter: captured + restored live snapshot state")
@@ -446,6 +447,11 @@ enum ExternalHotProof {
         try require(
             addedMachRights.valid == true && addedMachRights.helperValid == true,
             "target did not add the root/helper Mach-right probe"
+        )
+        let addedChild = try target.send(command: "add-child")
+        try require(
+            addedChild.valid == true,
+            "target did not add the descendant-tree probe"
         )
         let changedFiles = try target.send(command: "mutate-file", state: "A")
         try require(

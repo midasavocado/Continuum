@@ -1161,8 +1161,6 @@ static void continuum_hash_file_info(
     continuum_remote_resource_fingerprint *fingerprint
 ) {
     continuum_hash_u64(hash, info->fi_openflags);
-    continuum_hash_u64(hash, info->fi_status);
-    continuum_hash_u64(hash, (uint64_t)info->fi_offset);
     continuum_hash_u64(hash, (uint64_t)(uint32_t)info->fi_type);
     continuum_hash_u64(hash, info->fi_guardflags);
     if ((info->fi_status & PROC_FP_GUARDED) != 0 || info->fi_guardflags != 0) {
@@ -1242,7 +1240,8 @@ static continuum_status continuum_capture_descriptor_fingerprint(
                 continuum_hash_file_info(&hash, &info.pfi, fingerprint);
                 continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_dev);
                 continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_ino);
-                continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_gen);
+                /* vnode generation/content revisions can advance on writes;
+                   device+inode+path remain the descriptor identity guard. */
                 /* File length is mutable content state restored by the file
                    checkpoint layer, not immutable descriptor identity. */
                 continuum_hash_bytes(
@@ -1273,9 +1272,6 @@ static continuum_status continuum_capture_descriptor_fingerprint(
                 continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.psi.soi_type);
                 continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.psi.soi_protocol);
                 continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.psi.soi_family);
-                continuum_hash_u64(&hash, (uint64_t)(uint16_t)info.psi.soi_state);
-                continuum_hash_u64(&hash, info.psi.soi_rcv.sbi_cc);
-                continuum_hash_u64(&hash, info.psi.soi_snd.sbi_cc);
                 break;
             }
             case PROX_FDTYPE_PIPE: {
@@ -1296,10 +1292,6 @@ static continuum_status continuum_capture_descriptor_fingerprint(
                 continuum_hash_file_info(&hash, &info.pfi, fingerprint);
                 continuum_hash_u64(&hash, info.pipeinfo.pipe_handle);
                 continuum_hash_u64(&hash, info.pipeinfo.pipe_peerhandle);
-                continuum_hash_u64(
-                    &hash,
-                    (uint64_t)(uint32_t)info.pipeinfo.pipe_status
-                );
                 break;
             }
             case PROX_FDTYPE_KQUEUE: {
@@ -1318,7 +1310,6 @@ static continuum_status continuum_capture_descriptor_fingerprint(
                 }
                 fingerprint->kqueue_count += 1;
                 continuum_hash_file_info(&hash, &info.pfi, fingerprint);
-                continuum_hash_u64(&hash, info.kqueueinfo.kq_state);
                 continuum_hash_u64(&hash, info.kqueueinfo.kq_stat.vst_ino);
                 break;
             }
@@ -2681,6 +2672,40 @@ static int continuum_process_tree_matches_group(
     return 1;
 }
 
+static int continuum_process_tree_contains_group(
+    const continuum_remote_process_tree_entry *entries,
+    size_t entry_count,
+    const continuum_remote_process_group_snapshot *group
+) {
+    if (entries == NULL || group == NULL
+        || entry_count < group->member_count) {
+        return 0;
+    }
+    for (size_t member_index = 0;
+         member_index < group->member_count;
+         member_index += 1) {
+        const continuum_remote_process_group_member *member =
+            &group->members[member_index];
+        if (member->session == NULL) {
+            return 0;
+        }
+        int found = 0;
+        for (size_t entry_index = 0; entry_index < entry_count; entry_index += 1) {
+            if (entries[entry_index].process_id
+                    == member->session->identity.process_id
+                && entries[entry_index].parent_process_id
+                    == member->parent_process_id) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static continuum_status continuum_suspend_process_group(
     continuum_remote_process_group_snapshot *group,
     size_t *out_suspended_count
@@ -3298,7 +3323,7 @@ static continuum_status continuum_remote_process_group_restore_internal(
         );
     }
     if (status == CONTINUUM_STATUS_OK
-        && !continuum_process_tree_matches_group(
+        && !continuum_process_tree_contains_group(
             tree,
             tree_count,
             snapshot
@@ -3447,7 +3472,7 @@ continuum_status continuum_remote_process_group_with_suspended_resources(
         );
     }
     if (status == CONTINUUM_STATUS_OK
-        && !continuum_process_tree_matches_group(tree, tree_count, snapshot)) {
+        && !continuum_process_tree_contains_group(tree, tree_count, snapshot)) {
         status = CONTINUUM_STATUS_PROCESS_TREE_CHANGED;
     }
     free(tree);

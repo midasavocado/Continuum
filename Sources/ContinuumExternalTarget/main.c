@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 extern char **environ;
+static const char *self_executable = NULL;
 
 typedef struct target_state {
     uint8_t *arena;
@@ -21,6 +22,7 @@ typedef struct target_state {
     int probe_descriptor;
     int stable_descriptor;
     mach_port_t additive_port;
+    pid_t additive_child;
     char stable_path[PATH_MAX];
     int is_helper;
     pid_t helper_pid;
@@ -330,6 +332,32 @@ static int run_server(target_state *target) {
                 valid,
                 valid ? NULL : "Mach port allocation failed"
             );
+        } else if (strcmp(command, "add-child") == 0) {
+            char *const arguments[] = {
+                (char *)self_executable,
+                "--continuum-idle-child",
+                NULL
+            };
+            pid_t child = 0;
+            int spawn_result = posix_spawn(
+                &child,
+                self_executable,
+                NULL,
+                NULL,
+                arguments,
+                environ
+            );
+            if (spawn_result != 0) {
+                child = -1;
+            }
+            target->additive_child = child;
+            send_reply(
+                target,
+                child > 0 ? "child-added" : "error",
+                command,
+                child > 0,
+                child > 0 ? NULL : "child creation failed"
+            );
         } else if (strcmp(command, "validate-file") == 0) {
             int helper_valid = target->is_helper
                 ? validate_file_state(target, requested_state)
@@ -380,6 +408,13 @@ static int run_server(target_state *target) {
 }
 
 int main(int argc, char **argv) {
+    self_executable = argv[0];
+    if (argc > 1 && strcmp(argv[1], "--continuum-idle-child") == 0) {
+        while (getppid() != 1) {
+            usleep(100000);
+        }
+        return EXIT_SUCCESS;
+    }
     target_state target;
     memset(&target, 0, sizeof(target));
     target.probe_descriptor = -1;

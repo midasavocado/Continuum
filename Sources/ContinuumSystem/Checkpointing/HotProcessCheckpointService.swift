@@ -198,7 +198,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             guard safetyStatus == CONTINUUM_STATUS_OK else {
                 return .failed(
                     safetyBox.failureDescription
-                        ?? "Continuum could not secure the live files before restoring. No memory was changed."
+                        ?? "Continuum could not secure the live state before restoring: \(statusDescription(safetyStatus)). No memory was changed."
                 )
             }
         }
@@ -783,7 +783,6 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
             current.processIdentifier == saved.processIdentifier
                 && current.fileDescriptor == saved.fileDescriptor
                 && current.openFlags == saved.openFlags
-                && current.offset == saved.offset
                 && current.device == saved.device
                 && current.inode == saved.inode
                 && current.mode == saved.mode
