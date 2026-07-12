@@ -2983,6 +2983,23 @@ size_t continuum_remote_process_group_member_count(
     return snapshot == NULL ? 0 : snapshot->member_count;
 }
 
+continuum_status continuum_remote_process_group_live_status(
+    const continuum_remote_process_group_snapshot *snapshot
+) {
+    if (snapshot == NULL || snapshot->member_count == 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    for (size_t index = 0; index < snapshot->member_count; index += 1) {
+        continuum_status status = continuum_validate_session_identity(
+            snapshot->members[index].session
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            return status;
+        }
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
 continuum_status continuum_remote_process_group_copy_member_info(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t index,

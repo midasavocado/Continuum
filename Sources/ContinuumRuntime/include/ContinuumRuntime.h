@@ -416,6 +416,12 @@ size_t continuum_remote_process_group_member_count(
     const continuum_remote_process_group_snapshot *snapshot
 );
 
+/// Verifies that every process captured by the live snapshot still refers to
+/// the exact original process identity. This does not suspend or mutate it.
+continuum_status continuum_remote_process_group_live_status(
+    const continuum_remote_process_group_snapshot *snapshot
+);
+
 continuum_status continuum_remote_process_group_copy_member_info(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t index,

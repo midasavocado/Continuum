@@ -196,6 +196,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 safetyContext
             )
             guard safetyStatus == CONTINUUM_STATUS_OK else {
+                if safetyStatus == CONTINUUM_STATUS_TARGET_EXITED
+                    || safetyStatus == CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED {
+                    expire(snapshot.id)
+                }
                 return .failed(
                     safetyBox.failureDescription
                         ?? "Continuum could not secure the live state before restoring: \(statusDescription(safetyStatus)). No memory was changed."
@@ -246,7 +250,20 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         guard snapshot.availability == .experimentalHot else {
             return snapshot.availability
         }
-        return handles[snapshot.id] == nil ? .unavailable : .experimentalHot
+        guard let handle = handles[snapshot.id] else {
+            return .unavailable
+        }
+        guard continuum_remote_process_group_live_status(handle.pointer)
+                == CONTINUUM_STATUS_OK else {
+            expire(snapshot.id)
+            return .unavailable
+        }
+        return .experimentalHot
+    }
+
+    private func expire(_ snapshotID: SnapshotID) {
+        handles.removeValue(forKey: snapshotID)
+        retentionOrder.removeAll { $0 == snapshotID }
     }
 
     private func retain(_ handle: HotProcessSnapshotHandle, for snapshotID: SnapshotID) {

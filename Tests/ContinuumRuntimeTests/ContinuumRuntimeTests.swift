@@ -236,6 +236,10 @@ final class ContinuumRuntimeTests: XCTestCase {
         )
         XCTAssertNil(snapshot)
         XCTAssertEqual(continuum_remote_process_group_member_count(nil), 0)
+        XCTAssertEqual(
+            continuum_remote_process_group_live_status(nil),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
 
         var member = continuum_remote_process_group_member_info()
         XCTAssertEqual(

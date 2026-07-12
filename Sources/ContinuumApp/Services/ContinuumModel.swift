@@ -221,14 +221,19 @@ final class ContinuumModel {
 
     func restore(snapshotID: SnapshotID) async {
         await performAction {
-            guard let snapshot = self.snapshots.first(where: {
+            guard var snapshot = self.snapshots.first(where: {
                 $0.id == snapshotID
             }) else {
                 throw ContinuumError.snapshotNotFound
             }
+            snapshot.availability = await self.checkpointCapturer
+                .currentRestoreAvailability(for: snapshot)
             guard snapshot.availability != .unavailable else {
+                if let index = self.snapshots.firstIndex(where: { $0.id == snapshotID }) {
+                    self.snapshots[index].availability = .unavailable
+                }
                 throw ContinuumError.restoreUnavailable(
-                    "This snapshot no longer has a live restorable process."
+                    "The captured app has exited. Cold relaunch restore is not implemented yet."
                 )
             }
 
@@ -247,6 +252,7 @@ final class ContinuumModel {
                 self.onlineWarning = effects.isEmpty ? snapshot.externalEffects : effects
             case let .failed(detail):
                 self.rewindPhase = .failed(detail)
+                try await self.refreshIndex()
                 throw ContinuumError.restoreUnavailable(detail)
             }
 
