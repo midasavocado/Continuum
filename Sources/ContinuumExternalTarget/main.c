@@ -61,7 +61,9 @@ static void current_digest(const target_state *target, char output[17]) {
 
 static int write_file_state(target_state *target, char state) {
     char bytes[32];
-    int length = snprintf(bytes, sizeof(bytes), "continuum-file-%c\n", state);
+    int length = state == 'A'
+        ? snprintf(bytes, sizeof(bytes), "A\n")
+        : snprintf(bytes, sizeof(bytes), "continuum-file-B\n");
     if (length <= 0
         || pwrite(target->stable_descriptor, bytes, (size_t)length, 0) != length
         || ftruncate(target->stable_descriptor, length) != 0
@@ -74,7 +76,9 @@ static int write_file_state(target_state *target, char state) {
 static int validate_file_state(target_state *target, char state) {
     char expected[32];
     char actual[32] = {0};
-    int length = snprintf(expected, sizeof(expected), "continuum-file-%c\n", state);
+    int length = state == 'A'
+        ? snprintf(expected, sizeof(expected), "A\n")
+        : snprintf(expected, sizeof(expected), "continuum-file-B\n");
     if (length <= 0 || pread(target->stable_descriptor, actual, sizeof(actual), 0) != length) {
         return 0;
     }

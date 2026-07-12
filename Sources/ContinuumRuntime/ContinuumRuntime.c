@@ -1243,10 +1243,8 @@ static continuum_status continuum_capture_descriptor_fingerprint(
                 continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_dev);
                 continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_ino);
                 continuum_hash_u64(&hash, info.pvip.vip_vi.vi_stat.vst_gen);
-                continuum_hash_u64(
-                    &hash,
-                    (uint64_t)info.pvip.vip_vi.vi_stat.vst_size
-                );
+                /* File length is mutable content state restored by the file
+                   checkpoint layer, not immutable descriptor identity. */
                 continuum_hash_bytes(
                     &hash,
                     info.pvip.vip_path,

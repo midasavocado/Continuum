@@ -186,7 +186,6 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         let rollbackSnapshotID = UUID()
         if let fileCheckpointStore = handle.fileCheckpointStore {
             let safetyBox = HotResourceInventoryCallbackBox(
-                expectedInventory: handle.writableVnodes,
                 fileCheckpointStore: fileCheckpointStore,
                 captureSnapshotID: rollbackSnapshotID
             )
@@ -738,7 +737,8 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
 
         let captured = rawEntries.map(Self.convert).sorted()
         inventory = captured
-        if let expectedInventory, captured != expectedInventory {
+        if let expectedInventory,
+           !Self.hasMatchingStableIdentity(captured, expectedInventory) {
             return CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED
         }
 
@@ -772,6 +772,23 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
             }
         }
         return CONTINUUM_STATUS_OK
+    }
+
+    private static func hasMatchingStableIdentity(
+        _ current: [HotWritableVnode],
+        _ saved: [HotWritableVnode]
+    ) -> Bool {
+        guard current.count == saved.count else { return false }
+        return zip(current, saved).allSatisfy { current, saved in
+            current.processIdentifier == saved.processIdentifier
+                && current.fileDescriptor == saved.fileDescriptor
+                && current.openFlags == saved.openFlags
+                && current.offset == saved.offset
+                && current.device == saved.device
+                && current.inode == saved.inode
+                && current.mode == saved.mode
+                && current.path == saved.path
+        }
     }
 
     private static func convert(
