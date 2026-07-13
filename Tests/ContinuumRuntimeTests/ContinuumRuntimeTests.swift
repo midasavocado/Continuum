@@ -125,6 +125,20 @@ final class ContinuumRuntimeTests: XCTestCase {
             continuum_remote_session_prepare_suspended_pthreads(nil, 0, nil),
             CONTINUUM_STATUS_INVALID_ARGUMENT
         )
+        var byte: UInt8 = 0
+        var restoreReport = continuum_remote_restore_report()
+        XCTAssertEqual(
+            continuum_remote_session_write_prepared_pthread_stack(
+                nil,
+                nil,
+                0,
+                &byte,
+                1,
+                &restoreReport
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(restoreReport.bytes_written, 0)
     }
 
     func testExactPthreadPlanCopiesOnlyStacksAtMatchingAddresses() {

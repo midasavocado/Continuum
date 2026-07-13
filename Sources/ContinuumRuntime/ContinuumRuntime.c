@@ -483,6 +483,7 @@ struct continuum_remote_session {
     int has_active_reconstruction;
     int has_prepared_pthread_set;
     int has_reconstructed_thread_set;
+    continuum_remote_pthread_bootstrap_report prepared_pthreads;
 };
 
 struct continuum_remote_thread_snapshot {
@@ -5466,6 +5467,7 @@ continuum_status continuum_remote_session_prepare_suspended_pthreads(
             wire_report.pthread_region_lengths[index];
     }
     if (status == CONTINUUM_STATUS_OK) {
+        session->prepared_pthreads = *out_report;
         session->has_prepared_pthread_set = 1;
     } else {
         memset(out_report, 0, sizeof(*out_report));
@@ -5508,6 +5510,233 @@ cleanup_original_threads:
     }
     return status;
 #endif
+}
+
+static continuum_status continuum_prepared_pthread_stack_range(
+    continuum_remote_session *session,
+    const continuum_pthread_reconstruction_plan_entry *entry,
+    uint64_t *out_address,
+    uint64_t *out_length
+) {
+    if (session == NULL || entry == NULL || out_address == NULL
+        || out_length == NULL || !session->has_prepared_pthread_set
+        || session->prepared_pthreads.version != 3
+        || entry->is_primary > 1) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+
+    const continuum_remote_pthread_bootstrap_report *prepared =
+        &session->prepared_pthreads;
+    uint64_t pthread_address = 0;
+    uint64_t replacement_identifier = 0;
+    uint64_t replacement_handle = 0;
+    uint64_t stack_region_address = 0;
+    uint64_t stack_region_length = 0;
+    uint64_t pthread_region_address = 0;
+    uint64_t pthread_region_length = 0;
+    if (entry->is_primary != 0) {
+        pthread_address = prepared->primary_pthread_address;
+        replacement_identifier = prepared->primary_thread_identifier;
+        replacement_handle = prepared->primary_thread_handle;
+        stack_region_address = prepared->primary_stack_region_address;
+        stack_region_length = prepared->primary_stack_region_length;
+        pthread_region_address = prepared->primary_pthread_region_address;
+        pthread_region_length = prepared->primary_pthread_region_length;
+    } else {
+        size_t match = SIZE_MAX;
+        for (uint32_t index = 0; index < prepared->created_count; index += 1) {
+            if (prepared->thread_identifiers[index]
+                    == entry->replacement_thread_identifier
+                && prepared->thread_handles[index]
+                    == entry->replacement_thread_handle
+                && prepared->pthread_addresses[index]
+                    == entry->pthread_address) {
+                if (match != SIZE_MAX) {
+                    return CONTINUUM_STATUS_VALIDATION_FAILED;
+                }
+                match = index;
+            }
+        }
+        if (match == SIZE_MAX) {
+            return CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+        pthread_address = prepared->pthread_addresses[match];
+        replacement_identifier = prepared->thread_identifiers[match];
+        replacement_handle = prepared->thread_handles[match];
+        stack_region_address = prepared->stack_region_addresses[match];
+        stack_region_length = prepared->stack_region_lengths[match];
+        pthread_region_address = prepared->pthread_region_addresses[match];
+        pthread_region_length = prepared->pthread_region_lengths[match];
+    }
+
+    uint64_t stack_region_end = 0;
+    uint64_t pthread_region_end = 0;
+    if (pthread_address == 0 || replacement_identifier == 0
+        || replacement_handle == 0 || stack_region_address == 0
+        || stack_region_length == 0 || pthread_region_address == 0
+        || pthread_region_length == 0
+        || !continuum_add_u64(
+            stack_region_address,
+            stack_region_length,
+            &stack_region_end
+        )
+        || !continuum_add_u64(
+            pthread_region_address,
+            pthread_region_length,
+            &pthread_region_end
+        )) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    uint64_t stack_copy_length = stack_region_length;
+    uint64_t preserved_address = pthread_region_address;
+    if (stack_region_address == pthread_region_address) {
+        if (stack_region_length != pthread_region_length
+            || pthread_address <= stack_region_address
+            || pthread_address >= stack_region_end) {
+            return CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+        stack_copy_length = pthread_address - stack_region_address;
+        preserved_address = pthread_address;
+    } else if (stack_region_address < pthread_region_end
+        && pthread_region_address < stack_region_end) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    uint64_t preserved_length = pthread_region_end - preserved_address;
+    if (stack_copy_length == 0 || preserved_length == 0
+        || entry->replacement_thread_identifier != replacement_identifier
+        || entry->replacement_thread_handle != replacement_handle
+        || entry->pthread_address != pthread_address
+        || entry->stack_copy_address != stack_region_address
+        || entry->stack_copy_length != stack_copy_length
+        || entry->preserved_pthread_address != preserved_address
+        || entry->preserved_pthread_length != preserved_length) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    mach_vm_size_t writable_span = 0;
+    kern_return_t mach_result = KERN_SUCCESS;
+    continuum_status status = continuum_reconstruction_leaf_span(
+        session->task,
+        stack_region_address,
+        stack_copy_length,
+        VM_PROT_READ | VM_PROT_WRITE,
+        &writable_span,
+        &mach_result
+    );
+    if (status != CONTINUUM_STATUS_OK || writable_span != stack_copy_length) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+    *out_address = stack_region_address;
+    *out_length = stack_copy_length;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_session_write_prepared_pthread_stack(
+    continuum_remote_session *session,
+    const continuum_pthread_reconstruction_plan_entry *entry,
+    uint64_t offset,
+    const void *bytes,
+    size_t length,
+    continuum_remote_restore_report *out_report
+) {
+    if (bytes == NULL || length == 0 || out_report == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_report, 0, sizeof(*out_report));
+    if (session == NULL || session->has_active_reconstruction
+        || session->has_reconstructed_thread_set
+        || session->owned_suspend_count != 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    continuum_status status = continuum_validate_stopped_replacement_session(
+        session
+    );
+    uint64_t stack_address = 0;
+    uint64_t stack_length = 0;
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_prepared_pthread_stack_range(
+            session,
+            entry,
+            &stack_address,
+            &stack_length
+        );
+    }
+    uint64_t end = 0;
+    uint64_t write_address = 0;
+    if (status == CONTINUUM_STATUS_OK
+        && (!continuum_add_u64(offset, length, &end)
+            || end > stack_length
+            || !continuum_add_u64(
+                stack_address,
+                offset,
+                &write_address
+            ))) {
+        status = CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    uint64_t bytes_written = 0;
+    status = continuum_write_reconstructed_task_bytes(
+        session->task,
+        write_address,
+        bytes,
+        length,
+        &bytes_written,
+        &out_report->mach_result
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        out_report->reconstruction_stage =
+            CONTINUUM_RECONSTRUCTION_STAGE_WRITE;
+    }
+
+    uint8_t *readback = NULL;
+    if (status == CONTINUUM_STATUS_OK) {
+        readback = malloc(length);
+        if (readback == NULL) {
+            status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_read_reconstructed_task_bytes(
+            session->task,
+            write_address,
+            length,
+            readback,
+            &out_report->mach_result
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            out_report->reconstruction_stage =
+                CONTINUUM_RECONSTRUCTION_STAGE_READBACK;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK && memcmp(readback, bytes, length) != 0) {
+        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    free(readback);
+
+    continuum_status resume_status = continuum_resume_session(
+        session,
+        did_suspend
+    );
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        status = resume_status;
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        out_report->bytes_written = bytes_written;
+        out_report->readback_verified = 1;
+    }
+    return status;
 }
 
 continuum_status continuum_remote_session_write_reconstructed_region(

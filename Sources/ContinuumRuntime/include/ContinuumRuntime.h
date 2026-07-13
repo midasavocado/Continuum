@@ -531,6 +531,19 @@ continuum_status continuum_plan_exact_pthread_reconstruction(
     continuum_pthread_reconstruction_plan *out_plan
 );
 
+/// Writes and immediately reads back bytes only within an exact stack-copy
+/// range from a validated prepared-pthread plan. The runtime revalidates the
+/// entry against the pthread set it created and refuses every byte of live
+/// libpthread metadata.
+continuum_status continuum_remote_session_write_prepared_pthread_stack(
+    continuum_remote_session *session,
+    const continuum_pthread_reconstruction_plan_entry *entry,
+    uint64_t offset,
+    const void *bytes,
+    size_t length,
+    continuum_remote_restore_report *out_report
+);
+
 /// Writes and immediately reads back one bounded range of a mapping prepared
 /// by continuum_remote_session_begin_reconstruct_region.
 continuum_status continuum_remote_session_write_reconstructed_region(
