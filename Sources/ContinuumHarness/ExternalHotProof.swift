@@ -359,6 +359,7 @@ enum ExternalHotProof {
             "  cold local files:      \(coldMemory.reconstructedFileCount) file, "
                 + "\(coldMemory.reconstructedFileBytes) bytes restored + rolled back"
         )
+        print("  cold continuation:     committed replacement detached from ptrace")
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -898,6 +899,46 @@ enum ExternalHotProof {
             remainingTransactions.isEmpty,
             "successful cold rollback left a stale durable transaction journal"
         )
+
+        let committedPreparation = try await restorer.prepareRootProcess(
+            from: saved.id,
+            repository: store
+        )
+        let commit = try await restorer.commit(committedPreparation.id)
+        var committedWasReaped = false
+        defer {
+            if !committedWasReaped {
+                kill(commit.processIdentifier, SIGKILL)
+                var status: Int32 = 0
+                waitpid(commit.processIdentifier, &status, 0)
+            }
+        }
+        usleep(100_000)
+        let committedFileBytes = try Data(contentsOf: coldFileURL)
+        let committedFileInode = try fileInode(coldFileURL)
+        try require(
+            kill(commit.processIdentifier, 0) == 0
+                && committedFileBytes == savedFileBytes
+                && committedFileInode == originalFileInode
+                && commit.retainedFileCount == 1
+                && commit.retainedFileBytes == UInt64(savedFileBytes.count)
+                && commit.safetyTransactionRootURL.map {
+                    FileManager.default.fileExists(atPath: $0.path)
+                } == true,
+            "committed cold replacement did not continue with its saved file state"
+        )
+        let recoveredCommittedTransactions = try await restorer
+            .recoverInterruptedFileTransactions()
+        let postRecoveryCommittedBytes = try Data(contentsOf: coldFileURL)
+        try require(
+            recoveredCommittedTransactions == 0
+                && postRecoveryCommittedBytes == savedFileBytes,
+            "crash recovery incorrectly rolled back a committed cold replacement"
+        )
+        kill(commit.processIdentifier, SIGKILL)
+        var committedStatus: Int32 = 0
+        waitpid(commit.processIdentifier, &committedStatus, 0)
+        committedWasReaped = true
         return preparation
     }
 

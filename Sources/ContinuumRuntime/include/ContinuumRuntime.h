@@ -123,6 +123,12 @@ continuum_status continuum_advance_process_to_entry_stop(
     uint32_t timeout_milliseconds
 );
 
+/// Detaches from a direct child stopped at Continuum's executable-entry
+/// boundary and lets it continue from its currently installed thread state.
+continuum_status continuum_release_entry_stopped_child(
+    int32_t process_id
+);
+
 /// Runs while every member of a process group remains coherently suspended.
 /// The callback must not resume or mutate process topology. Returning a failure
 /// aborts capture, resumes every task, and destroys the incomplete snapshot.

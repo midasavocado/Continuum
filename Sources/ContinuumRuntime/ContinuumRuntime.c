@@ -2006,6 +2006,47 @@ continuum_status continuum_advance_process_to_entry_stop(
 #endif
 }
 
+continuum_status continuum_release_entry_stopped_child(
+    int32_t process_id
+) {
+    if (process_id <= 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    struct proc_bsdinfo process_info;
+    memset(&process_info, 0, sizeof(process_info));
+    int copied = proc_pidinfo(
+        process_id,
+        PROC_PIDTBSDINFO,
+        0,
+        &process_info,
+        (int)sizeof(process_info)
+    );
+    if (copied != (int)sizeof(process_info)) {
+        return CONTINUUM_STATUS_TARGET_EXITED;
+    }
+    if (process_info.pbi_ppid != getpid()) {
+        return CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    int detach_result = ptrace(
+        PT_DETACH,
+        process_id,
+        (caddr_t)1,
+        0
+    );
+#pragma clang diagnostic pop
+    if (detach_result != 0) {
+        return errno == ESRCH
+            ? CONTINUUM_STATUS_TARGET_EXITED
+            : CONTINUUM_STATUS_RESUME_FAILED;
+    }
+    return kill(process_id, 0) == 0 || errno == EPERM
+        ? CONTINUUM_STATUS_OK
+        : CONTINUUM_STATUS_TARGET_EXITED;
+}
+
 static continuum_status continuum_write_task_bytes(
     mach_port_t task,
     mach_vm_address_t address,

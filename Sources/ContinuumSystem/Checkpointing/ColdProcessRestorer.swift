@@ -21,11 +21,18 @@ public struct ColdProcessPreparation: Hashable, Sendable {
     public let reconstructedFileBytes: UInt64
 }
 
+public struct ColdProcessCommit: Hashable, Sendable {
+    public let processIdentifier: Int32
+    public let safetyTransactionRootURL: URL?
+    public let retainedFileCount: Int
+    public let retainedFileBytes: UInt64
+}
+
 /// Rebuilds a durable process image into a disposable child that remains
 /// stopped before main. A certified single-thread image also receives its saved
 /// ARM64 general and vector register state. Validated regular writable files
-/// are reconnected before memory reconstruction. Other resources and execution
-/// resume intentionally remain later phases.
+/// are reconnected before memory reconstruction. Commit detaches the verified
+/// replacement; unsupported resources remain certification boundaries.
 public actor ColdProcessRestorer {
     private struct PreparedReplacement: @unchecked Sendable {
         let processIdentifier: Int32
@@ -54,6 +61,7 @@ public actor ColdProcessRestorer {
         let transactionID: UUID
         let safetySnapshotID: UUID
         let replacementProcessIdentifier: Int32
+        let state: String
         let createdAt: Date
         let entries: [Entry]
     }
@@ -569,6 +577,61 @@ public actor ColdProcessRestorer {
         preparedReplacements.removeValue(forKey: preparationID)
     }
 
+    public func commit(
+        _ preparationID: UUID
+    ) throws -> ColdProcessCommit {
+        guard let replacement = preparedReplacements[preparationID] else {
+            throw ContinuumError.restoreUnavailable(
+                "The prepared cold replacement no longer exists."
+            )
+        }
+        if let rollback = replacement.fileRollback {
+            try Self.validateInstalledFiles(
+                rollback,
+                allowedProcessIdentifier: replacement.processIdentifier
+            )
+            try Self.updateFileTransactionState(
+                rollback,
+                state: "committed"
+            )
+        }
+
+        let releaseStatus = continuum_release_entry_stopped_child(
+            replacement.processIdentifier
+        )
+        guard releaseStatus == CONTINUUM_STATUS_OK else {
+            if let rollback = replacement.fileRollback,
+               (try? Self.updateFileTransactionState(
+                    rollback,
+                    state: "prepared"
+               )) == nil {
+                _ = Self.killAndReap(replacement.processIdentifier)
+                guard (try? Self.rollbackFiles(rollback)) != nil else {
+                    throw ContinuumError.integrityFailure(
+                        "Cold resume failed, its transaction state could not be reverted, and file rollback also failed. The safety root remains at \(rollback.rootURL.path)."
+                    )
+                }
+                continuum_remote_session_destroy(replacement.session)
+                preparedReplacements.removeValue(forKey: preparationID)
+                throw ContinuumError.restoreUnavailable(
+                    "Cold resume failed; Continuum restored the pre-restore files."
+                )
+            }
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not release the reconstructed process: \(String(cString: continuum_status_string(releaseStatus)))."
+            )
+        }
+
+        continuum_remote_session_destroy(replacement.session)
+        preparedReplacements.removeValue(forKey: preparationID)
+        return ColdProcessCommit(
+            processIdentifier: replacement.processIdentifier,
+            safetyTransactionRootURL: replacement.fileRollback?.rootURL,
+            retainedFileCount: replacement.fileRollback?.replacedFileCount ?? 0,
+            retainedFileBytes: replacement.fileRollback?.replacedBytes ?? 0
+        )
+    }
+
     @discardableResult
     public func recoverInterruptedFileTransactions() throws -> Int {
         guard preparedReplacements.isEmpty else {
@@ -591,6 +654,14 @@ public actor ColdProcessRestorer {
                   journal.transactionID.uuidString == rootURL.lastPathComponent else {
                 throw ContinuumError.integrityFailure(
                     "A durable cold-file transaction journal has an invalid identity."
+                )
+            }
+            if journal.state == "committed" {
+                continue
+            }
+            guard journal.state == "prepared" else {
+                throw ContinuumError.integrityFailure(
+                    "A durable cold-file transaction has an unknown state."
                 )
             }
             guard Self.processIsAbsent(
@@ -921,6 +992,7 @@ public actor ColdProcessRestorer {
                 transactionID: transactionID,
                 safetySnapshotID: safetySnapshotID,
                 replacementProcessIdentifier: replacementProcessIdentifier,
+                state: "prepared",
                 createdAt: Date(),
                 entries: replacements.map {
                     ColdFileTransactionJournal.Entry(
@@ -993,9 +1065,23 @@ public actor ColdProcessRestorer {
         _ rollback: PreparedFileRollback?
     ) throws {
         guard let rollback else { return }
+        try validateInstalledFiles(
+            rollback,
+            allowedProcessIdentifier: 0
+        )
+        _ = try rollback.store.restoreCoherently(
+            snapshotID: rollback.snapshotID
+        )
+        try FileManager.default.removeItem(at: rollback.rootURL)
+    }
+
+    private static func validateInstalledFiles(
+        _ rollback: PreparedFileRollback,
+        allowedProcessIdentifier: Int32
+    ) throws {
         try ensureNoExternalWriters(
             rollback.installedFiles,
-            allowedProcessIdentifier: 0
+            allowedProcessIdentifier: allowedProcessIdentifier
         )
         for file in rollback.installedFiles {
             guard try fileIdentity(atPath: file.originalPath)
@@ -1003,14 +1089,10 @@ public actor ColdProcessRestorer {
                   try sha256File(atPath: file.originalPath)
                     == sha256(file.data) else {
                 throw ContinuumError.integrityFailure(
-                    "A cold-restore file changed after preparation. Continuum preserved the safety root instead of overwriting newer bytes."
+                    "A cold-restore file changed after preparation. Continuum preserved its safety transaction instead of overwriting newer bytes."
                 )
             }
         }
-        _ = try rollback.store.restoreCoherently(
-            snapshotID: rollback.snapshotID
-        )
-        try FileManager.default.removeItem(at: rollback.rootURL)
     }
 
     private static func bootstrapDescriptorPlan(
@@ -1142,6 +1224,33 @@ public actor ColdProcessRestorer {
                 "A durable cold-file transaction journal could not be decoded."
             )
         }
+    }
+
+    private static func updateFileTransactionState(
+        _ rollback: PreparedFileRollback,
+        state: String
+    ) throws {
+        guard state == "prepared" || state == "committed" else {
+            throw ContinuumError.integrityFailure(
+                "Continuum refused an invalid cold-file transaction state."
+            )
+        }
+        let journal = try readFileTransactionJournal(
+            rootURL: rollback.rootURL
+        )
+        let updated = ColdFileTransactionJournal(
+            formatVersion: journal.formatVersion,
+            transactionID: journal.transactionID,
+            safetySnapshotID: journal.safetySnapshotID,
+            replacementProcessIdentifier: journal.replacementProcessIdentifier,
+            state: state,
+            createdAt: journal.createdAt,
+            entries: journal.entries
+        )
+        try writeFileTransactionJournal(
+            updated,
+            rootURL: rollback.rootURL
+        )
     }
 
     private static func ensureNoExternalWriters(

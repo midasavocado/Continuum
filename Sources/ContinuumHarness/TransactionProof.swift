@@ -173,6 +173,7 @@ enum TransactionProof {
             transactionID: coldTransactionID,
             safetySnapshotID: coldSafetySnapshotID,
             replacementProcessIdentifier: Int32.max,
+            state: "prepared",
             createdAt: Date(),
             entries: [
                 ProofColdFileJournal.Entry(
@@ -369,6 +370,7 @@ private struct ProofColdFileJournal: Codable {
     let transactionID: UUID
     let safetySnapshotID: UUID
     let replacementProcessIdentifier: Int32
+    let state: String
     let createdAt: Date
     let entries: [Entry]
 }
