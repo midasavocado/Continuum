@@ -41,10 +41,32 @@ public actor ColdProcessRestorer {
         let replacedBytes: UInt64
     }
 
+    private struct ColdFileTransactionJournal: Codable, Sendable {
+        struct Entry: Codable, Sendable {
+            let originalPath: String
+            let device: UInt64
+            let inode: UInt64
+            let installedSHA256: String
+        }
+
+        let formatVersion: Int
+        let transactionID: UUID
+        let safetySnapshotID: UUID
+        let replacementProcessIdentifier: Int32
+        let createdAt: Date
+        let entries: [Entry]
+    }
+
     private let bootstrapLibraryPath: String?
+    private let fileSafetyRootURL: URL
     private var preparedReplacements: [UUID: PreparedReplacement] = [:]
 
-    public init(bootstrapLibraryURL: URL? = nil) {
+    public init(
+        bootstrapLibraryURL: URL? = nil,
+        fileSafetyRootURL: URL? = nil
+    ) {
+        self.fileSafetyRootURL = fileSafetyRootURL
+            ?? Self.defaultFileSafetyRootURL()
         if let bootstrapLibraryURL {
             self.bootstrapLibraryPath = bootstrapLibraryURL.standardizedFileURL.path
         } else if let environmentPath = ProcessInfo.processInfo.environment[
@@ -71,6 +93,9 @@ public actor ColdProcessRestorer {
         from snapshotID: SnapshotID,
         repository: any SnapshotRepository
     ) async throws -> ColdProcessPreparation {
+        if preparedReplacements.isEmpty {
+            _ = try recoverInterruptedFileTransactions()
+        }
         let manifest = try await repository.artifact(
             for: snapshotID,
             logicalName: "durable-checkpoint-v3.json"
@@ -490,7 +515,9 @@ public actor ColdProcessRestorer {
         }
 
         let fileRollback = try await Self.beginFileReplacement(
-            fileReplacements
+            fileReplacements,
+            replacementProcessIdentifier: replacementProcessIdentifier,
+            safetyRootURL: fileSafetyRootURL
         )
         let preparationID = UUID()
         preparedReplacements[preparationID] = PreparedReplacement(
@@ -539,6 +566,58 @@ public actor ColdProcessRestorer {
         }
         continuum_remote_session_destroy(replacement.session)
         preparedReplacements.removeValue(forKey: preparationID)
+    }
+
+    @discardableResult
+    public func recoverInterruptedFileTransactions() throws -> Int {
+        guard preparedReplacements.isEmpty else {
+            throw ContinuumError.transactionInProgress
+        }
+        guard FileManager.default.fileExists(atPath: fileSafetyRootURL.path) else {
+            return 0
+        }
+        let roots = try FileManager.default.contentsOfDirectory(
+            at: fileSafetyRootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        var recovered = 0
+        for rootURL in roots {
+            let values = try rootURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard values.isDirectory == true else { continue }
+            let journal = try Self.readFileTransactionJournal(rootURL: rootURL)
+            guard journal.formatVersion == 1,
+                  journal.transactionID.uuidString == rootURL.lastPathComponent else {
+                throw ContinuumError.integrityFailure(
+                    "A durable cold-file transaction journal has an invalid identity."
+                )
+            }
+            guard Self.processIsAbsent(
+                journal.replacementProcessIdentifier
+            ) else {
+                throw ContinuumError.restoreUnavailable(
+                    "An interrupted cold replacement is still running; Continuum will not touch its files."
+                )
+            }
+            for entry in journal.entries {
+                guard try Self.fileIdentity(
+                    atPath: entry.originalPath
+                ) == (entry.device, entry.inode),
+                      try Self.sha256File(atPath: entry.originalPath)
+                        == entry.installedSHA256 else {
+                    throw ContinuumError.integrityFailure(
+                        "A file changed after an interrupted cold restore. Continuum preserved the safety transaction at \(rootURL.path) instead of overwriting newer bytes."
+                    )
+                }
+            }
+            let store = try APFSLocalFileCheckpointStore(rootURL: rootURL)
+            _ = try store.restoreCoherently(
+                snapshotID: journal.safetySnapshotID
+            )
+            try FileManager.default.removeItem(at: rootURL)
+            recovered += 1
+        }
+        return recovered
     }
 
     private func validate(_ image: DurableCheckpointImage) throws {
@@ -779,14 +858,26 @@ public actor ColdProcessRestorer {
     }
 
     private static func beginFileReplacement(
-        _ replacements: [LocalFileReplacement]
+        _ replacements: [LocalFileReplacement],
+        replacementProcessIdentifier: Int32,
+        safetyRootURL: URL
     ) async throws -> PreparedFileRollback? {
         guard !replacements.isEmpty else { return nil }
-        let rootURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "com.midas.continuum-cold-file-safety-\(UUID().uuidString)",
-                isDirectory: true
+        do {
+            try FileManager.default.createDirectory(
+                at: safetyRootURL,
+                withIntermediateDirectories: true
             )
+        } catch {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not create its durable cold-file transaction directory."
+            )
+        }
+        let transactionID = UUID()
+        let rootURL = safetyRootURL.appendingPathComponent(
+            transactionID.uuidString,
+            isDirectory: true
+        )
         let store: APFSLocalFileCheckpointStore
         do {
             store = try APFSLocalFileCheckpointStore(rootURL: rootURL)
@@ -805,6 +896,25 @@ public actor ColdProcessRestorer {
                 }
             )
             safetyCaptured = true
+            let journal = ColdFileTransactionJournal(
+                formatVersion: 1,
+                transactionID: transactionID,
+                safetySnapshotID: safetySnapshotID,
+                replacementProcessIdentifier: replacementProcessIdentifier,
+                createdAt: Date(),
+                entries: replacements.map {
+                    ColdFileTransactionJournal.Entry(
+                        originalPath: $0.originalPath,
+                        device: $0.device,
+                        inode: $0.inode,
+                        installedSHA256: sha256($0.data)
+                    )
+                }
+            )
+            try writeFileTransactionJournal(
+                journal,
+                rootURL: rootURL
+            )
             let report = try store.replaceCoherently(replacements)
             var byteCount: UInt64 = 0
             for replacement in replacements {
@@ -972,6 +1082,113 @@ public actor ColdProcessRestorer {
             )
         }
         return artifact.data
+    }
+
+    private static func readFileTransactionJournal(
+        rootURL: URL
+    ) throws -> ColdFileTransactionJournal {
+        let journalURL = rootURL.appendingPathComponent(
+            "ColdFileTransaction.json",
+            isDirectory: false
+        )
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        do {
+            return try decoder.decode(
+                ColdFileTransactionJournal.self,
+                from: Data(contentsOf: journalURL)
+            )
+        } catch {
+            throw ContinuumError.integrityFailure(
+                "A durable cold-file transaction journal could not be decoded."
+            )
+        }
+    }
+
+    private static func fileIdentity(
+        atPath path: String
+    ) throws -> (UInt64, UInt64) {
+        var info = stat()
+        guard path.withCString({ lstat($0, &info) }) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG else {
+            throw ContinuumError.integrityFailure(
+                "A cold-file transaction target is missing or no longer regular."
+            )
+        }
+        return (UInt64(info.st_dev), UInt64(info.st_ino))
+    }
+
+    private static func sha256File(atPath path: String) throws -> String {
+        let descriptor = path.withCString {
+            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw ContinuumError.integrityFailure(
+                "A cold-file transaction target could not be opened for validation."
+            )
+        }
+        defer { Darwin.close(descriptor) }
+        var hasher = SHA256()
+        var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+            if count == 0 { break }
+            guard count > 0 else {
+                if errno == EINTR { continue }
+                throw ContinuumError.integrityFailure(
+                    "A cold-file transaction target changed during validation."
+                )
+            }
+            hasher.update(data: Data(buffer[0..<count]))
+        }
+        return hasher.finalize().map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
+    private static func writeFileTransactionJournal(
+        _ journal: ColdFileTransactionJournal,
+        rootURL: URL
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(journal)
+        let journalURL = rootURL.appendingPathComponent(
+            "ColdFileTransaction.json",
+            isDirectory: false
+        )
+        try data.write(to: journalURL, options: .atomic)
+        let descriptor = rootURL.path.withCString {
+            Darwin.open($0, O_RDONLY | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw ContinuumError.integrityFailure(
+                "Continuum wrote the cold-file journal but could not open its transaction directory for synchronization."
+            )
+        }
+        defer { Darwin.close(descriptor) }
+        guard fsync(descriptor) == 0 else {
+            throw ContinuumError.integrityFailure(
+                "Continuum could not durably synchronize the cold-file transaction journal."
+            )
+        }
+    }
+
+    private static func defaultFileSafetyRootURL() -> URL {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support")
+        return applicationSupport
+            .appendingPathComponent("Continuum", isDirectory: true)
+            .appendingPathComponent(
+                "ColdFileTransactions",
+                isDirectory: true
+            )
     }
 
     private static func legacyMemoryArtifactName(

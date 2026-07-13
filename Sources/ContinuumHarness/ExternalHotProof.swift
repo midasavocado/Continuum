@@ -723,6 +723,10 @@ enum ExternalHotProof {
             "hot-file-root",
             isDirectory: true
         )
+        let coldFileSafetyRoot = coldProofRoot.appendingPathComponent(
+            "cold-file-transactions",
+            isDirectory: true
+        )
         let savedFileBytes = Data("continuum-cold-saved-A".utf8)
         let futureFileBytes = Data("continuum-cold-future-B-and-more".utf8)
         try savedFileBytes.write(to: coldFileURL)
@@ -828,7 +832,8 @@ enum ExternalHotProof {
         originalWasReaped = true
 
         let restorer = ColdProcessRestorer(
-            bootstrapLibraryURL: URL(fileURLWithPath: bootstrapLibraryPath)
+            bootstrapLibraryURL: URL(fileURLWithPath: bootstrapLibraryPath),
+            fileSafetyRootURL: coldFileSafetyRoot
         )
         let preparation = try await restorer.prepareRootProcess(
             from: saved.id,
@@ -865,6 +870,18 @@ enum ExternalHotProof {
                 && preparedFileInode == originalFileInode,
             "cold restorer did not install the saved local file bytes in place"
         )
+        let transactionRoots = try FileManager.default.contentsOfDirectory(
+            at: coldFileSafetyRoot,
+            includingPropertiesForKeys: nil
+        )
+        try require(
+            transactionRoots.count == 1
+                && FileManager.default.fileExists(
+                    atPath: transactionRoots[0]
+                        .appendingPathComponent("ColdFileTransaction.json").path
+                ),
+            "cold restorer did not durably journal its file rollback"
+        )
         try await restorer.discard(preparation.id)
         let rolledBackFileBytes = try Data(contentsOf: coldFileURL)
         let rolledBackFileInode = try fileInode(coldFileURL)
@@ -872,6 +889,14 @@ enum ExternalHotProof {
             rolledBackFileBytes == futureFileBytes
                 && rolledBackFileInode == originalFileInode,
             "discarding cold preparation did not restore the abandoned current file bytes"
+        )
+        let remainingTransactions = try FileManager.default.contentsOfDirectory(
+            at: coldFileSafetyRoot,
+            includingPropertiesForKeys: nil
+        )
+        try require(
+            remainingTransactions.isEmpty,
+            "successful cold rollback left a stale durable transaction journal"
         )
         return preparation
     }

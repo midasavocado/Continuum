@@ -1,5 +1,7 @@
 import ContinuumCore
 import ContinuumStore
+import ContinuumSystem
+import CryptoKit
 import Foundation
 
 enum TransactionProof {
@@ -132,6 +134,74 @@ enum TransactionProof {
                 && inodeAfterRollback == originalInode,
             "file safety rollback did not restore the abandoned current bytes"
         )
+
+        let coldTransactionRoot = rootURL.appendingPathComponent(
+            "cold-file-transactions",
+            isDirectory: true
+        )
+        let coldTransactionID = UUID()
+        let coldTransactionURL = coldTransactionRoot.appendingPathComponent(
+            coldTransactionID.uuidString,
+            isDirectory: true
+        )
+        let coldSafetyStore = try APFSLocalFileCheckpointStore(
+            rootURL: coldTransactionURL
+        )
+        let coldSafetySnapshotID = UUID()
+        _ = try await coldSafetyStore.capture(
+            snapshotID: coldSafetySnapshotID,
+            files: [liveFileURL]
+        )
+        _ = try coldSafetyStore.replaceCoherently([
+            LocalFileReplacement(
+                originalPath: savedEntry.originalPath,
+                device: savedEntry.device,
+                inode: savedEntry.inode,
+                mode: savedEntry.mode,
+                data: savedFileBytes
+            )
+        ])
+        let coldJournal = ProofColdFileJournal(
+            formatVersion: 1,
+            transactionID: coldTransactionID,
+            safetySnapshotID: coldSafetySnapshotID,
+            replacementProcessIdentifier: Int32.max,
+            createdAt: Date(),
+            entries: [
+                ProofColdFileJournal.Entry(
+                    originalPath: savedEntry.originalPath,
+                    device: savedEntry.device,
+                    inode: savedEntry.inode,
+                    installedSHA256: SHA256.hash(data: savedFileBytes).map {
+                        String(format: "%02x", $0)
+                    }.joined()
+                )
+            ]
+        )
+        let journalEncoder = JSONEncoder()
+        journalEncoder.dateEncodingStrategy = .iso8601
+        try journalEncoder.encode(coldJournal).write(
+            to: coldTransactionURL.appendingPathComponent(
+                "ColdFileTransaction.json"
+            ),
+            options: .atomic
+        )
+        let coldRestorer = ColdProcessRestorer(
+            fileSafetyRootURL: coldTransactionRoot
+        )
+        let recoveredTransactions = try await coldRestorer
+            .recoverInterruptedFileTransactions()
+        let recoveredFileBytes = try Data(contentsOf: liveFileURL)
+        let remainingColdTransactions = try fileManager.contentsOfDirectory(
+            at: coldTransactionRoot,
+            includingPropertiesForKeys: nil
+        )
+        try require(
+            recoveredTransactions == 1
+                && recoveredFileBytes == futureFileBytes
+                && remainingColdTransactions.isEmpty,
+            "durable cold-file recovery did not restore and retire its journal"
+        )
         try fileManager.removeItem(at: fileCheckpointRoot)
         try fileManager.removeItem(at: liveFileURL)
 
@@ -213,4 +283,20 @@ enum TransactionProof {
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         guard condition() else { throw HarnessFailure.invariant(message) }
     }
+}
+
+private struct ProofColdFileJournal: Codable {
+    struct Entry: Codable {
+        let originalPath: String
+        let device: UInt64
+        let inode: UInt64
+        let installedSHA256: String
+    }
+
+    let formatVersion: Int
+    let transactionID: UUID
+    let safetySnapshotID: UUID
+    let replacementProcessIdentifier: Int32
+    let createdAt: Date
+    let entries: [Entry]
 }
