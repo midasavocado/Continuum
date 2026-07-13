@@ -355,6 +355,10 @@ enum ExternalHotProof {
         print(
             "  cold file descriptors: \(coldMemory.reconstructedFileDescriptorCount) reopened"
         )
+        print(
+            "  cold local files:      \(coldMemory.reconstructedFileCount) file, "
+                + "\(coldMemory.reconstructedFileBytes) bytes restored + rolled back"
+        )
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -704,6 +708,25 @@ enum ExternalHotProof {
                 "cold proof bootstrap library is missing"
             )
         }
+        let coldProofRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "continuum-cold-file-proof-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: coldProofRoot,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: coldProofRoot) }
+        let coldFileURL = coldProofRoot.appendingPathComponent("state.bin")
+        let coldFileCheckpointRoot = coldProofRoot.appendingPathComponent(
+            "hot-file-root",
+            isDirectory: true
+        )
+        let savedFileBytes = Data("continuum-cold-saved-A".utf8)
+        let futureFileBytes = Data("continuum-cold-future-B-and-more".utf8)
+        try savedFileBytes.write(to: coldFileURL)
+        let originalFileInode = try fileInode(coldFileURL)
         var environment = ProcessInfo.processInfo.environment.map {
             "\($0.key)=\($0.value)"
         }.filter {
@@ -718,7 +741,11 @@ enum ExternalHotProof {
         environment.append("CONTINUUM_BOOTSTRAP_STOP=1")
         environment.append("MallocLargeCache=0")
         environment.append("DYLD_INSERT_LIBRARIES=\(bootstrapLibraryPath)")
-        let arguments = [targetPath, "--continuum-idle-child"]
+        let arguments = [
+            targetPath,
+            "--continuum-cold-child",
+            coldFileURL.path
+        ]
 
         var originalProcessIdentifier: Int32 = 0
         let spawnStatus = withCStringArray(arguments) { argumentEntries in
@@ -760,7 +787,8 @@ enum ExternalHotProof {
 
         let service = HotProcessCheckpointService(
             maximumCapturedBytes: fullProcessCaptureBudget,
-            maximumRetainedSnapshots: 2
+            maximumRetainedSnapshots: 2,
+            fileCheckpointRootURL: coldFileCheckpointRoot
         )
         let app = AppIdentity(
             bundleIdentifier: nil,
@@ -777,6 +805,10 @@ enum ExternalHotProof {
             processIdentifiers: [originalProcessIdentifier],
             kind: .manual,
             branchID: UUID()
+        )
+        try replaceFileBytesPreservingInode(
+            at: coldFileURL,
+            with: futureFileBytes
         )
         let storeRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -823,8 +855,79 @@ enum ExternalHotProof {
             preparation.reconstructedFileDescriptorCount > 0,
             "cold restorer did not reconstruct the root process's writable descriptors"
         )
+        let preparedFileBytes = try Data(contentsOf: coldFileURL)
+        let preparedFileInode = try fileInode(coldFileURL)
+        try require(
+            preparation.reconstructedFileCount == 1
+                && preparation.reconstructedFileBytes
+                    == UInt64(savedFileBytes.count)
+                && preparedFileBytes == savedFileBytes
+                && preparedFileInode == originalFileInode,
+            "cold restorer did not install the saved local file bytes in place"
+        )
         await restorer.discard(preparation.id)
+        let rolledBackFileBytes = try Data(contentsOf: coldFileURL)
+        let rolledBackFileInode = try fileInode(coldFileURL)
+        try require(
+            rolledBackFileBytes == futureFileBytes
+                && rolledBackFileInode == originalFileInode,
+            "discarding cold preparation did not restore the abandoned current file bytes"
+        )
         return preparation
+    }
+
+    private static func fileInode(_ url: URL) throws -> UInt64 {
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: url.path
+        )
+        guard let inode = attributes[.systemFileNumber] as? NSNumber else {
+            throw ExternalHotProofFailure.invariant(
+                "proof file inode is unavailable"
+            )
+        }
+        return inode.uint64Value
+    }
+
+    private static func replaceFileBytesPreservingInode(
+        at url: URL,
+        with data: Data
+    ) throws {
+        let descriptor = url.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw ExternalHotProofFailure.invariant(
+                "proof file could not be opened"
+            )
+        }
+        defer { Darwin.close(descriptor) }
+        guard ftruncate(descriptor, off_t(data.count)) == 0 else {
+            throw ExternalHotProofFailure.invariant(
+                "proof file could not be resized"
+            )
+        }
+        var offset = 0
+        while offset < data.count {
+            let written = data.withUnsafeBytes { bytes in
+                pwrite(
+                    descriptor,
+                    bytes.baseAddress?.advanced(by: offset),
+                    data.count - offset,
+                    off_t(offset)
+                )
+            }
+            guard written > 0 else {
+                throw ExternalHotProofFailure.invariant(
+                    "proof file write failed"
+                )
+            }
+            offset += written
+        }
+        guard fsync(descriptor) == 0 else {
+            throw ExternalHotProofFailure.invariant(
+                "proof file sync failed"
+            )
+        }
     }
 
     private static func withCStringArray<Result>(

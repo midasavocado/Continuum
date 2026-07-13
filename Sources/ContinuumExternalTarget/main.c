@@ -415,6 +415,20 @@ int main(int argc, char **argv) {
         }
         return EXIT_SUCCESS;
     }
+    if (argc > 2 && strcmp(argv[1], "--continuum-cold-child") == 0) {
+        int descriptor = open(argv[2], O_RDWR | O_NOFOLLOW);
+        if (descriptor < 0 || lseek(descriptor, 3, SEEK_SET) != 3) {
+            if (descriptor >= 0) {
+                close(descriptor);
+            }
+            return EXIT_FAILURE;
+        }
+        while (getppid() != 1) {
+            usleep(100000);
+        }
+        close(descriptor);
+        return EXIT_SUCCESS;
+    }
     target_state target;
     memset(&target, 0, sizeof(target));
     target.probe_descriptor = -1;

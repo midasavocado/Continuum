@@ -1,5 +1,6 @@
 import ContinuumCore
 import ContinuumRuntime
+import ContinuumStore
 import CryptoKit
 import Darwin
 import Foundation
@@ -16,6 +17,8 @@ public struct ColdProcessPreparation: Hashable, Sendable {
     public let reconstructedThreadStateBytes: UInt64
     public let replacementThreadIdentifier: UInt64
     public let reconstructedFileDescriptorCount: Int
+    public let reconstructedFileCount: Int
+    public let reconstructedFileBytes: UInt64
 }
 
 /// Rebuilds a durable process image into a disposable child that remains
@@ -27,6 +30,15 @@ public actor ColdProcessRestorer {
     private struct PreparedReplacement: @unchecked Sendable {
         let processIdentifier: Int32
         let session: OpaquePointer
+        let fileRollback: PreparedFileRollback?
+    }
+
+    private struct PreparedFileRollback: Sendable {
+        let store: APFSLocalFileCheckpointStore
+        let snapshotID: UUID
+        let rootURL: URL
+        let replacedFileCount: Int
+        let replacedBytes: UInt64
     }
 
     private let bootstrapLibraryPath: String?
@@ -51,6 +63,7 @@ public actor ColdProcessRestorer {
         for replacement in preparedReplacements.values {
             continuum_remote_session_destroy(replacement.session)
             Self.killAndReap(replacement.processIdentifier)
+            Self.rollbackFiles(replacement.fileRollback)
         }
     }
 
@@ -93,6 +106,13 @@ public actor ColdProcessRestorer {
             )
         }
         try validateExecutable(process: process, launch: launch)
+        guard image.members.allSatisfy({
+            Self.processIsAbsent($0.processIdentifier)
+        }) else {
+            throw ContinuumError.restoreUnavailable(
+                "Cold restoration requires the captured process tree to be fully exited."
+            )
+        }
         guard let bootstrapLibraryPath,
               FileManager.default.fileExists(atPath: bootstrapLibraryPath) else {
             throw ContinuumError.restoreUnavailable(
@@ -148,6 +168,12 @@ public actor ColdProcessRestorer {
         let descriptorPlan = try Self.bootstrapDescriptorPlan(
             rootDescriptors,
             files: image.writableFiles
+        )
+        let fileReplacements = try await Self.fileReplacements(
+            descriptors: rootDescriptors,
+            files: image.writableFiles,
+            snapshotID: snapshotID,
+            repository: repository
         )
         try Self.writeBootstrapDescriptorPlan(
             descriptorPlan,
@@ -463,10 +489,14 @@ public actor ColdProcessRestorer {
             )
         }
 
+        let fileRollback = try await Self.beginFileReplacement(
+            fileReplacements
+        )
         let preparationID = UUID()
         preparedReplacements[preparationID] = PreparedReplacement(
             processIdentifier: replacementProcessIdentifier,
-            session: session
+            session: session,
+            fileRollback: fileRollback
         )
         retained = true
         return ColdProcessPreparation(
@@ -480,7 +510,9 @@ public actor ColdProcessRestorer {
             reconstructedThreadCount: 1,
             reconstructedThreadStateBytes: threadStateBytes,
             replacementThreadIdentifier: threadReport.replacement_thread_identifier,
-            reconstructedFileDescriptorCount: rootDescriptors.count
+            reconstructedFileDescriptorCount: rootDescriptors.count,
+            reconstructedFileCount: fileRollback?.replacedFileCount ?? 0,
+            reconstructedFileBytes: fileRollback?.replacedBytes ?? 0
         )
     }
 
@@ -492,6 +524,7 @@ public actor ColdProcessRestorer {
         }
         continuum_remote_session_destroy(replacement.session)
         Self.killAndReap(replacement.processIdentifier)
+        Self.rollbackFiles(replacement.fileRollback)
     }
 
     private func validate(_ image: DurableCheckpointImage) throws {
@@ -646,6 +679,179 @@ public actor ColdProcessRestorer {
         identity.image_base = imageBase
         identity.copy_address = address
         return identity
+    }
+
+    private static func processIsAbsent(_ processIdentifier: Int32) -> Bool {
+        errno = 0
+        return kill(processIdentifier, 0) != 0 && errno == ESRCH
+    }
+
+    private static func fileReplacements(
+        descriptors: [DurableWritableFileDescriptor],
+        files: [DurableFileImage],
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository
+    ) async throws -> [LocalFileReplacement] {
+        var paths: Set<String> = []
+        var replacements: [LocalFileReplacement] = []
+        for descriptor in descriptors where paths.insert(
+            descriptor.originalPath
+        ).inserted {
+            guard let file = files.first(where: {
+                $0.originalPath == descriptor.originalPath
+                    && $0.device == descriptor.device
+                    && $0.inode == descriptor.inode
+                    && $0.mode == descriptor.mode
+            }) else {
+                throw ContinuumError.integrityFailure(
+                    "The durable descriptor references a missing file image."
+                )
+            }
+            let data = try await durableFileData(
+                file,
+                snapshotID: snapshotID,
+                repository: repository
+            )
+            replacements.append(LocalFileReplacement(
+                originalPath: file.originalPath,
+                device: file.device,
+                inode: file.inode,
+                mode: file.mode,
+                data: data
+            ))
+        }
+        return replacements.sorted { $0.originalPath < $1.originalPath }
+    }
+
+    private static func durableFileData(
+        _ file: DurableFileImage,
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository
+    ) async throws -> Data {
+        guard file.byteCount <= UInt64(Int.max) else {
+            throw ContinuumError.restoreUnavailable(
+                "A durable local file is too large for this Continuum build."
+            )
+        }
+        var data = Data()
+        data.reserveCapacity(Int(file.byteCount))
+        for (index, reference) in file.chunks.enumerated() {
+            guard reference.logicalBytes > 0,
+                  reference.logicalBytes <= UInt64(Int.max),
+                  let logicalName = reference.artifactName else {
+                throw ContinuumError.integrityFailure(
+                    "A durable file block has invalid metadata."
+                )
+            }
+            let artifact = try await repository.artifact(
+                for: snapshotID,
+                logicalName: logicalName
+            )
+            guard artifact.kind == .fileBlock,
+                  UInt64(artifact.data.count) == reference.logicalBytes,
+                  sha256(artifact.data) == reference.hash else {
+                throw ContinuumError.integrityFailure(
+                    "File block \(index) for \(file.originalPath) failed validation."
+                )
+            }
+            data.append(artifact.data)
+        }
+        guard UInt64(data.count) == file.byteCount else {
+            throw ContinuumError.integrityFailure(
+                "The durable file image for \(file.originalPath) is incomplete."
+            )
+        }
+        return data
+    }
+
+    private static func beginFileReplacement(
+        _ replacements: [LocalFileReplacement]
+    ) async throws -> PreparedFileRollback? {
+        guard !replacements.isEmpty else { return nil }
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "com.midas.continuum-cold-file-safety-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        let store: APFSLocalFileCheckpointStore
+        do {
+            store = try APFSLocalFileCheckpointStore(rootURL: rootURL)
+        } catch {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not create a cold file safety root."
+            )
+        }
+        let safetySnapshotID = UUID()
+        var safetyCaptured = false
+        do {
+            _ = try await store.capture(
+                snapshotID: safetySnapshotID,
+                files: replacements.map {
+                    URL(fileURLWithPath: $0.originalPath)
+                }
+            )
+            safetyCaptured = true
+            let report = try store.replaceCoherently(replacements)
+            var byteCount: UInt64 = 0
+            for replacement in replacements {
+                let (next, overflow) = byteCount.addingReportingOverflow(
+                    UInt64(replacement.data.count)
+                )
+                guard !overflow else {
+                    throw ContinuumError.integrityFailure(
+                        "The cold file transaction exceeds numeric limits."
+                    )
+                }
+                byteCount = next
+            }
+            guard report.restoredFileCount == replacements.count,
+                  byteCount <= UInt64(Int64.max),
+                  report.restoredBytes == Int64(byteCount) else {
+                throw ContinuumError.integrityFailure(
+                    "The cold file transaction returned an incomplete report."
+                )
+            }
+            return PreparedFileRollback(
+                store: store,
+                snapshotID: safetySnapshotID,
+                rootURL: rootURL,
+                replacedFileCount: replacements.count,
+                replacedBytes: byteCount
+            )
+        } catch {
+            if safetyCaptured {
+                do {
+                    _ = try store.restoreCoherently(
+                        snapshotID: safetySnapshotID
+                    )
+                } catch {
+                    throw ContinuumError.integrityFailure(
+                        "Cold file replacement failed and its safety rollback also failed."
+                    )
+                }
+            }
+            try? FileManager.default.removeItem(at: rootURL)
+            if let continuumError = error as? ContinuumError {
+                throw continuumError
+            }
+            throw ContinuumError.restoreUnavailable(
+                "Cold file replacement failed: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private static func rollbackFiles(
+        _ rollback: PreparedFileRollback?
+    ) {
+        guard let rollback else { return }
+        do {
+            _ = try rollback.store.restoreCoherently(
+                snapshotID: rollback.snapshotID
+            )
+            try? FileManager.default.removeItem(at: rollback.rootURL)
+        } catch {
+            // Keep the safety clone available for manual recovery.
+        }
     }
 
     private static func bootstrapDescriptorPlan(
