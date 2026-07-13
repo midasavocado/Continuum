@@ -24,12 +24,32 @@ final class ContinuumRuntimeTests: XCTestCase {
             ),
             0
         )
-        XCTAssertEqual(report.version, 1)
+        XCTAssertEqual(report.version, 2)
         XCTAssertEqual(report.requested_count, 1)
         XCTAssertEqual(report.created_count, 1)
         XCTAssertEqual(report.error_code, 0)
         XCTAssertNotEqual(report.pthread_addresses.0, 0)
         XCTAssertNotEqual(report.mach_thread_ports.0, 0)
+        XCTAssertNotEqual(report.stack_base_addresses.0, 0)
+        XCTAssertGreaterThan(report.stack_lengths.0, 0)
+        XCTAssertNotEqual(report.pthread_region_addresses.0, 0)
+        XCTAssertGreaterThan(report.pthread_region_lengths.0, 0)
+
+        let pthreadAddress = report.pthread_addresses.0
+        let stackBase = report.stack_base_addresses.0
+        let (stackEnd, stackOverflow) = stackBase.addingReportingOverflow(
+            report.stack_lengths.0
+        )
+        let regionBase = report.pthread_region_addresses.0
+        let (regionEnd, regionOverflow) = regionBase.addingReportingOverflow(
+            report.pthread_region_lengths.0
+        )
+        XCTAssertFalse(stackOverflow)
+        XCTAssertFalse(regionOverflow)
+        XCTAssertGreaterThanOrEqual(stackBase, regionBase)
+        XCTAssertLessThanOrEqual(stackEnd, regionEnd)
+        XCTAssertGreaterThanOrEqual(pthreadAddress, regionBase)
+        XCTAssertLessThan(pthreadAddress, regionEnd)
 
         let machThread = mach_port_t(report.mach_thread_ports.0)
         XCTAssertEqual(thread_resume(machThread), KERN_SUCCESS)

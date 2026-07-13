@@ -27,11 +27,16 @@ typedef struct continuum_bootstrap_pthread_report {
     int32_t error_code;
     uint64_t pthread_addresses[CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT];
     uint32_t mach_thread_ports[CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT];
+    uint64_t stack_base_addresses[CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT];
+    uint64_t stack_lengths[CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT];
+    uint64_t pthread_region_addresses[CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT];
+    uint64_t pthread_region_lengths[CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT];
 } continuum_bootstrap_pthread_report;
 
 /// Creates ordinary pthreads with one libpthread suspension each. On partial
-/// failure, every successfully created pthread remains suspended and is
-/// described by the report; the owner must either release them or terminate
+/// failure, every successfully created pthread remains suspended. The report
+/// includes its pthread address, Mach name, usable stack, and containing
+/// writable VM region; the owner must either release the threads or terminate
 /// the disposable process.
 int continuum_bootstrap_prepare_suspended_pthreads(
     continuum_bootstrap_pthread_report *report,

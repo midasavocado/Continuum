@@ -34,6 +34,62 @@ void continuum_bootstrap_copy_and_trap(
     __builtin_unreachable();
 }
 
+static int continuum_bootstrap_pthread_geometry(
+    pthread_t thread,
+    uint64_t *out_stack_base,
+    uint64_t *out_stack_length,
+    uint64_t *out_region_address,
+    uint64_t *out_region_length
+) {
+    uintptr_t stack_top = (uintptr_t)pthread_get_stackaddr_np(thread);
+    size_t stack_length = pthread_get_stacksize_np(thread);
+    uintptr_t pthread_address = (uintptr_t)thread;
+    if (stack_top == 0 || stack_length == 0 || stack_length > stack_top
+        || pthread_address == 0 || out_stack_base == NULL
+        || out_stack_length == NULL || out_region_address == NULL
+        || out_region_length == NULL) {
+        return EINVAL;
+    }
+
+    mach_vm_address_t region_address = pthread_address;
+    mach_vm_size_t region_length = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    kern_return_t result;
+    for (;;) {
+        memset(&info, 0, sizeof(info));
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        result = mach_vm_region_recurse(
+            mach_task_self(),
+            &region_address,
+            &region_length,
+            &depth,
+            (vm_region_recurse_info_t)&info,
+            &count
+        );
+        if (result != KERN_SUCCESS || !info.is_submap) {
+            break;
+        }
+        depth += 1;
+    }
+    uint64_t stack_base = stack_top - stack_length;
+    uint64_t region_end = region_address + region_length;
+    if (result != KERN_SUCCESS || region_length == 0
+        || region_end < region_address || pthread_address < region_address
+        || pthread_address >= region_end
+        || (info.protection & (VM_PROT_READ | VM_PROT_WRITE))
+            != (VM_PROT_READ | VM_PROT_WRITE)
+        || stack_base < region_address
+        || stack_top > region_end) {
+        return EINVAL;
+    }
+    *out_stack_base = stack_base;
+    *out_stack_length = stack_length;
+    *out_region_address = region_address;
+    *out_region_length = region_length;
+    return 0;
+}
+
 static void *continuum_bootstrap_placeholder_start(void *context) {
     return context;
 }
@@ -49,7 +105,7 @@ int continuum_bootstrap_prepare_suspended_pthreads(
         return EINVAL;
     }
     memset(report, 0, sizeof(*report));
-    report->version = 1;
+    report->version = 2;
     report->requested_count = requested_count;
 
     for (uint32_t index = 0; index < requested_count; index += 1) {
@@ -70,6 +126,17 @@ int continuum_bootstrap_prepare_suspended_pthreads(
         report->created_count += 1;
         if (!MACH_PORT_VALID(mach_thread)) {
             report->error_code = EINVAL;
+            return report->error_code;
+        }
+        result = continuum_bootstrap_pthread_geometry(
+            thread,
+            &report->stack_base_addresses[index],
+            &report->stack_lengths[index],
+            &report->pthread_region_addresses[index],
+            &report->pthread_region_lengths[index]
+        );
+        if (result != 0) {
+            report->error_code = result;
             return report->error_code;
         }
     }
