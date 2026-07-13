@@ -228,6 +228,9 @@ typedef struct continuum_remote_thread_set_reconstruction_report {
     uint64_t general_state_bytes;
     uint64_t vector_state_bytes;
     uint64_t primary_replacement_thread_identifier;
+    uint64_t validation_thread_index;
+    uint64_t validation_address;
+    uint32_t validation_kind;
     uint8_t all_states_verified;
     uint8_t rollback_attempted;
     uint8_t rollback_verified;
@@ -602,10 +605,23 @@ continuum_status continuum_remote_session_reconstruct_raw_thread_set(
     continuum_remote_thread_set_reconstruction_report *out_report
 );
 
+/// Reconstructs a captured thread set after preparing an exact replacement
+/// pthread set. Inputs with a nonzero thread handle must match one prepared
+/// pthread exactly; inputs with both a zero handle and zero dispatch identity
+/// are recreated as raw Mach threads. Every state write is read back, and a
+/// failure restores all modified pthread states and terminates every raw thread
+/// created by this call.
+continuum_status continuum_remote_session_reconstruct_prepared_thread_set(
+    continuum_remote_session *session,
+    const continuum_remote_thread_reconstruction_input *threads,
+    size_t thread_count,
+    continuum_remote_thread_set_reconstruction_report *out_report
+);
+
 /// Detaches a reconstructed direct child from ptrace while its task suspension
 /// still prevents any reconstructed thread from running, then releases exactly
 /// the suspension owned by Continuum. This is the commit boundary for a thread
-/// set reconstructed by continuum_remote_session_reconstruct_raw_thread_set.
+/// set reconstructed by either thread-set reconstruction function above.
 continuum_status continuum_remote_session_release_entry_stopped_child(
     continuum_remote_session *session,
     int32_t process_id

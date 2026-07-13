@@ -338,7 +338,7 @@ enum ExternalHotProof {
         print("  resource A->B gate:  unchanged")
         print("  additive Mach rights: accepted; saved rights remained identity-valid")
         print("  additive descendant: accepted; captured process identities remained valid")
-        print("  coherent open files: root + helper APFS bytes restored")
+        print("  local files:         deliberately unchanged by restore")
         print("  descriptor mutation: rejected before memory write")
         print("  app backend adapter: captured + restored live snapshot state")
         print("  cold replacement:    deterministic layout + saved arena bytes, stopped before main")
@@ -352,13 +352,8 @@ enum ExternalHotProof {
                 + "\(coldMemory.reconstructedThreadStateBytes) bytes, replacement ID "
                 + "\(coldMemory.replacementThreadIdentifier)"
         )
-        print(
-            "  cold file descriptors: \(coldMemory.reconstructedFileDescriptorCount) reopened"
-        )
-        print(
-            "  cold local files:      \(coldMemory.reconstructedFileCount) file, "
-                + "\(coldMemory.reconstructedFileBytes) bytes restored + rolled back"
-        )
+        print("  cold file descriptors: excluded from process-only restore")
+        print("  cold local files:      unchanged and never transactionally replaced")
         print("  cold continuation:     committed replacement detached from ptrace")
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
@@ -377,16 +372,9 @@ enum ExternalHotProof {
         helperSession: OpaquePointer,
         expectedStateB: String
     ) async throws -> DurableCheckpointImage {
-        let fileCheckpointRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "continuum-shipping-hot-proof-\(UUID().uuidString)",
-                isDirectory: true
-            )
-        defer { try? FileManager.default.removeItem(at: fileCheckpointRoot) }
         let service = HotProcessCheckpointService(
             maximumCapturedBytes: fullProcessCaptureBudget,
-            maximumRetainedSnapshots: 2,
-            fileCheckpointRootURL: fileCheckpointRoot
+            maximumRetainedSnapshots: 2
         )
         let app = AppIdentity(
             bundleIdentifier: nil,
@@ -449,21 +437,9 @@ enum ExternalHotProof {
             "reopened durable checkpoint omitted the process relaunch contract"
         )
         try require(
-            !durableImage.writableFileDescriptors.isEmpty
-                && durableImage.writableFiles.allSatisfy { file in
-                    file.chunks.reduce(UInt64(0)) {
-                        $0 + $1.logicalBytes
-                    } == file.byteCount
-                }
-                && durableImage.writableFileDescriptors.allSatisfy { descriptor in
-                    durableImage.writableFiles.contains { file in
-                        file.originalPath == descriptor.originalPath
-                            && file.device == descriptor.device
-                            && file.inode == descriptor.inode
-                            && file.mode == descriptor.mode
-                    }
-                },
-            "reopened durable checkpoint omitted coherent file bytes or descriptor ownership"
+            durableImage.writableFiles.isEmpty
+                && !durableImage.writableFileDescriptors.isEmpty,
+            "process-only durable checkpoint stored file bytes or omitted descriptor metadata"
         )
         let durableMemoryChunks = durableImage.members.reduce(into: 0) {
             total, member in
@@ -489,8 +465,8 @@ enum ExternalHotProof {
             $0.domain == .localFiles
         }
         try require(
-            fileCoverage?.mode == .guarded,
-            "shipping backend did not run coherent writable-file inventory"
+            fileCoverage?.mode == .unavailable,
+            "shipping backend incorrectly claimed local-file restoration"
         )
         let liveAvailability = await service.currentRestoreAvailability(
             for: capture.snapshot
@@ -532,10 +508,10 @@ enum ExternalHotProof {
             digest: expectedStateB,
             cycle: 0
         )
-        let restoredFiles = try target.send(command: "validate-file", state: "B")
+        let restoredFiles = try target.send(command: "validate-file", state: "A")
         try require(
             restoredFiles.valid == true && restoredFiles.helperValid == true,
-            "shipping backend did not restore both open files from APFS clones"
+            "shipping backend changed open files during process-only restore"
         )
         return durableImage
     }
@@ -720,10 +696,6 @@ enum ExternalHotProof {
         )
         defer { try? FileManager.default.removeItem(at: coldProofRoot) }
         let coldFileURL = coldProofRoot.appendingPathComponent("state.bin")
-        let coldFileCheckpointRoot = coldProofRoot.appendingPathComponent(
-            "hot-file-root",
-            isDirectory: true
-        )
         let coldFileSafetyRoot = coldProofRoot.appendingPathComponent(
             "cold-file-transactions",
             isDirectory: true
@@ -792,8 +764,7 @@ enum ExternalHotProof {
 
         let service = HotProcessCheckpointService(
             maximumCapturedBytes: fullProcessCaptureBudget,
-            maximumRetainedSnapshots: 2,
-            fileCheckpointRootURL: coldFileCheckpointRoot
+            maximumRetainedSnapshots: 2
         )
         let app = AppIdentity(
             bundleIdentifier: nil,
@@ -847,9 +818,10 @@ enum ExternalHotProof {
         try require(
             preparation.reconstructedRegionCount > 0
                 && preparation.reconstructedChunkCount > 0
+                && preparation.reconstructedBytes > 0
                 && preparation.reconstructedBytes
-                    == UInt64(capture.snapshot.logicalBytes),
-            "cold restorer did not populate the complete durable memory image"
+                    <= UInt64(capture.snapshot.logicalBytes),
+            "cold restorer did not populate the durable process image"
         )
         try require(
             preparation.reconstructedThreadCount == 2
@@ -858,30 +830,21 @@ enum ExternalHotProof {
             "cold restorer did not reconstruct and verify both saved thread states"
         )
         try require(
-            preparation.reconstructedFileDescriptorCount > 0,
-            "cold restorer did not reconstruct the root process's writable descriptors"
+            preparation.reconstructedFileDescriptorCount == 0
+                && preparation.reconstructedFileCount == 0
+                && preparation.reconstructedFileBytes == 0,
+            "process-only cold restore reconstructed file state"
         )
         let preparedFileBytes = try Data(contentsOf: coldFileURL)
         let preparedFileInode = try fileInode(coldFileURL)
         try require(
-            preparation.reconstructedFileCount == 1
-                && preparation.reconstructedFileBytes
-                    == UInt64(savedFileBytes.count)
-                && preparedFileBytes == savedFileBytes
+            preparedFileBytes == futureFileBytes
                 && preparedFileInode == originalFileInode,
-            "cold restorer did not install the saved local file bytes in place"
-        )
-        let transactionRoots = try FileManager.default.contentsOfDirectory(
-            at: coldFileSafetyRoot,
-            includingPropertiesForKeys: nil
+            "cold restorer changed the current local file"
         )
         try require(
-            transactionRoots.count == 1
-                && FileManager.default.fileExists(
-                    atPath: transactionRoots[0]
-                        .appendingPathComponent("ColdFileTransaction.json").path
-                ),
-            "cold restorer did not durably journal its file rollback"
+            !FileManager.default.fileExists(atPath: coldFileSafetyRoot.path),
+            "process-only cold restore created a file transaction"
         )
         try await restorer.discard(preparation.id)
         let rolledBackFileBytes = try Data(contentsOf: coldFileURL)
@@ -889,15 +852,7 @@ enum ExternalHotProof {
         try require(
             rolledBackFileBytes == futureFileBytes
                 && rolledBackFileInode == originalFileInode,
-            "discarding cold preparation did not restore the abandoned current file bytes"
-        )
-        let remainingTransactions = try FileManager.default.contentsOfDirectory(
-            at: coldFileSafetyRoot,
-            includingPropertiesForKeys: nil
-        )
-        try require(
-            remainingTransactions.isEmpty,
-            "successful cold rollback left a stale durable transaction journal"
+            "discarding cold preparation changed the current file"
         )
 
         let committedPreparation = try await restorer.prepareRootProcess(
@@ -944,22 +899,20 @@ enum ExternalHotProof {
         let committedFileInode = try fileInode(coldFileURL)
         try require(
             kill(commit.processIdentifier, 0) == 0
-                && committedFileBytes == savedFileBytes
+                && committedFileBytes == futureFileBytes
                 && committedFileInode == originalFileInode
-                && commit.retainedFileCount == 1
-                && commit.retainedFileBytes == UInt64(savedFileBytes.count)
-                && commit.safetyTransactionRootURL.map {
-                    FileManager.default.fileExists(atPath: $0.path)
-                } == true,
-            "committed cold replacement did not continue with its saved file state"
+                && commit.retainedFileCount == 0
+                && commit.retainedFileBytes == 0
+                && commit.safetyTransactionRootURL == nil,
+            "committed cold replacement changed current file state"
         )
         let recoveredCommittedTransactions = try await restorer
             .recoverInterruptedFileTransactions()
         let postRecoveryCommittedBytes = try Data(contentsOf: coldFileURL)
         try require(
             recoveredCommittedTransactions == 0
-                && postRecoveryCommittedBytes == savedFileBytes,
-            "crash recovery incorrectly rolled back a committed cold replacement"
+                && postRecoveryCommittedBytes == futureFileBytes,
+            "crash recovery changed current files after process-only restore"
         )
         kill(commit.processIdentifier, SIGKILL)
         var committedStatus: Int32 = 0

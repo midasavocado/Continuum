@@ -352,12 +352,115 @@ public actor ColdProcessRestorer {
             )
         }
 
+        guard !process.threads.contains(where: {
+            $0.origin == .workqueue || $0.origin == .unknown
+        }) else {
+            throw ContinuumError.restoreUnavailable(
+                "This snapshot contains a workqueue thread whose libdispatch identity cannot be reconstructed yet."
+            )
+        }
+        let savedPthreads = process.threads.filter { $0.origin == .pthread }
+        guard !savedPthreads.isEmpty else {
+            throw ContinuumError.restoreUnavailable(
+                "The durable process image does not identify its primary pthread."
+            )
+        }
+        let pthreadGeometry = try savedPthreads.map { thread in
+            guard let pthreadAddress = thread.pthreadObjectAddress,
+                  let stackPointer = thread.stackPointer,
+                  let stackRegionAddress = thread.stackRegionAddress,
+                  let stackRegionLength = thread.stackRegionLength,
+                  let pthreadRegionAddress = thread.pthreadRegionAddress,
+                  let pthreadRegionLength = thread.pthreadRegionLength else {
+                throw ContinuumError.restoreUnavailable(
+                    "A captured pthread is missing exact stack geometry."
+                )
+            }
+            return continuum_saved_pthread_geometry(
+                saved_thread_identifier: thread.threadIdentifier,
+                pthread_address: pthreadAddress,
+                stack_pointer: stackPointer,
+                stack_region_address: stackRegionAddress,
+                stack_region_length: stackRegionLength,
+                pthread_region_address: pthreadRegionAddress,
+                pthread_region_length: pthreadRegionLength
+            )
+        }
+        var pthreadBootstrap = continuum_remote_pthread_bootstrap_report()
+        try requireRuntimeOK(
+            continuum_remote_session_prepare_suspended_pthreads(
+                session,
+                UInt32(savedPthreads.count - 1),
+                &pthreadBootstrap
+            ),
+            operation: "prepare the replacement pthread set"
+        )
+        var pthreadPlan = continuum_pthread_reconstruction_plan()
+        let planStatus = pthreadGeometry.withUnsafeBufferPointer { geometry in
+            continuum_plan_exact_pthread_reconstruction(
+                geometry.baseAddress,
+                geometry.count,
+                &pthreadBootstrap,
+                &pthreadPlan
+            )
+        }
+        try requireRuntimeOK(
+            planStatus,
+            operation: "match captured pthread stacks to the replacement"
+        )
+        var planTuple = pthreadPlan.entries
+        let pthreadPlanEntries = withUnsafeBytes(of: &planTuple) { bytes in
+            Array(
+                bytes.bindMemory(
+                    to: continuum_pthread_reconstruction_plan_entry.self
+                ).prefix(Int(pthreadPlan.entry_count))
+            )
+        }
+        guard pthreadPlanEntries.count == savedPthreads.count else {
+            throw ContinuumError.integrityFailure(
+                "The replacement pthread plan is incomplete."
+            )
+        }
+
         var reconstructedRegionCount = 0
         var reconstructedChunkCount = 0
         var reconstructedBytes: UInt64 = 0
         var deferredMaximumProtectionRegionCount = 0
 
         for region in process.regions.sorted(by: { $0.address < $1.address }) {
+            if Self.regionIntersectsPreparedPthread(
+                region,
+                entries: pthreadPlanEntries
+            ) {
+                let result = try await restorePreparedPthreadRegion(
+                    region,
+                    entries: pthreadPlanEntries,
+                    session: session,
+                    processIdentifier: process.processIdentifier,
+                    snapshotID: snapshotID,
+                    repository: repository
+                )
+                let (nextChunkCount, chunkCountOverflow) =
+                    reconstructedChunkCount.addingReportingOverflow(
+                        result.chunkCount
+                    )
+                let (nextByteCount, byteCountOverflow) =
+                    reconstructedBytes.addingReportingOverflow(
+                        result.writtenBytes
+                    )
+                let (nextRegionCount, regionCountOverflow) =
+                    reconstructedRegionCount.addingReportingOverflow(1)
+                guard !chunkCountOverflow, !byteCountOverflow,
+                      !regionCountOverflow else {
+                    throw ContinuumError.integrityFailure(
+                        "The durable pthread image exceeds Continuum's numeric limits."
+                    )
+                }
+                reconstructedChunkCount = nextChunkCount
+                reconstructedBytes = nextByteCount
+                reconstructedRegionCount = nextRegionCount
+                continue
+            }
             var runtimeRegion = continuum_remote_process_region_info()
             runtimeRegion.address = region.address
             runtimeRegion.length = region.length
@@ -537,8 +640,15 @@ public actor ColdProcessRestorer {
 
             var input = continuum_remote_thread_reconstruction_input()
             input.saved_thread_identifier = thread.threadIdentifier
-            input.thread_handle = thread.threadHandle ?? 0
-            input.dispatch_queue_address = thread.dispatchQueueAddress ?? 0
+            if let pthreadEntry = pthreadPlanEntries.first(where: {
+                $0.saved_thread_identifier == thread.threadIdentifier
+            }) {
+                input.thread_handle = pthreadEntry.replacement_thread_handle
+                input.dispatch_queue_address = 0
+            } else {
+                input.thread_handle = 0
+                input.dispatch_queue_address = 0
+            }
             input.general_state_flavor = thread.generalStateFlavor
             input.general_state = UnsafeRawPointer(generalPointer)
             input.general_state_length = generalState.count
@@ -562,18 +672,29 @@ public actor ColdProcessRestorer {
         var threadReport =
             continuum_remote_thread_set_reconstruction_report()
         let threadStatus = threadInputs.withUnsafeBufferPointer { inputs in
-            continuum_remote_session_reconstruct_raw_thread_set(
+            continuum_remote_session_reconstruct_prepared_thread_set(
                 session,
                 inputs.baseAddress,
                 inputs.count,
                 &threadReport
             )
         }
-        try requireRuntimeOK(
-            threadStatus,
-            operation: "reconstruct the captured raw Mach thread set"
-        )
-        let expectedRawThreadCount = process.threads.count - 1
+        if threadStatus != CONTINUUM_STATUS_OK {
+            let detail = continuum_status_string(threadStatus).map {
+                String(cString: $0)
+            } ?? "status \(threadStatus.rawValue)"
+            guard threadReport.validation_kind == 1
+                    || threadReport.validation_kind == 2 else {
+                throw ContinuumError.restoreUnavailable(
+                    "Could not reconstruct the captured thread set: \(detail)."
+                )
+            }
+            let register = threadReport.validation_kind == 1 ? "PC" : "SP"
+            throw ContinuumError.restoreUnavailable(
+                "Could not reconstruct captured thread \(threadReport.validation_thread_index): \(register) address 0x\(String(threadReport.validation_address, radix: 16)) failed validation (\(detail))."
+            )
+        }
+        let expectedRawThreadCount = process.threads.count - savedPthreads.count
         let reportedStateBytes = threadReport.general_state_bytes
             .addingReportingOverflow(threadReport.vector_state_bytes)
         guard threadReport.all_states_verified != 0,
@@ -1015,6 +1136,193 @@ public actor ColdProcessRestorer {
                 "The app executable changed after this checkpoint was captured."
             )
         }
+    }
+
+    private static func regionIntersectsPreparedPthread(
+        _ region: DurableMemoryRegion,
+        entries: [continuum_pthread_reconstruction_plan_entry]
+    ) -> Bool {
+        guard let regionEnd = checkedEnd(region.address, region.length) else {
+            return true
+        }
+        return entries.contains { entry in
+            rangesIntersect(
+                region.address,
+                regionEnd,
+                entry.stack_copy_address,
+                checkedEnd(entry.stack_copy_address, entry.stack_copy_length)
+                    ?? UInt64.max
+            ) || rangesIntersect(
+                region.address,
+                regionEnd,
+                entry.preserved_pthread_address,
+                checkedEnd(
+                    entry.preserved_pthread_address,
+                    entry.preserved_pthread_length
+                ) ?? UInt64.max
+            )
+        }
+    }
+
+    private func restorePreparedPthreadRegion(
+        _ region: DurableMemoryRegion,
+        entries: [continuum_pthread_reconstruction_plan_entry],
+        session: OpaquePointer,
+        processIdentifier: Int32,
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository
+    ) async throws -> (chunkCount: Int, writtenBytes: UInt64) {
+        guard let regionEnd = Self.checkedEnd(region.address, region.length) else {
+            throw ContinuumError.integrityFailure(
+                "A pthread mapping exceeds the address space."
+            )
+        }
+        var coverage: [(UInt64, UInt64)] = []
+        for entry in entries {
+            for (start, length) in [
+                (entry.stack_copy_address, entry.stack_copy_length),
+                (entry.preserved_pthread_address, entry.preserved_pthread_length),
+            ] {
+                guard let end = Self.checkedEnd(start, length) else {
+                    throw ContinuumError.integrityFailure(
+                        "The prepared pthread plan exceeds the address space."
+                    )
+                }
+                let clippedStart = max(start, region.address)
+                let clippedEnd = min(end, regionEnd)
+                if clippedStart < clippedEnd {
+                    coverage.append((clippedStart, clippedEnd))
+                }
+            }
+        }
+        coverage.sort { $0.0 < $1.0 }
+        var coveredThrough = region.address
+        for interval in coverage {
+            guard interval.0 <= coveredThrough else {
+                throw ContinuumError.restoreUnavailable(
+                    "A captured pthread mapping does not match the live libpthread allocation."
+                )
+            }
+            coveredThrough = max(coveredThrough, interval.1)
+        }
+        guard coveredThrough == regionEnd else {
+            throw ContinuumError.restoreUnavailable(
+                "A captured pthread mapping is only partially represented by the replacement."
+            )
+        }
+
+        var chunkOffset: UInt64 = 0
+        var chunkCount = 0
+        var writtenBytes: UInt64 = 0
+        for chunk in region.chunks {
+            guard chunk.logicalBytes > 0,
+                  chunk.logicalBytes <= 1_024 * 1_024,
+                  chunkOffset <= region.length,
+                  chunk.logicalBytes <= region.length - chunkOffset,
+                  let chunkAddress = Self.checkedEnd(
+                    region.address,
+                    chunkOffset
+                  ),
+                  let chunkEnd = Self.checkedEnd(
+                    chunkAddress,
+                    chunk.logicalBytes
+                  ) else {
+                throw ContinuumError.integrityFailure(
+                    "A pthread memory chunk exceeds its captured mapping."
+                )
+            }
+            let logicalName = chunk.artifactName
+                ?? Self.legacyMemoryArtifactName(
+                    processIdentifier: processIdentifier,
+                    address: region.address,
+                    offset: chunkOffset
+                )
+            let artifact = try await repository.artifact(
+                for: snapshotID,
+                logicalName: logicalName
+            )
+            guard artifact.kind == .memoryPage,
+                  UInt64(artifact.data.count) == chunk.logicalBytes,
+                  Self.sha256(artifact.data) == chunk.hash else {
+                throw ContinuumError.integrityFailure(
+                    "Pthread stack chunk \(logicalName) does not match its manifest."
+                )
+            }
+
+            for originalEntry in entries {
+                guard let stackEnd = Self.checkedEnd(
+                    originalEntry.stack_copy_address,
+                    originalEntry.stack_copy_length
+                ) else {
+                    throw ContinuumError.integrityFailure(
+                        "The prepared pthread stack range overflowed."
+                    )
+                }
+                let writeStart = max(chunkAddress, originalEntry.stack_copy_address)
+                let writeEnd = min(chunkEnd, stackEnd)
+                guard writeStart < writeEnd else { continue }
+                let dataStart = Int(writeStart - chunkAddress)
+                let dataEnd = Int(writeEnd - chunkAddress)
+                let slice = artifact.data.subdata(in: dataStart..<dataEnd)
+                var entry = originalEntry
+                var report = continuum_remote_restore_report()
+                let status = slice.withUnsafeBytes { bytes in
+                    continuum_remote_session_write_prepared_pthread_stack(
+                        session,
+                        &entry,
+                        writeStart - entry.stack_copy_address,
+                        bytes.baseAddress,
+                        bytes.count,
+                        &report
+                    )
+                }
+                guard status == CONTINUUM_STATUS_OK else {
+                    let detail = continuum_status_string(status).map {
+                        String(cString: $0)
+                    } ?? "status \(status.rawValue)"
+                    throw ContinuumError.restoreUnavailable(
+                        "Could not restore pthread stack 0x\(String(entry.stack_copy_address, radix: 16)) + 0x\(String(writeStart - entry.stack_copy_address, radix: 16)) (\(slice.count) bytes): \(detail); wrote \(report.bytes_written) bytes, mismatch +0x\(String(report.observed_offset, radix: 16)) expected \(report.observed_flags) observed \(report.observed_user_tag), Mach \(report.mach_result)."
+                    )
+                }
+                guard report.readback_verified != 0,
+                      report.bytes_written == UInt64(slice.count) else {
+                    throw ContinuumError.integrityFailure(
+                        "A prepared pthread stack failed readback verification."
+                    )
+                }
+                let (nextBytes, overflow) = writtenBytes.addingReportingOverflow(
+                    UInt64(slice.count)
+                )
+                guard !overflow else {
+                    throw ContinuumError.integrityFailure(
+                        "The prepared pthread stacks exceed numeric limits."
+                    )
+                }
+                writtenBytes = nextBytes
+            }
+            chunkOffset += chunk.logicalBytes
+            chunkCount += 1
+        }
+        guard chunkOffset == region.length else {
+            throw ContinuumError.integrityFailure(
+                "A prepared pthread mapping is incomplete."
+            )
+        }
+        return (chunkCount, writtenBytes)
+    }
+
+    private static func checkedEnd(_ start: UInt64, _ length: UInt64) -> UInt64? {
+        let result = start.addingReportingOverflow(length)
+        return result.overflow ? nil : result.partialValue
+    }
+
+    private static func rangesIntersect(
+        _ firstStart: UInt64,
+        _ firstEnd: UInt64,
+        _ secondStart: UInt64,
+        _ secondEnd: UInt64
+    ) -> Bool {
+        firstStart < secondEnd && secondStart < firstEnd
     }
 
     private func requireRuntimeOK(
