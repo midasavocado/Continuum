@@ -462,6 +462,8 @@ final class ContinuumRuntimeTests: XCTestCase {
             CONTINUUM_STATUS_OK
         )
         XCTAssertGreaterThan(first.thread_identifier, 0)
+        XCTAssertGreaterThan(first.thread_handle, 0)
+        XCTAssertGreaterThan(first.pthread_object_address, 0)
         XCTAssertGreaterThan(first.general_state_length, 0)
         XCTAssertGreaterThan(first.vector_state_length, 0)
 

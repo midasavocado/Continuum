@@ -329,6 +329,7 @@ typedef struct continuum_checkpoint {
 typedef struct continuum_remote_thread_entry {
     uint64_t identifier;
     uint64_t thread_handle;
+    uint64_t pthread_object_address;
     uint64_t dispatch_queue_address;
     uint32_t general_flavor;
     uint8_t *general_bytes;
@@ -337,6 +338,30 @@ typedef struct continuum_remote_thread_entry {
     uint8_t *vector_bytes;
     size_t vector_length;
 } continuum_remote_thread_entry;
+
+typedef struct continuum_pthread_layout_offsets {
+    uint16_t version;
+    uint16_t pthread_tsd_base_offset;
+    uint16_t pthread_tsd_base_address_offset;
+    uint16_t pthread_tsd_entry_size;
+} continuum_pthread_layout_offsets;
+
+static uint64_t continuum_pthread_object_address(uint64_t thread_handle) {
+    if (thread_handle == 0) {
+        return 0;
+    }
+    const continuum_pthread_layout_offsets *layout = dlsym(
+        RTLD_DEFAULT,
+        "pthread_layout_offsets"
+    );
+    if (layout == NULL || layout->version < 1
+        || layout->pthread_tsd_base_offset == 0
+        || layout->pthread_tsd_base_address_offset != 0
+        || thread_handle < layout->pthread_tsd_base_offset) {
+        return 0;
+    }
+    return thread_handle - layout->pthread_tsd_base_offset;
+}
 
 typedef struct continuum_remote_process_region {
     uint64_t address;
@@ -2547,6 +2572,9 @@ static continuum_status continuum_capture_thread_snapshot(
         }
         entry->identifier = identifier_info.thread_id;
         entry->thread_handle = identifier_info.thread_handle;
+        entry->pthread_object_address = continuum_pthread_object_address(
+            identifier_info.thread_handle
+        );
         entry->dispatch_queue_address = identifier_info.dispatch_qaddr;
 
         mach_msg_type_number_t general_count = ARM_THREAD_STATE64_COUNT;
@@ -7373,6 +7401,7 @@ continuum_status continuum_remote_thread_snapshot_info(
     memset(out_info, 0, sizeof(*out_info));
     out_info->thread_identifier = entry->identifier;
     out_info->thread_handle = entry->thread_handle;
+    out_info->pthread_object_address = entry->pthread_object_address;
     out_info->dispatch_queue_address = entry->dispatch_queue_address;
     out_info->general_state_flavor = entry->general_flavor;
     out_info->general_state_length = entry->general_length;

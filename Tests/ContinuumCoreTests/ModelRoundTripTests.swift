@@ -72,6 +72,7 @@ final class ModelRoundTripTests: XCTestCase {
                         DurableThreadImage(
                             threadIdentifier: 13,
                             threadHandle: 0x1_2345_0000,
+                            pthreadObjectAddress: 0x1_2344_FF20,
                             dispatchQueueAddress: 0x1_2346_0000,
                             stackPointer: 0x1_0000_3000,
                             pthreadRegionAddress: 0x1_0000_0000,

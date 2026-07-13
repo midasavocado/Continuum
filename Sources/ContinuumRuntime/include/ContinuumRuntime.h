@@ -274,6 +274,7 @@ typedef struct continuum_remote_process_region_info {
 typedef struct continuum_remote_thread_state_info {
     uint64_t thread_identifier;
     uint64_t thread_handle;
+    uint64_t pthread_object_address;
     uint64_t dispatch_queue_address;
     uint64_t stack_pointer;
     uint32_t general_state_flavor;
