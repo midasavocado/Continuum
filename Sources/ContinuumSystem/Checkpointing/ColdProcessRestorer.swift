@@ -62,8 +62,8 @@ public actor ColdProcessRestorer {
     deinit {
         for replacement in preparedReplacements.values {
             continuum_remote_session_destroy(replacement.session)
-            Self.killAndReap(replacement.processIdentifier)
-            Self.rollbackFiles(replacement.fileRollback)
+            _ = Self.killAndReap(replacement.processIdentifier)
+            try? Self.rollbackFiles(replacement.fileRollback)
         }
     }
 
@@ -249,7 +249,7 @@ public actor ColdProcessRestorer {
                 if let session {
                     continuum_remote_session_destroy(session)
                 }
-                Self.killAndReap(replacementProcessIdentifier)
+                _ = Self.killAndReap(replacementProcessIdentifier)
             }
         }
         try requireRuntimeOK(
@@ -516,15 +516,29 @@ public actor ColdProcessRestorer {
         )
     }
 
-    public func discard(_ preparationID: UUID) {
-        guard let replacement = preparedReplacements.removeValue(
-            forKey: preparationID
-        ) else {
+    public func discard(_ preparationID: UUID) throws {
+        guard let replacement = preparedReplacements[preparationID] else {
             return
         }
+        let terminationStatus = Self.killAndReap(
+            replacement.processIdentifier
+        )
+        guard terminationStatus == CONTINUUM_STATUS_OK
+                || (terminationStatus == CONTINUUM_STATUS_TARGET_EXITED
+                    && Self.processIsAbsent(replacement.processIdentifier)) else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not stop the prepared replacement; current files were left untouched."
+            )
+        }
+        do {
+            try Self.rollbackFiles(replacement.fileRollback)
+        } catch {
+            throw ContinuumError.integrityFailure(
+                "Continuum stopped the replacement but could not restore the pre-restore files. The safety root remains at \(replacement.fileRollback?.rootURL.path ?? "no file transaction")."
+            )
+        }
         continuum_remote_session_destroy(replacement.session)
-        Self.killAndReap(replacement.processIdentifier)
-        Self.rollbackFiles(replacement.fileRollback)
+        preparedReplacements.removeValue(forKey: preparationID)
     }
 
     private func validate(_ image: DurableCheckpointImage) throws {
@@ -842,16 +856,12 @@ public actor ColdProcessRestorer {
 
     private static func rollbackFiles(
         _ rollback: PreparedFileRollback?
-    ) {
+    ) throws {
         guard let rollback else { return }
-        do {
-            _ = try rollback.store.restoreCoherently(
-                snapshotID: rollback.snapshotID
-            )
-            try? FileManager.default.removeItem(at: rollback.rootURL)
-        } catch {
-            // Keep the safety clone available for manual recovery.
-        }
+        _ = try rollback.store.restoreCoherently(
+            snapshotID: rollback.snapshotID
+        )
+        try FileManager.default.removeItem(at: rollback.rootURL)
     }
 
     private static func bootstrapDescriptorPlan(
@@ -988,9 +998,13 @@ public actor ColdProcessRestorer {
         }
     }
 
-    private static func killAndReap(_ processIdentifier: Int32) {
-        guard processIdentifier > 0 else { return }
-        _ = continuum_terminate_direct_child(processIdentifier, 2_000)
+    private static func killAndReap(
+        _ processIdentifier: Int32
+    ) -> continuum_status {
+        guard processIdentifier > 0 else {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT
+        }
+        return continuum_terminate_direct_child(processIdentifier, 2_000)
     }
 
     private static func withCStringArray<Result>(

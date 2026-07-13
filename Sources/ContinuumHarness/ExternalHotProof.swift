@@ -865,7 +865,7 @@ enum ExternalHotProof {
                 && preparedFileInode == originalFileInode,
             "cold restorer did not install the saved local file bytes in place"
         )
-        await restorer.discard(preparation.id)
+        try await restorer.discard(preparation.id)
         let rolledBackFileBytes = try Data(contentsOf: coldFileURL)
         let rolledBackFileInode = try fileInode(coldFileURL)
         try require(
