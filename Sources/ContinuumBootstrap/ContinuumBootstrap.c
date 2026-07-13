@@ -48,6 +48,225 @@ static int continuum_bootstrap_write_all(
     return 1;
 }
 
+enum {
+    CONTINUUM_BOOTSTRAP_MAX_PLAN_BYTES = 1024 * 1024,
+    CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS = 1024
+};
+
+typedef struct continuum_bootstrap_descriptor_record {
+    int target_descriptor;
+    uint32_t open_flags;
+    int64_t offset;
+    uint64_t device;
+    uint64_t inode;
+    uint32_t mode;
+    char path[PATH_MAX];
+} continuum_bootstrap_descriptor_record;
+
+static int continuum_bootstrap_hex_value(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+static int continuum_bootstrap_decode_path(
+    const char *hex,
+    char output[PATH_MAX]
+) {
+    size_t length = strlen(hex);
+    if (length == 0 || (length % 2) != 0 || length / 2 >= PATH_MAX) {
+        return 0;
+    }
+    for (size_t index = 0; index < length; index += 2) {
+        int high = continuum_bootstrap_hex_value(hex[index]);
+        int low = continuum_bootstrap_hex_value(hex[index + 1]);
+        if (high < 0 || low < 0 || (high == 0 && low == 0)) {
+            return 0;
+        }
+        output[index / 2] = (char)((high << 4) | low);
+    }
+    output[length / 2] = '\0';
+    return output[0] == '/';
+}
+
+static int continuum_bootstrap_prepare_descriptors(
+    int descriptor,
+    uint32_t *out_restored_count
+) {
+    *out_restored_count = 0;
+    struct stat metadata;
+    if (fstat(descriptor, &metadata) != 0
+        || !S_ISREG(metadata.st_mode)
+        || metadata.st_uid != geteuid()
+        || metadata.st_nlink != 0
+        || (metadata.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO))
+            != (S_IRUSR | S_IWUSR)
+        || metadata.st_size < 0
+        || metadata.st_size > CONTINUUM_BOOTSTRAP_MAX_PLAN_BYTES) {
+        close(descriptor);
+        return -1;
+    }
+
+    size_t plan_length = (size_t)metadata.st_size;
+    char *plan = calloc(plan_length + 1, 1);
+    if (plan == NULL) {
+        close(descriptor);
+        return -1;
+    }
+    if (plan_length > 0
+        && pread(descriptor, plan, plan_length, 0) != (ssize_t)plan_length) {
+        free(plan);
+        close(descriptor);
+        return -1;
+    }
+
+    uint32_t count = 0;
+    continuum_bootstrap_descriptor_record *records = NULL;
+    int maximum_target = 63;
+    if (plan_length > 0) {
+        char *context = NULL;
+        char *line = strtok_r(plan, "\n", &context);
+        char trailing = '\0';
+        if (line == NULL
+            || sscanf(
+                line,
+                "CONTINUUM_FD_PLAN_V1 %u %c",
+                &count,
+                &trailing
+            ) != 1
+            || count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS) {
+            free(plan);
+            close(descriptor);
+            return -1;
+        }
+        records = calloc(count, sizeof(*records));
+        if (count > 0 && records == NULL) {
+            free(plan);
+            close(descriptor);
+            return -1;
+        }
+        for (uint32_t index = 0; index < count; index += 1) {
+            line = strtok_r(NULL, "\n", &context);
+            char path_hex[PATH_MAX * 2];
+            long long offset = 0;
+            unsigned long long device = 0;
+            unsigned long long inode = 0;
+            trailing = '\0';
+            int parsed = line == NULL ? 0 : sscanf(
+                line,
+                "%d %u %lld %llu %llu %u %2046s %c",
+                &records[index].target_descriptor,
+                &records[index].open_flags,
+                &offset,
+                &device,
+                &inode,
+                &records[index].mode,
+                path_hex,
+                &trailing
+            );
+            if (parsed != 7 || records[index].target_descriptor < 0
+                || offset < 0
+                || !continuum_bootstrap_decode_path(
+                    path_hex,
+                    records[index].path
+                )) {
+                free(records);
+                free(plan);
+                close(descriptor);
+                return -1;
+            }
+            records[index].offset = offset;
+            records[index].device = device;
+            records[index].inode = inode;
+            for (uint32_t prior = 0; prior < index; prior += 1) {
+                if (records[prior].target_descriptor
+                    == records[index].target_descriptor) {
+                    free(records);
+                    free(plan);
+                    close(descriptor);
+                    return -1;
+                }
+            }
+            if (records[index].target_descriptor > maximum_target) {
+                maximum_target = records[index].target_descriptor;
+            }
+        }
+        if (strtok_r(NULL, "\n", &context) != NULL) {
+            free(records);
+            free(plan);
+            close(descriptor);
+            return -1;
+        }
+    }
+    free(plan);
+
+    if (maximum_target == INT_MAX) {
+        free(records);
+        close(descriptor);
+        return -1;
+    }
+    int report_descriptor = fcntl(
+        descriptor,
+        F_DUPFD_CLOEXEC,
+        maximum_target + 1
+    );
+    close(descriptor);
+    if (report_descriptor < 0) {
+        free(records);
+        return -1;
+    }
+
+    for (uint32_t index = 0; index < count; index += 1) {
+        int access_mode = records[index].open_flags & O_ACCMODE;
+        if (access_mode != O_WRONLY && access_mode != O_RDWR) {
+            free(records);
+            close(report_descriptor);
+            return -1;
+        }
+        int safe_flags = access_mode | O_CLOEXEC | O_NOFOLLOW;
+        if ((records[index].open_flags & O_APPEND) != 0) {
+            safe_flags |= O_APPEND;
+        }
+        int opened = open(records[index].path, safe_flags);
+        struct stat file_metadata;
+        if (opened < 0 || fstat(opened, &file_metadata) != 0
+            || !S_ISREG(file_metadata.st_mode)
+            || (uint64_t)file_metadata.st_dev != records[index].device
+            || (uint64_t)file_metadata.st_ino != records[index].inode
+            || ((uint32_t)file_metadata.st_mode & (S_IFMT | 07777))
+                != (records[index].mode & (S_IFMT | 07777))
+            || lseek(opened, records[index].offset, SEEK_SET) < 0
+            || (opened != records[index].target_descriptor
+                && dup2(opened, records[index].target_descriptor) < 0)
+            || fcntl(records[index].target_descriptor, F_SETFD, 0) != 0) {
+            if (opened >= 0) {
+                close(opened);
+            }
+            free(records);
+            close(report_descriptor);
+            return -1;
+        }
+        if (opened != records[index].target_descriptor) {
+            close(opened);
+        }
+        *out_restored_count += 1;
+    }
+    free(records);
+    if (ftruncate(report_descriptor, 0) != 0
+        || lseek(report_descriptor, 0, SEEK_SET) != 0) {
+        close(report_descriptor);
+        return -1;
+    }
+    return report_descriptor;
+}
+
 static void continuum_bootstrap_report_copy_address(void) {
     const char *descriptor_text = getenv("CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD");
     if (descriptor_text == NULL || descriptor_text[0] == '\0') {
@@ -60,18 +279,12 @@ static void continuum_bootstrap_report_copy_address(void) {
         || descriptor_value < 0 || descriptor_value > INT_MAX) {
         return;
     }
-    int descriptor = (int)descriptor_value;
-    struct stat metadata;
-    if (fstat(descriptor, &metadata) != 0
-        || !S_ISREG(metadata.st_mode)
-        || metadata.st_uid != geteuid()
-        || metadata.st_nlink != 0
-        || (metadata.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO))
-            != (S_IRUSR | S_IWUSR)
-        || metadata.st_size != 0
-        || ftruncate(descriptor, 0) != 0
-        || lseek(descriptor, 0, SEEK_SET) != 0) {
-        close(descriptor);
+    uint32_t restored_descriptor_count = 0;
+    int descriptor = continuum_bootstrap_prepare_descriptors(
+        (int)descriptor_value,
+        &restored_descriptor_count
+    );
+    if (descriptor < 0) {
         return;
     }
 
@@ -100,10 +313,11 @@ static void continuum_bootstrap_report_copy_address(void) {
     int length = snprintf(
         report,
         sizeof(report),
-        "CONTINUUM_BOOTSTRAP_V2 %d 0x%llx 0x%llx\n",
+        "CONTINUUM_BOOTSTRAP_V3 %d 0x%llx 0x%llx %u\n",
         getpid(),
         (unsigned long long)image_base,
-        (unsigned long long)copy_address
+        (unsigned long long)copy_address,
+        restored_descriptor_count
     );
     if (length > 0 && (size_t)length < sizeof(report)
         && continuum_bootstrap_write_all(

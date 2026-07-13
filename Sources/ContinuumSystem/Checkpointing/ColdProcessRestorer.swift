@@ -15,11 +15,13 @@ public struct ColdProcessPreparation: Hashable, Sendable {
     public let reconstructedThreadCount: Int
     public let reconstructedThreadStateBytes: UInt64
     public let replacementThreadIdentifier: UInt64
+    public let reconstructedFileDescriptorCount: Int
 }
 
 /// Rebuilds a durable process image into a disposable child that remains
 /// stopped before main. A certified single-thread image also receives its saved
-/// ARM64 general and vector register state. Resource restoration and execution
+/// ARM64 general and vector register state. Validated regular writable files
+/// are reconnected before memory reconstruction. Other resources and execution
 /// resume intentionally remain later phases.
 public actor ColdProcessRestorer {
     private struct PreparedReplacement: @unchecked Sendable {
@@ -140,6 +142,18 @@ public actor ColdProcessRestorer {
         }
         defer { Darwin.close(descriptor) }
 
+        let rootDescriptors = image.writableFileDescriptors
+            .filter { $0.processIdentifier == process.processIdentifier }
+            .sorted { $0.fileDescriptor < $1.fileDescriptor }
+        let descriptorPlan = try Self.bootstrapDescriptorPlan(
+            rootDescriptors,
+            files: image.writableFiles
+        )
+        try Self.writeBootstrapDescriptorPlan(
+            descriptorPlan,
+            to: descriptor
+        )
+
         var localBootstrapIdentity = continuum_bootstrap_identity()
         try requireRuntimeOK(
             bootstrapLibraryPath.withCString {
@@ -222,7 +236,8 @@ public actor ColdProcessRestorer {
         var bootstrapIdentity = try Self.bootstrapIdentity(
             from: descriptor,
             expectedProcessIdentifier: replacementProcessIdentifier,
-            localIdentity: localBootstrapIdentity
+            localIdentity: localBootstrapIdentity,
+            expectedRestoredDescriptorCount: rootDescriptors.count
         )
         try requireRuntimeOK(
             continuum_remote_session_open(replacementProcessIdentifier, &session),
@@ -464,7 +479,8 @@ public actor ColdProcessRestorer {
             deferredMaximumProtectionRegionCount: deferredMaximumProtectionRegionCount,
             reconstructedThreadCount: 1,
             reconstructedThreadStateBytes: threadStateBytes,
-            replacementThreadIdentifier: threadReport.replacement_thread_identifier
+            replacementThreadIdentifier: threadReport.replacement_thread_identifier,
+            reconstructedFileDescriptorCount: rootDescriptors.count
         )
     }
 
@@ -564,7 +580,8 @@ public actor ColdProcessRestorer {
     private static func bootstrapIdentity(
         from descriptor: Int32,
         expectedProcessIdentifier: Int32,
-        localIdentity: continuum_bootstrap_identity
+        localIdentity: continuum_bootstrap_identity,
+        expectedRestoredDescriptorCount: Int
     ) throws -> continuum_bootstrap_identity {
         var metadata = stat()
         guard fstat(descriptor, &metadata) == 0,
@@ -597,8 +614,9 @@ public actor ColdProcessRestorer {
         }
         let contents = String(decoding: bytes.prefix(count), as: UTF8.self)
         let fields = contents.split(whereSeparator: { $0.isWhitespace })
-        guard fields.count == 4,
-              fields[0] == "CONTINUUM_BOOTSTRAP_V2",
+        guard fields.count == 5,
+              fields[0] == "CONTINUUM_BOOTSTRAP_V3",
+              Int(fields[4]) == expectedRestoredDescriptorCount,
               Int32(fields[1]) == expectedProcessIdentifier else {
             throw ContinuumError.restoreUnavailable(
                 "Continuum's pre-main bootstrap descriptor is invalid."
@@ -628,6 +646,89 @@ public actor ColdProcessRestorer {
         identity.image_base = imageBase
         identity.copy_address = address
         return identity
+    }
+
+    private static func bootstrapDescriptorPlan(
+        _ descriptors: [DurableWritableFileDescriptor],
+        files: [DurableFileImage]
+    ) throws -> Data {
+        guard descriptors.count <= 1_024 else {
+            throw ContinuumError.restoreUnavailable(
+                "The root process owns too many writable descriptors for cold reconstruction."
+            )
+        }
+        var seenDescriptors: Set<Int32> = []
+        var lines = ["CONTINUUM_FD_PLAN_V1 \(descriptors.count)"]
+        lines.reserveCapacity(descriptors.count + 1)
+        for descriptor in descriptors {
+            guard descriptor.fileDescriptor >= 0,
+                  descriptor.offset >= 0,
+                  seenDescriptors.insert(descriptor.fileDescriptor).inserted,
+                  descriptor.originalPath.hasPrefix("/"),
+                  let pathBytes = descriptor.originalPath.data(using: .utf8),
+                  !pathBytes.isEmpty,
+                  pathBytes.count < Int(PATH_MAX),
+                  !pathBytes.contains(0),
+                  files.contains(where: { file in
+                      file.originalPath == descriptor.originalPath
+                          && file.device == descriptor.device
+                          && file.inode == descriptor.inode
+                          && file.mode == descriptor.mode
+                  }) else {
+                throw ContinuumError.integrityFailure(
+                    "The durable writable-descriptor plan does not match its file root."
+                )
+            }
+            let encodedPath = pathBytes.map {
+                String(format: "%02x", $0)
+            }.joined()
+            lines.append(
+                "\(descriptor.fileDescriptor) \(descriptor.openFlags) "
+                    + "\(descriptor.offset) \(descriptor.device) "
+                    + "\(descriptor.inode) \(descriptor.mode) \(encodedPath)"
+            )
+        }
+        guard let plan = (lines.joined(separator: "\n") + "\n")
+                .data(using: .utf8),
+              plan.count <= 1_024 * 1_024 else {
+            throw ContinuumError.integrityFailure(
+                "The durable writable-descriptor plan exceeds one megabyte."
+            )
+        }
+        return plan
+    }
+
+    private static func writeBootstrapDescriptorPlan(
+        _ plan: Data,
+        to descriptor: Int32
+    ) throws {
+        guard ftruncate(descriptor, 0) == 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not initialize its private descriptor plan."
+            )
+        }
+        var offset = 0
+        while offset < plan.count {
+            let written = plan.withUnsafeBytes { bytes in
+                pwrite(
+                    descriptor,
+                    bytes.baseAddress?.advanced(by: offset),
+                    plan.count - offset,
+                    off_t(offset)
+                )
+            }
+            guard written > 0 else {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not write its private descriptor plan."
+                )
+            }
+            offset += written
+        }
+        guard fsync(descriptor) == 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not secure its private descriptor plan."
+            )
+        }
     }
 
     private func threadStateData(

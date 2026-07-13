@@ -352,6 +352,9 @@ enum ExternalHotProof {
                 + "\(coldMemory.reconstructedThreadStateBytes) bytes, replacement ID "
                 + "\(coldMemory.replacementThreadIdentifier)"
         )
+        print(
+            "  cold file descriptors: \(coldMemory.reconstructedFileDescriptorCount) reopened"
+        )
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -815,6 +818,10 @@ enum ExternalHotProof {
                 && preparation.reconstructedThreadStateBytes > 0
                 && preparation.replacementThreadIdentifier > 0,
             "cold restorer did not reconstruct and verify the saved thread state"
+        )
+        try require(
+            preparation.reconstructedFileDescriptorCount > 0,
+            "cold restorer did not reconstruct the root process's writable descriptors"
         )
         await restorer.discard(preparation.id)
         return preparation
