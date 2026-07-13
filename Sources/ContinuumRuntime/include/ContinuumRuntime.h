@@ -366,6 +366,8 @@ typedef struct continuum_remote_thread_state_info {
     size_t general_state_length;
     uint32_t vector_state_flavor;
     size_t vector_state_length;
+    uint8_t is_userspace_safepoint;
+    uint8_t preserves_kernel_continuation;
 } continuum_remote_thread_state_info;
 
 typedef struct continuum_remote_resource_fingerprint {

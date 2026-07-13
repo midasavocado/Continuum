@@ -8,6 +8,14 @@
 extern "C" {
 #endif
 
+enum { CONTINUUM_BOOTSTRAP_SAFEPOINT_REGISTER = 28 };
+#define CONTINUUM_BOOTSTRAP_SAFEPOINT_MAGIC UINT64_C(0x434F4E5453414645)
+
+/// Runs on AppKit's main queue until the controller sends the release signal.
+/// x28 carries a marker so an external capture can prove it stopped at this
+/// user-space continuation instead of inside a Mach syscall.
+void continuum_bootstrap_safepoint_spin(void);
+
 /// Copies one reconstruction chunk with ordinary in-process stores, then
 /// raises a debugger trap without returning. Continuum invokes this only while
 /// its disposable replacement is stopped before the app's first instruction.

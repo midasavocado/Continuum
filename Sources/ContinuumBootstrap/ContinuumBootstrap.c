@@ -1,10 +1,12 @@
 #include "ContinuumBootstrap.h"
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach/mach.h>
+#include <objc/runtime.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -18,6 +20,203 @@
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
 #endif
+
+static volatile sig_atomic_t continuum_safepoint_release = 0;
+static volatile sig_atomic_t continuum_safepoint_requested = 0;
+static volatile sig_atomic_t continuum_preservation_active = 0;
+static CFRunLoopObserverRef continuum_safepoint_observer = NULL;
+static void continuum_install_terminate_interposition(void);
+
+#define CONTINUUM_INTERPOSE(replacement, replacee) \
+    __attribute__((used)) static struct { \
+        const void *replacement; \
+        const void *replacee; \
+    } continuum_interpose_##replacee \
+        __attribute__((section("__DATA,__interpose"))) = { \
+            (const void *)(uintptr_t)&replacement, \
+            (const void *)(uintptr_t)&replacee \
+        }
+
+static int continuum_should_preserve_receive_right(
+    ipc_space_t task,
+    mach_port_name_t name
+) {
+    if (!continuum_preservation_active || task != mach_task_self()
+        || !MACH_PORT_VALID(name)) {
+        return 0;
+    }
+    mach_port_type_t type = MACH_PORT_TYPE_NONE;
+    return mach_port_type(task, name, &type) == KERN_SUCCESS
+        && (type & MACH_PORT_TYPE_RECEIVE) != 0;
+}
+
+static int continuum_should_preserve_deallocatable_right(
+    ipc_space_t task,
+    mach_port_name_t name
+) {
+    if (!continuum_preservation_active || task != mach_task_self()
+        || !MACH_PORT_VALID(name)) {
+        return 0;
+    }
+    mach_port_type_t type = MACH_PORT_TYPE_NONE;
+    return mach_port_type(task, name, &type) == KERN_SUCCESS
+        && (type & (MACH_PORT_TYPE_SEND | MACH_PORT_TYPE_SEND_ONCE
+            | MACH_PORT_TYPE_DEAD_NAME)) != 0;
+}
+
+static kern_return_t continuum_preserving_mach_port_destruct(
+    ipc_space_t task,
+    mach_port_name_t name,
+    mach_port_delta_t send_right_delta,
+    mach_port_context_t guard
+) {
+    if (continuum_should_preserve_receive_right(task, name)) {
+        return KERN_SUCCESS;
+    }
+    return mach_port_destruct(task, name, send_right_delta, guard);
+}
+
+static kern_return_t continuum_preserving_mach_port_mod_refs(
+    ipc_space_t task,
+    mach_port_name_t name,
+    mach_port_right_t right,
+    mach_port_delta_t delta
+) {
+    if (delta < 0
+        && (continuum_should_preserve_receive_right(task, name)
+            || continuum_should_preserve_deallocatable_right(task, name))) {
+        return KERN_SUCCESS;
+    }
+    return mach_port_mod_refs(task, name, right, delta);
+}
+
+static kern_return_t continuum_preserving_mach_port_deallocate(
+    ipc_space_t task,
+    mach_port_name_t name
+) {
+    if (continuum_should_preserve_deallocatable_right(task, name)) {
+        return KERN_SUCCESS;
+    }
+    return mach_port_deallocate(task, name);
+}
+
+CONTINUUM_INTERPOSE(
+    continuum_preserving_mach_port_destruct,
+    mach_port_destruct
+);
+CONTINUUM_INTERPOSE(
+    continuum_preserving_mach_port_mod_refs,
+    mach_port_mod_refs
+);
+CONTINUUM_INTERPOSE(
+    continuum_preserving_mach_port_deallocate,
+    mach_port_deallocate
+);
+
+__attribute__((visibility("default"), noinline))
+void continuum_bootstrap_safepoint_spin(void) {
+    continuum_safepoint_release = 0;
+    while (!continuum_safepoint_release) {
+#if defined(__arm64__)
+        const uint64_t marker = CONTINUUM_BOOTSTRAP_SAFEPOINT_MAGIC;
+        __asm__ volatile("mov x28, %0" : : "r"(marker) : "x28", "memory");
+#else
+        __asm__ volatile("" : : : "memory");
+#endif
+    }
+}
+
+static void continuum_release_safepoint(int signal_number) {
+    (void)signal_number;
+    continuum_safepoint_release = 1;
+}
+
+static void continuum_request_safepoint(int signal_number) {
+    (void)signal_number;
+    continuum_safepoint_requested = 1;
+}
+
+static void continuum_run_loop_safepoint(
+    CFRunLoopObserverRef observer,
+    CFRunLoopActivity activity,
+    void *context
+) {
+    (void)observer;
+    (void)activity;
+    (void)context;
+    if (continuum_safepoint_requested) {
+        continuum_preservation_active = 1;
+        continuum_safepoint_requested = 0;
+        continuum_bootstrap_safepoint_spin();
+    }
+}
+
+static __attribute__((noreturn)) void continuum_park_on_quit(void) {
+    (void)kill(getpid(), SIGSTOP);
+    for (;;) {
+        pause();
+    }
+}
+
+static void continuum_preserving_application_terminate(
+    id application,
+    SEL command,
+    id sender
+) {
+    (void)application;
+    (void)command;
+    (void)sender;
+    continuum_park_on_quit();
+}
+
+static void continuum_install_terminate_interposition(void) {
+    Class application_class = objc_getClass("NSApplication");
+    SEL terminate = sel_registerName("terminate:");
+    if (application_class == Nil) {
+        return;
+    }
+    Method method = class_getInstanceMethod(application_class, terminate);
+    if (method != NULL) {
+        method_setImplementation(
+            method,
+            (IMP)continuum_preserving_application_terminate
+        );
+    }
+}
+
+static void continuum_bootstrap_enable_safepoints(void) {
+    const char *requested = getenv("CONTINUUM_PRESERVE_ON_QUIT");
+    if (requested == NULL || strcmp(requested, "1") != 0) {
+        return;
+    }
+
+    (void)signal(SIGUSR1, continuum_release_safepoint);
+    (void)signal(SIGUSR2, continuum_request_safepoint);
+    CFRunLoopObserverContext context = {
+        .version = 0,
+        .info = NULL,
+        .retain = NULL,
+        .release = NULL,
+        .copyDescription = NULL,
+    };
+    continuum_safepoint_observer = CFRunLoopObserverCreate(
+        kCFAllocatorDefault,
+        kCFRunLoopBeforeWaiting | kCFRunLoopAfterWaiting,
+        true,
+        0,
+        continuum_run_loop_safepoint,
+        &context
+    );
+    if (continuum_safepoint_observer != NULL) {
+        CFRunLoopAddObserver(
+            CFRunLoopGetMain(),
+            continuum_safepoint_observer,
+            kCFRunLoopCommonModes
+        );
+    }
+
+    continuum_install_terminate_interposition();
+}
 
 __attribute__((visibility("default"), noinline, noreturn))
 void continuum_bootstrap_copy_and_trap(
@@ -532,6 +731,7 @@ static void continuum_bootstrap_report_copy_address(void) {
 /// replace the disposable process image without executing app code.
 __attribute__((constructor))
 static void continuum_bootstrap_stop_before_main(void) {
+    continuum_bootstrap_enable_safepoints();
     const char *requested = getenv("CONTINUUM_BOOTSTRAP_STOP");
     if (requested == NULL || strcmp(requested, "1") != 0) {
         return;

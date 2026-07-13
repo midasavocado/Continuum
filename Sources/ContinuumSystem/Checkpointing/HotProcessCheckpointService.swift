@@ -14,6 +14,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
 
     private let maximumCapturedBytes: UInt64
     private let maximumRetainedSnapshots: Int
+    private let usesInjectedSafepoints: Bool
     private let fileCheckpointStore: APFSLocalFileCheckpointStore?
     private var handles: [SnapshotID: HotProcessSnapshotHandle] = [:]
     private var retentionOrder: [SnapshotID] = []
@@ -21,10 +22,12 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
     public init(
         maximumCapturedBytes: UInt64 = UInt64(ContinuumConstants.defaultHotMemoryBudgetBytes),
         maximumRetainedSnapshots: Int = 8,
+        usesInjectedSafepoints: Bool = false,
         fileCheckpointRootURL: URL? = nil
     ) {
         self.maximumCapturedBytes = maximumCapturedBytes
         self.maximumRetainedSnapshots = max(maximumRetainedSnapshots, 2)
+        self.usesInjectedSafepoints = usesInjectedSafepoints
         if let fileCheckpointRootURL {
             // Hot file roots cannot outlive their in-memory task snapshots.
             // Clear leftovers from a prior Continuum process before arming.
@@ -51,6 +54,21 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         }
 
         let snapshotID = UUID()
+        var safepointRequested = false
+        if usesInjectedSafepoints {
+            guard kill(rootProcessIdentifier, SIGUSR2) == 0 else {
+                throw ContinuumError.runtimeUnsupported(
+                    "Continuum could not request the app's capture safepoint."
+                )
+            }
+            safepointRequested = true
+            usleep(100_000)
+        }
+        defer {
+            if safepointRequested {
+                _ = kill(rootProcessIdentifier, SIGUSR1)
+            }
+        }
         var rawSnapshot: OpaquePointer?
         var info = continuum_remote_process_group_snapshot_info()
         let resourceBox = HotResourceInventoryCallbackBox(
@@ -72,6 +90,19 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             }
             throw captureError(status: status, appName: app.displayName)
         }
+        if usesInjectedSafepoints {
+            guard capturedSafepointCount(
+                in: rawSnapshot,
+                rootProcessIdentifier: rootProcessIdentifier
+            ) == 1 else {
+                continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+                throw ContinuumError.runtimeUnsupported(
+                    "The app did not reach Continuum's main-thread capture safepoint."
+                )
+            }
+            _ = kill(rootProcessIdentifier, SIGUSR1)
+            safepointRequested = false
+        }
 
         guard let writableVnodes = resourceBox.inventory else {
             continuum_remote_process_group_snapshot_destroy(rawSnapshot)
@@ -81,6 +112,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         }
         let handle = HotProcessSnapshotHandle(
             pointer: rawSnapshot,
+            rootProcessIdentifier: rootProcessIdentifier,
             writableVnodes: writableVnodes,
             snapshotID: snapshotID,
             appID: app.id,
@@ -208,6 +240,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             return .failed(
                 "The runtime returned without validating restored memory, processes, and thread state."
             )
+        }
+        if usesInjectedSafepoints {
+            _ = kill(handle.rootProcessIdentifier, SIGCONT)
+            _ = kill(handle.rootProcessIdentifier, SIGUSR1)
         }
         return .experimentalHot
     }
@@ -722,6 +758,42 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         return members
     }
 
+    private func capturedSafepointCount(
+        in snapshot: OpaquePointer,
+        rootProcessIdentifier: Int32
+    ) -> Int {
+        for memberIndex in 0..<continuum_remote_process_group_member_count(snapshot) {
+            var member = continuum_remote_process_group_member_info()
+            guard continuum_remote_process_group_copy_member_info(
+                snapshot,
+                memberIndex,
+                &member
+            ) == CONTINUUM_STATUS_OK else {
+                return 0
+            }
+            guard member.process_id == rootProcessIdentifier else { continue }
+            var count = 0
+            let threadCount = continuum_remote_process_group_member_thread_count(
+                snapshot,
+                memberIndex
+            )
+            for threadIndex in 0..<threadCount {
+                var info = continuum_remote_thread_state_info()
+                guard continuum_remote_process_group_copy_member_thread_info(
+                    snapshot,
+                    memberIndex,
+                    threadIndex,
+                    &info
+                ) == CONTINUUM_STATUS_OK else {
+                    return 0
+                }
+                count += info.is_userspace_safepoint == 0 ? 0 : 1
+            }
+            return count
+        }
+        return 0
+    }
+
     private func captureError(
         status: continuum_status,
         appName: String
@@ -836,6 +908,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
 
 private final class HotProcessSnapshotHandle: @unchecked Sendable {
     let pointer: OpaquePointer
+    let rootProcessIdentifier: Int32
     let writableVnodes: [HotWritableVnode]
     let snapshotID: SnapshotID
     let appID: String
@@ -844,6 +917,7 @@ private final class HotProcessSnapshotHandle: @unchecked Sendable {
 
     init(
         pointer: OpaquePointer,
+        rootProcessIdentifier: Int32,
         writableVnodes: [HotWritableVnode],
         snapshotID: SnapshotID,
         appID: String,
@@ -851,6 +925,7 @@ private final class HotProcessSnapshotHandle: @unchecked Sendable {
         fileCheckpointStore: APFSLocalFileCheckpointStore?
     ) {
         self.pointer = pointer
+        self.rootProcessIdentifier = rootProcessIdentifier
         self.writableVnodes = writableVnodes
         self.snapshotID = snapshotID
         self.appID = appID

@@ -35,7 +35,11 @@ let package = Package(
         ),
         .target(
             name: "ContinuumBootstrap",
-            publicHeadersPath: "include"
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("CoreFoundation"),
+                .linkedLibrary("objc")
+            ]
         ),
         .target(
             name: "ContinuumSystem",
