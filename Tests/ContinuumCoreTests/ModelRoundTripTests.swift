@@ -81,7 +81,28 @@ final class ModelRoundTripTests: XCTestCase {
                     ]
                 )
             ],
-            writableFiles: []
+            writableFiles: [
+                DurableFileImage(
+                    originalPath: "/private/tmp/continuum-state.bin",
+                    device: 7,
+                    inode: 21,
+                    byteCount: 16_384,
+                    mode: 0o100600,
+                    chunks: [chunk]
+                )
+            ],
+            writableFileDescriptors: [
+                DurableWritableFileDescriptor(
+                    processIdentifier: 4242,
+                    fileDescriptor: 9,
+                    openFlags: 2,
+                    offset: 512,
+                    device: 7,
+                    inode: 21,
+                    mode: 0o100600,
+                    originalPath: "/private/tmp/continuum-state.bin"
+                )
+            ]
         )
 
         XCTAssertEqual(try roundTrip(image), image)

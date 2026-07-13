@@ -3,7 +3,7 @@ import Foundation
 /// Versioned, pointer-free description of a process-tree checkpoint. Large
 /// byte ranges live in encrypted content-addressed chunks referenced here.
 public struct DurableCheckpointImage: Codable, Hashable, Sendable {
-    public static let currentFormatVersion = 2
+    public static let currentFormatVersion = 3
 
     public let formatVersion: Int
     public let checkpointID: CheckpointID
@@ -15,6 +15,7 @@ public struct DurableCheckpointImage: Codable, Hashable, Sendable {
     public let app: AppIdentity
     public let members: [DurableProcessImage]
     public let writableFiles: [DurableFileImage]
+    public let writableFileDescriptors: [DurableWritableFileDescriptor]
 
     public init(
         formatVersion: Int = Self.currentFormatVersion,
@@ -26,7 +27,8 @@ public struct DurableCheckpointImage: Codable, Hashable, Sendable {
         rootProcessIdentifier: Int32,
         app: AppIdentity,
         members: [DurableProcessImage],
-        writableFiles: [DurableFileImage]
+        writableFiles: [DurableFileImage],
+        writableFileDescriptors: [DurableWritableFileDescriptor] = []
     ) {
         self.formatVersion = formatVersion
         self.checkpointID = checkpointID
@@ -38,6 +40,7 @@ public struct DurableCheckpointImage: Codable, Hashable, Sendable {
         self.app = app
         self.members = members
         self.writableFiles = writableFiles
+        self.writableFileDescriptors = writableFileDescriptors
     }
 }
 
@@ -168,6 +171,7 @@ public struct DurableFileImage: Codable, Hashable, Sendable {
     public let device: UInt64
     public let inode: UInt64
     public let byteCount: UInt64
+    public let mode: UInt32
     public let chunks: [DurableChunkReference]
 
     public init(
@@ -175,13 +179,49 @@ public struct DurableFileImage: Codable, Hashable, Sendable {
         device: UInt64,
         inode: UInt64,
         byteCount: UInt64,
+        mode: UInt32,
         chunks: [DurableChunkReference]
     ) {
         self.originalPath = originalPath
         self.device = device
         self.inode = inode
         self.byteCount = byteCount
+        self.mode = mode
         self.chunks = chunks
+    }
+}
+
+/// Stable descriptor metadata needed to reconnect a regular file before a
+/// cold replacement is allowed to execute. Non-vnode descriptors are rejected
+/// by the runtime resource gate and never represented as restorable here.
+public struct DurableWritableFileDescriptor: Codable, Hashable, Sendable {
+    public let processIdentifier: Int32
+    public let fileDescriptor: Int32
+    public let openFlags: UInt32
+    public let offset: Int64
+    public let device: UInt64
+    public let inode: UInt64
+    public let mode: UInt32
+    public let originalPath: String
+
+    public init(
+        processIdentifier: Int32,
+        fileDescriptor: Int32,
+        openFlags: UInt32,
+        offset: Int64,
+        device: UInt64,
+        inode: UInt64,
+        mode: UInt32,
+        originalPath: String
+    ) {
+        self.processIdentifier = processIdentifier
+        self.fileDescriptor = fileDescriptor
+        self.openFlags = openFlags
+        self.offset = offset
+        self.device = device
+        self.inode = inode
+        self.mode = mode
+        self.originalPath = originalPath
     }
 }
 

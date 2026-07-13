@@ -151,6 +151,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 snapshot: rawSnapshot,
                 checkpoint: checkpoint,
                 app: app,
+                snapshotID: snapshotID,
                 writableVnodes: writableVnodes
             )
             artifacts.append(
@@ -281,11 +282,31 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         snapshot: OpaquePointer,
         checkpoint: CheckpointRecord,
         app: AppIdentity,
+        snapshotID: SnapshotID,
         writableVnodes: [HotWritableVnode]
     ) throws -> [CapturedArtifact] {
         let chunkSize = 1_024 * 1_024
         var artifacts: [CapturedArtifact] = []
         var processImages: [DurableProcessImage] = []
+        let filePayloads: [LocalFileCheckpointPayload]
+        if writableVnodes.isEmpty {
+            filePayloads = []
+        } else {
+            guard let fileCheckpointStore else {
+                throw ContinuumError.runtimeUnsupported(
+                    "Durable capture requires a coherent file root for every writable vnode."
+                )
+            }
+            do {
+                filePayloads = try fileCheckpointStore.payloadsCoherently(
+                    snapshotID: snapshotID
+                )
+            } catch {
+                throw ContinuumError.runtimeUnsupported(
+                    "Could not persist the coherent file root: \(error.localizedDescription)"
+                )
+            }
+        }
         let memberCount = continuum_remote_process_group_member_count(snapshot)
 
         for memberIndex in 0..<memberCount {
@@ -436,6 +457,60 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 threads: threads
             ))
         }
+        var writableFiles: [DurableFileImage] = []
+        writableFiles.reserveCapacity(filePayloads.count)
+        for (fileIndex, payload) in filePayloads.enumerated() {
+            guard payload.entry.byteCount >= 0,
+                  UInt64(payload.data.count) == UInt64(payload.entry.byteCount) else {
+                throw ContinuumError.integrityFailure(
+                    "The coherent file clone changed while its durable root was exported."
+                )
+            }
+            var references: [DurableChunkReference] = []
+            var offset = 0
+            while offset < payload.data.count {
+                let length = min(chunkSize, payload.data.count - offset)
+                let block = payload.data.subdata(in: offset..<(offset + length))
+                let logicalName = String(
+                    format: "files/%08d/%016llx.bin",
+                    fileIndex,
+                    UInt64(offset)
+                )
+                artifacts.append(CapturedArtifact(
+                    kind: .fileBlock,
+                    logicalName: logicalName,
+                    data: block
+                ))
+                references.append(DurableChunkReference(
+                    hash: Self.sha256(block),
+                    artifactName: logicalName,
+                    logicalBytes: UInt64(length),
+                    storedBytes: 0,
+                    compression: .none
+                ))
+                offset += length
+            }
+            writableFiles.append(DurableFileImage(
+                originalPath: payload.entry.originalPath,
+                device: payload.entry.device,
+                inode: payload.entry.inode,
+                byteCount: UInt64(payload.entry.byteCount),
+                mode: payload.entry.mode,
+                chunks: references
+            ))
+        }
+        let writableFileDescriptors = writableVnodes.map { vnode in
+            DurableWritableFileDescriptor(
+                processIdentifier: vnode.processIdentifier,
+                fileDescriptor: vnode.fileDescriptor,
+                openFlags: vnode.openFlags,
+                offset: vnode.offset,
+                device: vnode.device,
+                inode: vnode.inode,
+                mode: vnode.mode,
+                originalPath: vnode.path
+            )
+        }
 
         let image = DurableCheckpointImage(
             checkpointID: checkpoint.id,
@@ -446,13 +521,14 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             rootProcessIdentifier: checkpoint.processIdentifiers.first ?? 0,
             app: app,
             members: processImages,
-            writableFiles: []
+            writableFiles: writableFiles,
+            writableFileDescriptors: writableFileDescriptors
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         artifacts.append(CapturedArtifact(
             kind: .metadata,
-            logicalName: "durable-checkpoint-v2.json",
+            logicalName: "durable-checkpoint-v3.json",
             data: try encoder.encode(image)
         ))
         return artifacts

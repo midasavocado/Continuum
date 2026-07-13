@@ -414,7 +414,7 @@ enum ExternalHotProof {
         )
         let durableManifest = try await reopenedStore.artifact(
             for: saved.id,
-            logicalName: "durable-checkpoint-v2.json"
+            logicalName: "durable-checkpoint-v3.json"
         )
         let durableImage = try JSONDecoder().decode(
             DurableCheckpointImage.self,
@@ -439,6 +439,23 @@ enum ExternalHotProof {
                     && !launch.workingDirectory.isEmpty
             },
             "reopened durable checkpoint omitted the process relaunch contract"
+        )
+        try require(
+            !durableImage.writableFileDescriptors.isEmpty
+                && durableImage.writableFiles.allSatisfy { file in
+                    file.chunks.reduce(UInt64(0)) {
+                        $0 + $1.logicalBytes
+                    } == file.byteCount
+                }
+                && durableImage.writableFileDescriptors.allSatisfy { descriptor in
+                    durableImage.writableFiles.contains { file in
+                        file.originalPath == descriptor.originalPath
+                            && file.device == descriptor.device
+                            && file.inode == descriptor.inode
+                            && file.mode == descriptor.mode
+                    }
+                },
+            "reopened durable checkpoint omitted coherent file bytes or descriptor ownership"
         )
         let durableMemoryChunks = durableImage.members.reduce(into: 0) {
             total, member in

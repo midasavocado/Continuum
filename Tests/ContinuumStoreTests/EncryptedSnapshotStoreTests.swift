@@ -23,6 +23,10 @@ final class EncryptedSnapshotStoreTests: XCTestCase {
                 files: [live]
             )
             XCTAssertEqual(manifest.entries.count, 1)
+            let payloads = try store.payloadsCoherently(snapshotID: snapshotID)
+            XCTAssertEqual(payloads.count, 1)
+            XCTAssertEqual(payloads[0].entry.originalPath, live.path)
+            XCTAssertEqual(payloads[0].data, Data("before".utf8))
 
             try Data("future-state".utf8).write(to: live)
             let report = try await store.restore(snapshotID: snapshotID)

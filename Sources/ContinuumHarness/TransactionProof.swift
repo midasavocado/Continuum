@@ -61,6 +61,34 @@ enum TransactionProof {
             "safety snapshot artifacts did not decrypt to the abandoned-future bytes"
         )
 
+        let liveFileURL = rootURL.appendingPathComponent("app-local-state.bin")
+        let fileCheckpointRoot = rootURL.appendingPathComponent(
+            "file-checkpoints",
+            isDirectory: true
+        )
+        let savedFileBytes = Data("continuum-saved-local-file-state".utf8)
+        try savedFileBytes.write(to: liveFileURL)
+        let fileCheckpointStore = try APFSLocalFileCheckpointStore(
+            rootURL: fileCheckpointRoot
+        )
+        let fileCheckpointID = UUID()
+        _ = try await fileCheckpointStore.capture(
+            snapshotID: fileCheckpointID,
+            files: [liveFileURL]
+        )
+        try Data("continuum-future-local-file-state".utf8).write(to: liveFileURL)
+        let filePayloads = try fileCheckpointStore.payloadsCoherently(
+            snapshotID: fileCheckpointID
+        )
+        try require(
+            filePayloads.count == 1
+                && filePayloads[0].entry.originalPath == liveFileURL.path
+                && filePayloads[0].data == savedFileBytes,
+            "the coherent APFS clone did not export its captured bytes"
+        )
+        try fileManager.removeItem(at: fileCheckpointRoot)
+        try fileManager.removeItem(at: liveFileURL)
+
         let persistedFiles = try regularFiles(beneath: rootURL, fileManager: fileManager)
         try require(!persistedFiles.isEmpty, "store committed no durable files")
         for fileURL in persistedFiles {
@@ -75,6 +103,7 @@ enum TransactionProof {
         print("  active branch:         \(commit.activeBranchID.uuidString)")
         print("  abandoned future:      \(commit.abandonedFutureBranchID.uuidString)")
         print("  encrypted store files: \(persistedFiles.count)")
+        print("  coherent file bytes:  APFS clone exported after live mutation")
     }
 
     private static func verifyIndex(

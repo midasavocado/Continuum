@@ -58,7 +58,7 @@ public actor ColdProcessRestorer {
     ) async throws -> ColdProcessPreparation {
         let manifest = try await repository.artifact(
             for: snapshotID,
-            logicalName: "durable-checkpoint-v2.json"
+            logicalName: "durable-checkpoint-v3.json"
         )
         let image: DurableCheckpointImage
         do {

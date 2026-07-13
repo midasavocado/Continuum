@@ -16,6 +16,11 @@ public struct LocalFileCheckpointManifest: Codable, Hashable, Sendable {
     public let entries: [LocalFileCheckpointEntry]
 }
 
+public struct LocalFileCheckpointPayload: Hashable, Sendable {
+    public let entry: LocalFileCheckpointEntry
+    public let data: Data
+}
+
 public struct LocalFileRestoreReport: Equatable, Sendable {
     public let restoredFileCount: Int
     public let restoredBytes: Int64
@@ -175,6 +180,33 @@ public actor APFSLocalFileCheckpointStore {
             LocalFileCheckpointManifest.self,
             from: Data(contentsOf: url)
         )
+    }
+
+    /// Reads the immutable APFS clones captured while the process group was
+    /// suspended so they can enter encrypted content-addressed storage.
+    public nonisolated func payloadsCoherently(
+        snapshotID: UUID
+    ) throws -> [LocalFileCheckpointPayload] {
+        let manifest = try manifestCoherently(snapshotID: snapshotID)
+        let snapshotRoot = Self.snapshotURL(rootURL: rootURL, id: snapshotID)
+        return try manifest.entries.map { entry in
+            let cloneURL = snapshotRoot.appendingPathComponent(
+                entry.cloneRelativePath,
+                isDirectory: false
+            )
+            let cloneStat = try Self.regularFileStat(at: cloneURL)
+            guard cloneStat.st_size == entry.byteCount else {
+                throw LocalFileCheckpointError.io(path: cloneURL.path, code: EIO)
+            }
+            let data = try Data(contentsOf: cloneURL, options: [.mappedIfSafe])
+            guard data.count == Int(entry.byteCount) else {
+                throw LocalFileCheckpointError.io(path: cloneURL.path, code: EIO)
+            }
+            return LocalFileCheckpointPayload(
+                entry: entry,
+                data: data
+            )
+        }
     }
 
     public func restore(snapshotID: UUID) throws -> LocalFileRestoreReport {
