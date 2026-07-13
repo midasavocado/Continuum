@@ -61,6 +61,24 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertEqual(pthread_join(pthread, nil), 0)
     }
 
+    func testRemotePthreadBootstrapRejectsInvalidArguments() {
+        var report = continuum_remote_pthread_bootstrap_report()
+        report.version = 99
+        XCTAssertEqual(
+            continuum_remote_session_prepare_suspended_pthreads(
+                nil,
+                1,
+                &report
+            ),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+        XCTAssertEqual(report.version, 0)
+        XCTAssertEqual(
+            continuum_remote_session_prepare_suspended_pthreads(nil, 0, nil),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
+    }
+
     func testTrackedMemoryMovesBackwardAndForward() {
         let length = 16_384
         let memory = UnsafeMutableRawPointer.allocate(

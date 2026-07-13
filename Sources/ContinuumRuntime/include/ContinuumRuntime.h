@@ -221,6 +221,22 @@ typedef struct continuum_remote_thread_set_reconstruction_report {
     uint8_t rollback_verified;
 } continuum_remote_thread_set_reconstruction_report;
 
+enum { CONTINUUM_REMOTE_PTHREAD_LIMIT = 64 };
+
+typedef struct continuum_remote_pthread_bootstrap_report {
+    uint32_t version;
+    uint32_t requested_count;
+    uint32_t created_count;
+    int32_t error_code;
+    uint64_t pthread_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t thread_identifiers[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t thread_handles[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t stack_base_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t stack_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t pthread_region_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t pthread_region_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+} continuum_remote_pthread_bootstrap_report;
+
 
 typedef enum continuum_reconstruction_stage {
     CONTINUUM_RECONSTRUCTION_STAGE_NONE = 0,
@@ -448,6 +464,16 @@ continuum_status continuum_remote_session_set_bootstrap_copy_identity(
     continuum_remote_session *session,
     const continuum_bootstrap_identity *identity,
     const char *expected_library_path
+);
+
+/// Calls the authenticated bootstrap inside a disposable entry-stopped child,
+/// creates ordinary pthreads with one libpthread suspension each, and validates
+/// their kernel identities and writable stack-allocation geometry. A failure
+/// after remote execution is terminal for that disposable child.
+continuum_status continuum_remote_session_prepare_suspended_pthreads(
+    continuum_remote_session *session,
+    uint32_t requested_count,
+    continuum_remote_pthread_bootstrap_report *out_report
 );
 
 /// Writes and immediately reads back one bounded range of a mapping prepared
