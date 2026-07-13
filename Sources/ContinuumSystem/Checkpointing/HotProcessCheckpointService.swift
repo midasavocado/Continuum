@@ -417,10 +417,29 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     logicalName: vectorName,
                     data: vector
                 ))
+                let stackPointer = thread.stack_pointer == 0
+                    ? nil
+                    : thread.stack_pointer
+                let pthreadRegion = regions.first { region in
+                    guard thread.thread_handle != 0,
+                          let stackPointer else {
+                        return false
+                    }
+                    let (end, overflow) = region.address
+                        .addingReportingOverflow(region.length)
+                    return !overflow
+                        && stackPointer >= region.address
+                        && stackPointer < end
+                        && thread.thread_handle >= region.address
+                        && thread.thread_handle < end
+                }
                 threads.append(DurableThreadImage(
                     threadIdentifier: thread.thread_identifier,
                     threadHandle: thread.thread_handle,
                     dispatchQueueAddress: thread.dispatch_queue_address,
+                    stackPointer: stackPointer,
+                    pthreadRegionAddress: pthreadRegion?.address,
+                    pthreadRegionLength: pthreadRegion?.length,
                     generalStateFlavor: thread.general_state_flavor,
                     generalState: DurableChunkReference(
                         hash: Self.sha256(general),

@@ -7370,6 +7370,7 @@ continuum_status continuum_remote_thread_snapshot_info(
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
     }
     const continuum_remote_thread_entry *entry = &snapshot->entries[index];
+    memset(out_info, 0, sizeof(*out_info));
     out_info->thread_identifier = entry->identifier;
     out_info->thread_handle = entry->thread_handle;
     out_info->dispatch_queue_address = entry->dispatch_queue_address;
@@ -7377,6 +7378,15 @@ continuum_status continuum_remote_thread_snapshot_info(
     out_info->general_state_length = entry->general_length;
     out_info->vector_state_flavor = entry->vector_flavor;
     out_info->vector_state_length = entry->vector_length;
+#if defined(__arm64__)
+    if (entry->general_flavor == ARM_THREAD_STATE64
+        && entry->general_length == sizeof(arm_thread_state64_t)) {
+        arm_thread_state64_t state;
+        memcpy(&state, entry->general_bytes, sizeof(state));
+        out_info->stack_pointer = (uint64_t)(uintptr_t)
+            arm_thread_state64_get_sp(state);
+    }
+#endif
     return CONTINUUM_STATUS_OK;
 }
 

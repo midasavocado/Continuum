@@ -275,6 +275,7 @@ typedef struct continuum_remote_thread_state_info {
     uint64_t thread_identifier;
     uint64_t thread_handle;
     uint64_t dispatch_queue_address;
+    uint64_t stack_pointer;
     uint32_t general_state_flavor;
     size_t general_state_length;
     uint32_t vector_state_flavor;
