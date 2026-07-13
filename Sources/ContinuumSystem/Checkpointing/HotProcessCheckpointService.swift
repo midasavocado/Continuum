@@ -122,8 +122,8 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 uniqueBytes: clampedInt64(info.captured_bytes),
                 hotMemoryBytes: clampedInt64(info.captured_bytes),
                 isPinned: kind != .automatic,
-                localFileCoverage: fileCheckpointStore == nil ? .unavailable : .openFiles,
-                allowsKeepingCurrentFiles: false,
+                localFileCoverage: .unchanged,
+                allowsKeepingCurrentFiles: true,
                 resourceCoverage: Self.experimentalResourceCoverage(
                     writableVnodeCount: writableVnodes.count
                 )
@@ -184,43 +184,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             )
         }
 
-        let rollbackSnapshotID = UUID()
-        if let fileCheckpointStore = handle.fileCheckpointStore {
-            let safetyBox = HotResourceInventoryCallbackBox(
-                fileCheckpointStore: fileCheckpointStore,
-                captureSnapshotID: rollbackSnapshotID
-            )
-            let safetyContext = Unmanaged.passUnretained(safetyBox).toOpaque()
-            let safetyStatus = continuum_remote_process_group_with_suspended_resources(
-                handle.pointer,
-                continuumCaptureHotResourceInventory,
-                safetyContext
-            )
-            guard safetyStatus == CONTINUUM_STATUS_OK else {
-                if safetyStatus == CONTINUUM_STATUS_TARGET_EXITED
-                    || safetyStatus == CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED {
-                    expire(snapshot.id)
-                }
-                return .failed(
-                    safetyBox.failureDescription
-                        ?? "Continuum could not secure the live state before restoring: \(statusDescription(safetyStatus)). No memory was changed."
-                )
-            }
-        }
-        defer {
-            try? handle.fileCheckpointStore?.deleteCoherently(
-                snapshotID: rollbackSnapshotID
-            )
-        }
-
         var report = continuum_remote_process_group_restore_report()
         let resourceBox = HotResourceInventoryCallbackBox(
             expectedInventory: handle.writableVnodes,
-            fileCheckpointStore: handle.fileCheckpointStore,
-            restoreSnapshotID: handle.snapshotID,
-            rollbackSnapshotID: handle.fileCheckpointStore == nil
-                ? nil
-                : rollbackSnapshotID
+            fileCheckpointStore: nil
         )
         let resourceContext = Unmanaged.passUnretained(resourceBox).toOpaque()
         let status = continuum_remote_process_group_restore_with_resources(
@@ -252,12 +219,12 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             return snapshot.availability
         }
         guard let handle = handles[snapshot.id] else {
-            return .unavailable
+            return .replayRequired
         }
         guard continuum_remote_process_group_live_status(handle.pointer)
                 == CONTINUUM_STATUS_OK else {
             expire(snapshot.id)
-            return .unavailable
+            return .replayRequired
         }
         return .experimentalHot
     }
@@ -288,25 +255,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         let chunkSize = 1_024 * 1_024
         var artifacts: [CapturedArtifact] = []
         var processImages: [DurableProcessImage] = []
-        let filePayloads: [LocalFileCheckpointPayload]
-        if writableVnodes.isEmpty {
-            filePayloads = []
-        } else {
-            guard let fileCheckpointStore else {
-                throw ContinuumError.runtimeUnsupported(
-                    "Durable capture requires a coherent file root for every writable vnode."
-                )
-            }
-            do {
-                filePayloads = try fileCheckpointStore.payloadsCoherently(
-                    snapshotID: snapshotID
-                )
-            } catch {
-                throw ContinuumError.runtimeUnsupported(
-                    "Could not persist the coherent file root: \(error.localizedDescription)"
-                )
-            }
-        }
+        // Files are deliberately outside the rewind boundary. Descriptor
+        // metadata is retained so a cold process can reconnect to the current
+        // files, but no file bytes are copied into the durable image.
+        let filePayloads: [LocalFileCheckpointPayload] = []
         let memberCount = continuum_remote_process_group_member_count(snapshot)
 
         for memberIndex in 0..<memberCount {
@@ -841,8 +793,8 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         ),
         ResourceCoverage(
             domain: .localFiles,
-            mode: .guarded,
-            detail: "\(writableVnodeCount) writable open file\(writableVnodeCount == 1 ? "" : "s") are APFS-cloned during the coherent cut. Rename/delete history, closed files, and external writers remain uncovered."
+            mode: .unavailable,
+            detail: "Continuum never rewinds file contents. \(writableVnodeCount) writable open file descriptor\(writableVnodeCount == 1 ? "" : "s") are tracked only so the app can reconnect to current files."
         ),
         ResourceCoverage(
             domain: .descriptors,

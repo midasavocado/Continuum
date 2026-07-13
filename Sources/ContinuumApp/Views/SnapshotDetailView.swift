@@ -134,7 +134,7 @@ struct SnapshotDetailView: View {
     private var localStateCard: some View {
         SurfaceCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label("Local file rewind", systemImage: "internaldrive")
+                Label("Files", systemImage: "internaldrive")
                     .font(.headline)
 
                 detailRow(
@@ -142,29 +142,11 @@ struct SnapshotDetailView: View {
                     value: snapshot.effectiveLocalFileCoverage.displayName
                 )
 
-                if snapshot.isKeepingCurrentFilesCertified {
-                    Text(
-                        "You can choose App Only when opening this state. Continuum still saves the current app and file state first."
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                } else if snapshot.availability == .experimentalHot {
-                    Text("Ready to restore this snapshot.")
-                    .font(.subheadline)
-                    .foregroundStyle(.green)
-                } else if snapshot.effectiveLocalFileCoverage == .exact {
-                    Text(
-                        "App Only is disabled because old memory with newer files could corrupt this app. The exact restore rewinds captured local files with it."
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                } else {
-                    Text(
-                        "This snapshot has no certified file root. Continuum will not call it an exact restorable state until app-owned files and databases are captured together."
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                }
+                Text(
+                    "Continuum restores the app process only. Files always stay exactly as they are now."
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
             }
         }
     }
@@ -268,7 +250,7 @@ struct SnapshotDetailView: View {
     private var restoreActionTitle: String {
         switch snapshot.availability {
         case .instant, .experimentalHot: "Restore Snapshot"
-        case .replayRequired: "Open by Replay"
+        case .replayRequired: "Restore Snapshot"
         case .unavailable: "Unavailable"
         }
     }

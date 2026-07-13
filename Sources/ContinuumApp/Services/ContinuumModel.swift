@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import ContinuumCore
+import ContinuumSystem
 
 enum AppSetupOperation: String, Sendable {
     case checking
@@ -28,6 +29,7 @@ final class ContinuumModel {
     @ObservationIgnored private let inventory: any AppInventoryProviding
     @ObservationIgnored private let permissionProvider: any PermissionProviding
     @ObservationIgnored private let checkpointCapturer: any CheckpointCapturing
+    @ObservationIgnored private let coldProcessRestorer: ColdProcessRestorer
     @ObservationIgnored private let appSetupCoordinator: any AppSetupCoordinating
     @ObservationIgnored private let defaults: UserDefaults
 
@@ -71,6 +73,7 @@ final class ContinuumModel {
         inventory: any AppInventoryProviding,
         permissionProvider: any PermissionProviding,
         checkpointCapturer: any CheckpointCapturing,
+        coldProcessRestorer: ColdProcessRestorer,
         appSetupCoordinator: any AppSetupCoordinating,
         defaults: UserDefaults = .standard
     ) {
@@ -78,6 +81,7 @@ final class ContinuumModel {
         self.inventory = inventory
         self.permissionProvider = permissionProvider
         self.checkpointCapturer = checkpointCapturer
+        self.coldProcessRestorer = coldProcessRestorer
         self.appSetupCoordinator = appSetupCoordinator
         self.defaults = defaults
         self.isOnboardingComplete = defaults.bool(forKey: Self.onboardingDefaultsKey)
@@ -233,11 +237,36 @@ final class ContinuumModel {
                     self.snapshots[index].availability = .unavailable
                 }
                 throw ContinuumError.restoreUnavailable(
-                    "The captured app has exited. Cold relaunch restore is not implemented yet."
+                    "This snapshot does not contain a durable app-state image."
                 )
             }
 
             self.rewindPhase = .restoring(snapshotID)
+            if snapshot.availability == .replayRequired {
+                let preparation = try await self.coldProcessRestorer
+                    .prepareRootProcess(
+                        from: snapshotID,
+                        repository: self.repository
+                    )
+                do {
+                    _ = try await self.coldProcessRestorer.commit(
+                        preparation.id
+                    )
+                } catch {
+                    try? await self.coldProcessRestorer.discard(
+                        preparation.id
+                    )
+                    throw error
+                }
+                self.onlineWarning = snapshot.externalEffects.isEmpty
+                    ? nil
+                    : snapshot.externalEffects
+                self.selectedSnapshotID = snapshotID
+                self.rewindPhase = .completed(snapshotID)
+                try await self.refreshIndex()
+                return
+            }
+
             let artifacts = try await self.repository.artifacts(for: snapshotID)
             let result = await self.checkpointCapturer.restore(
                 snapshot: snapshot,

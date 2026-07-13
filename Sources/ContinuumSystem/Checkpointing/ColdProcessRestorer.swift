@@ -44,9 +44,10 @@ public struct ColdFileSafetyRestore: Hashable, Sendable {
 
 /// Rebuilds a durable process image into a disposable child that remains
 /// stopped before main. A certified single-thread image also receives its saved
-/// ARM64 general and vector register state. Validated regular writable files
-/// are reconnected before memory reconstruction. Commit detaches the verified
-/// replacement; unsupported resources remain certification boundaries.
+/// ARM64 general and vector register state. Writable descriptors reconnect to
+/// their current files, but file contents are never restored. Commit detaches
+/// the verified replacement; unsupported resources remain certification
+/// boundaries.
 public actor ColdProcessRestorer {
     private struct PreparedReplacement: @unchecked Sendable {
         let processIdentifier: Int32
@@ -116,9 +117,6 @@ public actor ColdProcessRestorer {
         from snapshotID: SnapshotID,
         repository: any SnapshotRepository
     ) async throws -> ColdProcessPreparation {
-        if preparedReplacements.isEmpty {
-            _ = try recoverInterruptedFileTransactions()
-        }
         let manifest = try await repository.artifact(
             for: snapshotID,
             logicalName: "durable-checkpoint-v3.json"
@@ -143,16 +141,8 @@ public actor ColdProcessRestorer {
                 "The root process relaunch contract is missing."
             )
         }
-        guard launch.addressSpacePolicy == .continuumDeterministic else {
-            throw ContinuumError.restoreUnavailable(
-                "This app was not launched with Continuum's deterministic address policy."
-            )
-        }
-        guard launch.environment.contains("MallocLargeCache=0") else {
-            throw ContinuumError.restoreUnavailable(
-                "This checkpoint predates Continuum's deterministic allocator policy."
-            )
-        }
+        let usesDeterministicAddressSpace =
+            launch.addressSpacePolicy == .continuumDeterministic
         try validateExecutable(process: process, launch: launch)
         guard image.members.allSatisfy({
             Self.processIsAbsent($0.processIdentifier)
@@ -210,18 +200,12 @@ public actor ColdProcessRestorer {
         }
         defer { Darwin.close(descriptor) }
 
-        let rootDescriptors = image.writableFileDescriptors
-            .filter { $0.processIdentifier == process.processIdentifier }
-            .sorted { $0.fileDescriptor < $1.fileDescriptor }
+        // File state is intentionally outside the cold-rewind boundary.
+        // Recreating captured writable descriptors would couple a process
+        // restore to stale vnode identities and can mutate current files.
+        let rootDescriptors: [DurableWritableFileDescriptor] = []
         let descriptorPlan = try Self.bootstrapDescriptorPlan(
-            rootDescriptors,
-            files: image.writableFiles
-        )
-        let fileReplacements = try await Self.fileReplacements(
-            descriptors: rootDescriptors,
-            files: image.writableFiles,
-            snapshotID: snapshotID,
-            repository: repository
+            rootDescriptors
         )
         try Self.writeBootstrapDescriptorPlan(
             descriptorPlan,
@@ -239,13 +223,14 @@ public actor ColdProcessRestorer {
             operation: "authenticate Continuum's restore bootstrap"
         )
         var environment = launch.environment.filter {
-            !$0.hasPrefix("DYLD_SHARED_REGION=")
-                && !$0.hasPrefix("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=")
-                && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
+            !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
                 && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_PATH=")
                 && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD=")
                 && !$0.hasPrefix("DYLD_INSERT_LIBRARIES=")
-                && !$0.hasPrefix("MallocLargeCache=")
+                && (!usesDeterministicAddressSpace
+                    || (!$0.hasPrefix("DYLD_SHARED_REGION=")
+                        && !$0.hasPrefix("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=")
+                        && !$0.hasPrefix("MallocLargeCache=")))
         }
         var insertedLibraries = launch.environment.first(where: {
             $0.hasPrefix("DYLD_INSERT_LIBRARIES=")
@@ -260,10 +245,12 @@ public actor ColdProcessRestorer {
             URL(fileURLWithPath: $0).lastPathComponent == bootstrapName
         }
         insertedLibraries.append(bootstrapLibraryPath)
-        environment.append("DYLD_SHARED_REGION=private")
-        environment.append("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1")
+        if usesDeterministicAddressSpace {
+            environment.append("DYLD_SHARED_REGION=private")
+            environment.append("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1")
+            environment.append("MallocLargeCache=0")
+        }
         environment.append("CONTINUUM_BOOTSTRAP_STOP=1")
-        environment.append("MallocLargeCache=0")
         environment.append(
             "CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD=\(descriptor)"
         )
@@ -591,11 +578,7 @@ public actor ColdProcessRestorer {
             )
         }
 
-        let fileRollback = try await Self.beginFileReplacement(
-            fileReplacements,
-            replacementProcessIdentifier: replacementProcessIdentifier,
-            safetyRootURL: fileSafetyRootURL
-        )
+        let fileRollback: PreparedFileRollback? = nil
         let preparationID = UUID()
         preparedReplacements[preparationID] = PreparedReplacement(
             processIdentifier: replacementProcessIdentifier,
@@ -1379,8 +1362,7 @@ public actor ColdProcessRestorer {
     }
 
     private static func bootstrapDescriptorPlan(
-        _ descriptors: [DurableWritableFileDescriptor],
-        files: [DurableFileImage]
+        _ descriptors: [DurableWritableFileDescriptor]
     ) throws -> Data {
         guard descriptors.count <= 1_024 else {
             throw ContinuumError.restoreUnavailable(
@@ -1398,15 +1380,9 @@ public actor ColdProcessRestorer {
                   let pathBytes = descriptor.originalPath.data(using: .utf8),
                   !pathBytes.isEmpty,
                   pathBytes.count < Int(PATH_MAX),
-                  !pathBytes.contains(0),
-                  files.contains(where: { file in
-                      file.originalPath == descriptor.originalPath
-                          && file.device == descriptor.device
-                          && file.inode == descriptor.inode
-                          && file.mode == descriptor.mode
-                  }) else {
+                  !pathBytes.contains(0) else {
                 throw ContinuumError.integrityFailure(
-                    "The durable writable-descriptor plan does not match its file root."
+                    "The durable writable-descriptor plan is invalid."
                 )
             }
             let encodedPath = pathBytes.map {

@@ -17,9 +17,8 @@ enum AppBootstrap {
             repository: repository,
             inventory: MacAppInventoryService(),
             permissionProvider: MacPermissionService(),
-            checkpointCapturer: HotProcessCheckpointService(
-                fileCheckpointRootURL: try? hotFileCheckpointStoreURL()
-            ),
+            checkpointCapturer: HotProcessCheckpointService(),
+            coldProcessRestorer: ColdProcessRestorer(),
             appSetupCoordinator: MacAppSetupCoordinator(
                 rootDirectory: try? appSetupStoreURL()
             )
@@ -50,17 +49,6 @@ enum AppBootstrap {
             .appendingPathComponent("AppSetups", isDirectory: true)
     }
 
-    static func hotFileCheckpointStoreURL() throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        return base
-            .appendingPathComponent("Continuum", isDirectory: true)
-            .appendingPathComponent("HotFileCheckpoints", isDirectory: true)
-    }
 }
 
 private actor UnavailableSnapshotRepository: SnapshotRepository {

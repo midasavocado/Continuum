@@ -26,7 +26,7 @@ public enum RestoreAvailability: String, Codable, CaseIterable, Sendable {
         switch self {
         case .instant: "Instant"
         case .experimentalHot: "Ready"
-        case .replayRequired: "Replay required"
+        case .replayRequired: "Relaunch"
         case .unavailable: "Unavailable"
         }
     }
