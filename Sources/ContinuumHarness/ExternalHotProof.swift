@@ -852,10 +852,10 @@ enum ExternalHotProof {
             "cold restorer did not populate the complete durable memory image"
         )
         try require(
-            preparation.reconstructedThreadCount == 1
+            preparation.reconstructedThreadCount == 2
                 && preparation.reconstructedThreadStateBytes > 0
                 && preparation.replacementThreadIdentifier > 0,
-            "cold restorer did not reconstruct and verify the saved thread state"
+            "cold restorer did not reconstruct and verify both saved thread states"
         )
         try require(
             preparation.reconstructedFileDescriptorCount > 0,
@@ -914,6 +914,32 @@ enum ExternalHotProof {
             }
         }
         usleep(100_000)
+        var committedSession: OpaquePointer?
+        try check(
+            continuum_remote_session_open(
+                commit.processIdentifier,
+                &committedSession
+            ),
+            operation: "open the committed cold replacement"
+        )
+        guard let committedSession else {
+            throw ExternalHotProofFailure.invariant(
+                "committed cold replacement returned no task session"
+            )
+        }
+        defer { continuum_remote_session_destroy(committedSession) }
+        var committedResources = continuum_remote_resource_fingerprint()
+        try check(
+            continuum_remote_session_capture_resource_fingerprint(
+                committedSession,
+                &committedResources
+            ),
+            operation: "inspect the committed cold replacement threads"
+        )
+        try require(
+            committedResources.thread_count == 2,
+            "committed cold replacement did not retain both reconstructed threads"
+        )
         let committedFileBytes = try Data(contentsOf: coldFileURL)
         let committedFileInode = try fileInode(coldFileURL)
         try require(

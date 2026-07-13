@@ -196,6 +196,29 @@ typedef struct continuum_remote_thread_reconstruction_report {
     uint8_t general_state_verified;
     uint8_t vector_state_verified;
 } continuum_remote_thread_reconstruction_report;
+typedef struct continuum_remote_thread_reconstruction_input {
+    uint64_t saved_thread_identifier;
+    uint64_t thread_handle;
+    uint64_t dispatch_queue_address;
+    uint32_t general_state_flavor;
+    const void *general_state;
+    size_t general_state_length;
+    uint32_t vector_state_flavor;
+    const void *vector_state;
+    size_t vector_state_length;
+} continuum_remote_thread_reconstruction_input;
+
+typedef struct continuum_remote_thread_set_reconstruction_report {
+    uint64_t reconstructed_thread_count;
+    uint64_t created_raw_thread_count;
+    uint64_t general_state_bytes;
+    uint64_t vector_state_bytes;
+    uint64_t primary_replacement_thread_identifier;
+    uint8_t all_states_verified;
+    uint8_t rollback_attempted;
+    uint8_t rollback_verified;
+} continuum_remote_thread_set_reconstruction_report;
+
 
 typedef enum continuum_reconstruction_stage {
     CONTINUUM_RECONSTRUCTION_STAGE_NONE = 0,
@@ -449,6 +472,27 @@ continuum_status continuum_remote_session_reconstruct_single_thread(
     size_t vector_state_length,
     continuum_remote_thread_reconstruction_report *out_report
 );
+/// Reconstructs a captured thread set whose sole pthread-compatible primary
+/// matches the replacement entry thread's kernel TSD handle and whose remaining
+/// members are deliberately raw Mach threads with no pthread or dispatch
+/// identity. The disposable child remains task-suspended until
+/// continuum_remote_session_release_entry_stopped_child commits it.
+continuum_status continuum_remote_session_reconstruct_raw_thread_set(
+    continuum_remote_session *session,
+    const continuum_remote_thread_reconstruction_input *threads,
+    size_t thread_count,
+    continuum_remote_thread_set_reconstruction_report *out_report
+);
+
+/// Detaches a reconstructed direct child from ptrace while its task suspension
+/// still prevents any reconstructed thread from running, then releases exactly
+/// the suspension owned by Continuum. This is the commit boundary for a thread
+/// set reconstructed by continuum_remote_session_reconstruct_raw_thread_set.
+continuum_status continuum_remote_session_release_entry_stopped_child(
+    continuum_remote_session *session,
+    int32_t process_id
+);
+
 
 /// Captures a read-only kernel-resource fingerprint while an external target
 /// is suspended. It inventories descriptor topology, vnode identity/offsets,

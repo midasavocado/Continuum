@@ -106,8 +106,8 @@ public actor ColdProcessRestorer {
 
     deinit {
         for replacement in preparedReplacements.values {
-            continuum_remote_session_destroy(replacement.session)
             _ = Self.killAndReap(replacement.processIdentifier)
+            continuum_remote_session_destroy(replacement.session)
             try? Self.rollbackFiles(replacement.fileRollback)
         }
     }
@@ -294,10 +294,10 @@ public actor ColdProcessRestorer {
         var retained = false
         defer {
             if !retained {
+                _ = Self.killAndReap(replacementProcessIdentifier)
                 if let session {
                     continuum_remote_session_destroy(session)
                 }
-                _ = Self.killAndReap(replacementProcessIdentifier)
             }
         }
         try requireRuntimeOK(
@@ -484,56 +484,110 @@ public actor ColdProcessRestorer {
             reconstructedRegionCount = nextRegionCount
         }
 
-        guard process.threads.count == 1, let thread = process.threads.first else {
+        guard !process.threads.isEmpty else {
             throw ContinuumError.restoreUnavailable(
-                "Cold thread reconstruction currently requires exactly one captured thread."
+                "The durable process image contains no captured threads."
             )
         }
-        let generalState = try await threadStateData(
-            thread.generalState,
-            fallbackName: "threads/\(process.processIdentifier)/\(thread.threadIdentifier)-general.bin",
-            snapshotID: snapshotID,
-            repository: repository
-        )
-        let vectorState = try await threadStateData(
-            thread.vectorState,
-            fallbackName: "threads/\(process.processIdentifier)/\(thread.threadIdentifier)-vector.bin",
-            snapshotID: snapshotID,
-            repository: repository
-        )
-        var threadReport = continuum_remote_thread_reconstruction_report()
-        let threadStatus = generalState.withUnsafeBytes { generalBytes in
-            vectorState.withUnsafeBytes { vectorBytes in
-                continuum_remote_session_reconstruct_single_thread(
-                    session,
-                    thread.generalStateFlavor,
-                    generalBytes.baseAddress,
-                    generalBytes.count,
-                    thread.vectorStateFlavor,
-                    vectorBytes.baseAddress,
-                    vectorBytes.count,
-                    &threadReport
+        var threadInputs: [continuum_remote_thread_reconstruction_input] = []
+        threadInputs.reserveCapacity(process.threads.count)
+        var threadStateAllocations: [UnsafeMutableRawPointer] = []
+        threadStateAllocations.reserveCapacity(process.threads.count * 2)
+        defer {
+            for pointer in threadStateAllocations {
+                pointer.deallocate()
+            }
+        }
+        var threadStateBytes: UInt64 = 0
+        for thread in process.threads {
+            let generalState = try await threadStateData(
+                thread.generalState,
+                fallbackName: "threads/\(process.processIdentifier)/\(thread.threadIdentifier)-general.bin",
+                snapshotID: snapshotID,
+                repository: repository
+            )
+            let vectorState = try await threadStateData(
+                thread.vectorState,
+                fallbackName: "threads/\(process.processIdentifier)/\(thread.threadIdentifier)-vector.bin",
+                snapshotID: snapshotID,
+                repository: repository
+            )
+            guard !generalState.isEmpty, !vectorState.isEmpty else {
+                throw ContinuumError.integrityFailure(
+                    "A durable thread image contains an empty register bank."
                 )
             }
+
+            let generalPointer = UnsafeMutableRawPointer.allocate(
+                byteCount: generalState.count,
+                alignment: 16
+            )
+            generalState.copyBytes(
+                to: generalPointer.assumingMemoryBound(to: UInt8.self),
+                count: generalState.count
+            )
+            threadStateAllocations.append(generalPointer)
+            let vectorPointer = UnsafeMutableRawPointer.allocate(
+                byteCount: vectorState.count,
+                alignment: 16
+            )
+            vectorState.copyBytes(
+                to: vectorPointer.assumingMemoryBound(to: UInt8.self),
+                count: vectorState.count
+            )
+            threadStateAllocations.append(vectorPointer)
+
+            var input = continuum_remote_thread_reconstruction_input()
+            input.saved_thread_identifier = thread.threadIdentifier
+            input.thread_handle = thread.threadHandle ?? 0
+            input.dispatch_queue_address = thread.dispatchQueueAddress ?? 0
+            input.general_state_flavor = thread.generalStateFlavor
+            input.general_state = UnsafeRawPointer(generalPointer)
+            input.general_state_length = generalState.count
+            input.vector_state_flavor = thread.vectorStateFlavor
+            input.vector_state = UnsafeRawPointer(vectorPointer)
+            input.vector_state_length = vectorState.count
+            threadInputs.append(input)
+
+            let (afterGeneral, generalOverflow) = threadStateBytes
+                .addingReportingOverflow(UInt64(generalState.count))
+            let (afterVector, vectorOverflow) = afterGeneral
+                .addingReportingOverflow(UInt64(vectorState.count))
+            guard !generalOverflow, !vectorOverflow else {
+                throw ContinuumError.integrityFailure(
+                    "The durable thread image exceeds Continuum's numeric limits."
+                )
+            }
+            threadStateBytes = afterVector
+        }
+
+        var threadReport =
+            continuum_remote_thread_set_reconstruction_report()
+        let threadStatus = threadInputs.withUnsafeBufferPointer { inputs in
+            continuum_remote_session_reconstruct_raw_thread_set(
+                session,
+                inputs.baseAddress,
+                inputs.count,
+                &threadReport
+            )
         }
         try requireRuntimeOK(
             threadStatus,
-            operation: "reconstruct the captured ARM64 thread state"
+            operation: "reconstruct the captured raw Mach thread set"
         )
-        guard threadReport.general_state_verified != 0,
-              threadReport.vector_state_verified != 0,
-              threadReport.general_state_bytes == UInt64(generalState.count),
-              threadReport.vector_state_bytes == UInt64(vectorState.count),
-              threadReport.replacement_thread_identifier != 0 else {
+        let expectedRawThreadCount = process.threads.count - 1
+        let reportedStateBytes = threadReport.general_state_bytes
+            .addingReportingOverflow(threadReport.vector_state_bytes)
+        guard threadReport.all_states_verified != 0,
+              threadReport.reconstructed_thread_count
+                == UInt64(process.threads.count),
+              threadReport.created_raw_thread_count
+                == UInt64(expectedRawThreadCount),
+              !reportedStateBytes.overflow,
+              reportedStateBytes.partialValue == threadStateBytes,
+              threadReport.primary_replacement_thread_identifier != 0 else {
             throw ContinuumError.integrityFailure(
-                "The replacement thread did not match the captured register image."
-            )
-        }
-        let (threadStateBytes, threadByteOverflow) = UInt64(generalState.count)
-            .addingReportingOverflow(UInt64(vectorState.count))
-        guard !threadByteOverflow else {
-            throw ContinuumError.integrityFailure(
-                "The durable thread image exceeds Continuum's numeric limits."
+                "The replacement thread set did not match the captured register images."
             )
         }
 
@@ -557,9 +611,10 @@ public actor ColdProcessRestorer {
             reconstructedChunkCount: reconstructedChunkCount,
             reconstructedBytes: reconstructedBytes,
             deferredMaximumProtectionRegionCount: deferredMaximumProtectionRegionCount,
-            reconstructedThreadCount: 1,
+            reconstructedThreadCount: process.threads.count,
             reconstructedThreadStateBytes: threadStateBytes,
-            replacementThreadIdentifier: threadReport.replacement_thread_identifier,
+            replacementThreadIdentifier:
+                threadReport.primary_replacement_thread_identifier,
             reconstructedFileDescriptorCount: rootDescriptors.count,
             reconstructedFileCount: fileRollback?.replacedFileCount ?? 0,
             reconstructedFileBytes: fileRollback?.replacedBytes ?? 0
@@ -610,7 +665,8 @@ public actor ColdProcessRestorer {
             )
         }
 
-        let releaseStatus = continuum_release_entry_stopped_child(
+        let releaseStatus = continuum_remote_session_release_entry_stopped_child(
+            replacement.session,
             replacement.processIdentifier
         )
         guard releaseStatus == CONTINUUM_STATUS_OK else {

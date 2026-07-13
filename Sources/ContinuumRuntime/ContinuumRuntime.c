@@ -373,6 +373,7 @@ struct continuum_remote_session {
     uint32_t owned_suspend_count;
     int has_registered_region;
     int has_active_reconstruction;
+    int has_reconstructed_thread_set;
 };
 
 struct continuum_remote_thread_snapshot {
@@ -4219,7 +4220,8 @@ static continuum_status continuum_validate_reconstruction_target(
         || (region->length % (uint64_t)getpagesize()) != 0
         || (region->protection & (VM_PROT_READ | VM_PROT_WRITE))
             != (VM_PROT_READ | VM_PROT_WRITE)
-        || !continuum_is_private_or_cow_share_mode(region->share_mode)) {
+        || !continuum_is_private_or_cow_share_mode(region->share_mode)
+        || session->has_reconstructed_thread_set) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
     }
     return continuum_validate_stopped_replacement_session(session);
@@ -4867,7 +4869,8 @@ continuum_status continuum_remote_session_reconstruct_single_thread(
     if (status != CONTINUUM_STATUS_OK) {
         return status;
     }
-    if (session->has_active_reconstruction) {
+    if (session->has_active_reconstruction
+        || session->has_reconstructed_thread_set) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
     }
 
@@ -5020,6 +5023,531 @@ continuum_status continuum_remote_session_reconstruct_single_thread(
     }
     return status;
 #endif
+}
+
+continuum_status continuum_remote_session_reconstruct_raw_thread_set(
+    continuum_remote_session *session,
+    const continuum_remote_thread_reconstruction_input *inputs,
+    size_t thread_count,
+    continuum_remote_thread_set_reconstruction_report *out_report
+) {
+    if (out_report == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_report, 0, sizeof(*out_report));
+#if !defined(__arm64__)
+    (void)session;
+    (void)inputs;
+    (void)thread_count;
+    return CONTINUUM_STATUS_UNSUPPORTED_ARCHITECTURE;
+#else
+    enum { CONTINUUM_RAW_THREAD_PROOF_LIMIT = 64 };
+    if (session == NULL || inputs == NULL || thread_count == 0
+        || thread_count > CONTINUUM_RAW_THREAD_PROOF_LIMIT
+        || session->has_active_reconstruction
+        || session->has_reconstructed_thread_set
+        || session->owned_suspend_count != 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    continuum_status status = continuum_validate_stopped_replacement_session(
+        session
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    thread_act_t *ports = calloc(thread_count, sizeof(*ports));
+    if (ports == NULL) {
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+    uint64_t general_state_bytes = 0;
+    uint64_t vector_state_bytes = 0;
+    for (size_t index = 0; index < thread_count; index += 1) {
+        const continuum_remote_thread_reconstruction_input *input =
+            &inputs[index];
+        if (input->general_state == NULL || input->vector_state == NULL
+            || input->general_state_flavor != ARM_THREAD_STATE64
+            || input->vector_state_flavor != ARM_NEON_STATE64
+            || input->general_state_length != sizeof(arm_thread_state64_t)
+            || input->vector_state_length != sizeof(arm_neon_state64_t)
+            || !continuum_add_u64(
+                general_state_bytes,
+                input->general_state_length,
+                &general_state_bytes
+            )
+            || !continuum_add_u64(
+                vector_state_bytes,
+                input->vector_state_length,
+                &vector_state_bytes
+            )) {
+            free(ports);
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+
+        arm_thread_state64_t general_state;
+        memcpy(
+            &general_state,
+            input->general_state,
+            sizeof(general_state)
+        );
+        uintptr_t program_counter = arm_thread_state64_get_pc(general_state);
+        uintptr_t stack_pointer = arm_thread_state64_get_sp(general_state);
+        if (program_counter == 0 || (program_counter & UINT64_C(3)) != 0
+            || stack_pointer < 16 || (stack_pointer & UINT64_C(15)) != 0) {
+            free(ports);
+            return CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+
+        mach_vm_size_t span = 0;
+        kern_return_t mach_result = KERN_SUCCESS;
+        status = continuum_reconstruction_leaf_span(
+            session->task,
+            program_counter,
+            sizeof(uint32_t),
+            VM_PROT_READ | VM_PROT_EXECUTE,
+            &span,
+            &mach_result
+        );
+        if (status != CONTINUUM_STATUS_OK || span != sizeof(uint32_t)) {
+            free(ports);
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : status;
+        }
+        status = continuum_reconstruction_leaf_span(
+            session->task,
+            stack_pointer - 16,
+            16,
+            VM_PROT_READ | VM_PROT_WRITE,
+            &span,
+            &mach_result
+        );
+        if (status != CONTINUUM_STATUS_OK || span != 16) {
+            free(ports);
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : status;
+        }
+    }
+
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status != CONTINUUM_STATUS_OK) {
+        free(ports);
+        return status;
+    }
+
+    thread_act_array_t existing_threads = NULL;
+    mach_msg_type_number_t existing_count = 0;
+    kern_return_t mach_result = task_threads(
+        session->task,
+        &existing_threads,
+        &existing_count
+    );
+    size_t primary_index = SIZE_MAX;
+    arm_thread_state64_t original_general;
+    arm_neon_state64_t original_vector;
+    memset(&original_general, 0, sizeof(original_general));
+    memset(&original_vector, 0, sizeof(original_vector));
+    uint64_t replacement_thread_identifier = 0;
+    size_t created_count = 0;
+    int primary_was_modified = 0;
+    if (mach_result != KERN_SUCCESS || existing_count != 1) {
+        status = CONTINUUM_STATUS_THREAD_SET_CHANGED;
+        goto rollback;
+    }
+
+    thread_identifier_info_data_t replacement_identity;
+    memset(&replacement_identity, 0, sizeof(replacement_identity));
+    mach_msg_type_number_t identity_count = THREAD_IDENTIFIER_INFO_COUNT;
+    mach_result = thread_info(
+        existing_threads[0],
+        THREAD_IDENTIFIER_INFO,
+        (thread_info_t)&replacement_identity,
+        &identity_count
+    );
+    if (mach_result != KERN_SUCCESS || replacement_identity.thread_handle == 0) {
+        status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
+        goto rollback;
+    }
+    replacement_thread_identifier = replacement_identity.thread_id;
+    for (size_t index = 0; index < thread_count; index += 1) {
+        if (inputs[index].thread_handle == replacement_identity.thread_handle) {
+            if (primary_index != SIZE_MAX) {
+                status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                goto rollback;
+            }
+            primary_index = index;
+        } else if (inputs[index].thread_handle != 0
+            || inputs[index].dispatch_queue_address != 0) {
+            status = CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            goto rollback;
+        }
+    }
+    if (primary_index == SIZE_MAX) {
+        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        goto rollback;
+    }
+
+    ports[primary_index] = existing_threads[0];
+    existing_threads[0] = MACH_PORT_NULL;
+    mach_msg_type_number_t original_general_count = ARM_THREAD_STATE64_COUNT;
+    mach_result = thread_get_state(
+        ports[primary_index],
+        ARM_THREAD_STATE64,
+        (thread_state_t)&original_general,
+        &original_general_count
+    );
+    if (mach_result != KERN_SUCCESS
+        || original_general_count != ARM_THREAD_STATE64_COUNT) {
+        status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
+        goto rollback;
+    }
+    mach_msg_type_number_t original_vector_count = ARM_NEON_STATE64_COUNT;
+    mach_result = thread_get_state(
+        ports[primary_index],
+        ARM_NEON_STATE64,
+        (thread_state_t)&original_vector,
+        &original_vector_count
+    );
+    if (mach_result != KERN_SUCCESS
+        || original_vector_count != ARM_NEON_STATE64_COUNT) {
+        status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
+        goto rollback;
+    }
+
+    for (size_t index = 0; index < thread_count; index += 1) {
+        arm_thread_state64_t saved_general;
+        arm_neon_state64_t saved_vector;
+        memcpy(
+            &saved_general,
+            inputs[index].general_state,
+            sizeof(saved_general)
+        );
+        memcpy(
+            &saved_vector,
+            inputs[index].vector_state,
+            sizeof(saved_vector)
+        );
+
+        if (index == primary_index) {
+            mach_result = thread_set_state(
+                ports[index],
+                ARM_NEON_STATE64,
+                (thread_state_t)&saved_vector,
+                ARM_NEON_STATE64_COUNT
+            );
+            if (mach_result == KERN_SUCCESS) {
+                mach_result = thread_set_state(
+                    ports[index],
+                    ARM_THREAD_STATE64,
+                    (thread_state_t)&saved_general,
+                    ARM_THREAD_STATE64_COUNT
+                );
+            }
+            primary_was_modified = 1;
+        } else {
+            mach_result = thread_create_running(
+                session->task,
+                ARM_THREAD_STATE64,
+                (thread_state_t)&saved_general,
+                ARM_THREAD_STATE64_COUNT,
+                &ports[index]
+            );
+            if (mach_result == KERN_SUCCESS) {
+                created_count += 1;
+                mach_result = thread_set_state(
+                    ports[index],
+                    ARM_NEON_STATE64,
+                    (thread_state_t)&saved_vector,
+                    ARM_NEON_STATE64_COUNT
+                );
+            }
+        }
+        if (mach_result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_THREAD_RESTORE_FAILED;
+            goto rollback;
+        }
+    }
+
+    for (size_t index = 0; index < thread_count; index += 1) {
+        arm_thread_state64_t saved_general;
+        arm_neon_state64_t saved_vector;
+        arm_thread_state64_t observed_general;
+        arm_neon_state64_t observed_vector;
+        memcpy(
+            &saved_general,
+            inputs[index].general_state,
+            sizeof(saved_general)
+        );
+        memcpy(
+            &saved_vector,
+            inputs[index].vector_state,
+            sizeof(saved_vector)
+        );
+        memset(&observed_general, 0, sizeof(observed_general));
+        memset(&observed_vector, 0, sizeof(observed_vector));
+
+        mach_msg_type_number_t vector_count = ARM_NEON_STATE64_COUNT;
+        mach_result = thread_get_state(
+            ports[index],
+            ARM_NEON_STATE64,
+            (thread_state_t)&observed_vector,
+            &vector_count
+        );
+        mach_msg_type_number_t general_count = ARM_THREAD_STATE64_COUNT;
+        if (mach_result == KERN_SUCCESS) {
+            mach_result = thread_get_state(
+                ports[index],
+                ARM_THREAD_STATE64,
+                (thread_state_t)&observed_general,
+                &general_count
+            );
+        }
+        if (mach_result != KERN_SUCCESS
+            || vector_count != ARM_NEON_STATE64_COUNT
+            || general_count != ARM_THREAD_STATE64_COUNT
+            || memcmp(
+                &saved_vector,
+                &observed_vector,
+                sizeof(saved_vector)
+            ) != 0
+            || !continuum_arm64_general_states_equal(
+                &saved_general,
+                &observed_general
+            )) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+            goto rollback;
+        }
+    }
+
+    thread_act_array_t verified_threads = NULL;
+    mach_msg_type_number_t verified_count = 0;
+    mach_result = task_threads(
+        session->task,
+        &verified_threads,
+        &verified_count
+    );
+    if (mach_result != KERN_SUCCESS
+        || (size_t)verified_count != thread_count) {
+        status = CONTINUUM_STATUS_THREAD_SET_CHANGED;
+    }
+    if (verified_threads != NULL) {
+        for (mach_msg_type_number_t index = 0;
+             index < verified_count;
+             index += 1) {
+            mach_port_deallocate(mach_task_self(), verified_threads[index]);
+        }
+        vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)verified_threads,
+            (vm_size_t)(verified_count * sizeof(thread_act_t))
+        );
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        goto rollback;
+    }
+
+    session->has_reconstructed_thread_set = 1;
+    out_report->reconstructed_thread_count = thread_count;
+    out_report->created_raw_thread_count = created_count;
+    out_report->general_state_bytes = general_state_bytes;
+    out_report->vector_state_bytes = vector_state_bytes;
+    out_report->primary_replacement_thread_identifier =
+        replacement_thread_identifier;
+    out_report->all_states_verified = 1;
+
+    if (existing_threads != NULL) {
+        vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)existing_threads,
+            (vm_size_t)(existing_count * sizeof(thread_act_t))
+        );
+    }
+    for (size_t index = 0; index < thread_count; index += 1) {
+        if (ports[index] != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), ports[index]);
+        }
+    }
+    free(ports);
+    return CONTINUUM_STATUS_OK;
+
+rollback:
+    out_report->rollback_attempted = 1;
+    int rollback_verified = 1;
+    for (size_t index = 0; index < thread_count; index += 1) {
+        if (index != primary_index && ports[index] != MACH_PORT_NULL
+            && thread_terminate(ports[index]) != KERN_SUCCESS) {
+            rollback_verified = 0;
+        }
+    }
+    if (primary_was_modified && primary_index != SIZE_MAX
+        && ports[primary_index] != MACH_PORT_NULL) {
+        if (thread_set_state(
+                ports[primary_index],
+                ARM_NEON_STATE64,
+                (thread_state_t)&original_vector,
+                ARM_NEON_STATE64_COUNT
+            ) != KERN_SUCCESS
+            || thread_set_state(
+                ports[primary_index],
+                ARM_THREAD_STATE64,
+                (thread_state_t)&original_general,
+                ARM_THREAD_STATE64_COUNT
+            ) != KERN_SUCCESS) {
+            rollback_verified = 0;
+        }
+    }
+
+    if (primary_was_modified && primary_index != SIZE_MAX
+        && ports[primary_index] != MACH_PORT_NULL) {
+        arm_thread_state64_t observed_general;
+        arm_neon_state64_t observed_vector;
+        memset(&observed_general, 0, sizeof(observed_general));
+        memset(&observed_vector, 0, sizeof(observed_vector));
+        mach_msg_type_number_t general_count = ARM_THREAD_STATE64_COUNT;
+        mach_msg_type_number_t vector_count = ARM_NEON_STATE64_COUNT;
+        if (thread_get_state(
+                ports[primary_index],
+                ARM_THREAD_STATE64,
+                (thread_state_t)&observed_general,
+                &general_count
+            ) != KERN_SUCCESS
+            || thread_get_state(
+                ports[primary_index],
+                ARM_NEON_STATE64,
+                (thread_state_t)&observed_vector,
+                &vector_count
+            ) != KERN_SUCCESS
+            || general_count != ARM_THREAD_STATE64_COUNT
+            || vector_count != ARM_NEON_STATE64_COUNT
+            || !continuum_arm64_general_states_equal(
+                &original_general,
+                &observed_general
+            )
+            || memcmp(
+                &original_vector,
+                &observed_vector,
+                sizeof(original_vector)
+            ) != 0) {
+            rollback_verified = 0;
+        }
+    }
+
+    if (primary_was_modified || created_count > 0) {
+        thread_act_array_t rollback_threads = NULL;
+        mach_msg_type_number_t rollback_count = 0;
+        mach_result = task_threads(
+            session->task,
+            &rollback_threads,
+            &rollback_count
+        );
+        if (mach_result != KERN_SUCCESS || rollback_count != 1) {
+            rollback_verified = 0;
+        } else if (replacement_thread_identifier != 0) {
+            thread_identifier_info_data_t rollback_identity;
+            memset(&rollback_identity, 0, sizeof(rollback_identity));
+            mach_msg_type_number_t rollback_identity_count =
+                THREAD_IDENTIFIER_INFO_COUNT;
+            if (thread_info(
+                    rollback_threads[0],
+                    THREAD_IDENTIFIER_INFO,
+                    (thread_info_t)&rollback_identity,
+                    &rollback_identity_count
+                ) != KERN_SUCCESS
+                || rollback_identity.thread_id
+                    != replacement_thread_identifier) {
+                rollback_verified = 0;
+            }
+        }
+        if (rollback_threads != NULL) {
+            for (mach_msg_type_number_t index = 0;
+                 index < rollback_count;
+                 index += 1) {
+                mach_port_deallocate(
+                    mach_task_self(),
+                    rollback_threads[index]
+                );
+            }
+            vm_deallocate(
+                mach_task_self(),
+                (vm_address_t)rollback_threads,
+                (vm_size_t)(rollback_count * sizeof(thread_act_t))
+            );
+        }
+    }
+
+    if (existing_threads != NULL) {
+        for (mach_msg_type_number_t index = 0;
+             index < existing_count;
+             index += 1) {
+            if (existing_threads[index] != MACH_PORT_NULL) {
+                mach_port_deallocate(
+                    mach_task_self(),
+                    existing_threads[index]
+                );
+            }
+        }
+        vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)existing_threads,
+            (vm_size_t)(existing_count * sizeof(thread_act_t))
+        );
+    }
+    for (size_t index = 0; index < thread_count; index += 1) {
+        if (ports[index] != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), ports[index]);
+        }
+    }
+    free(ports);
+
+    continuum_status resume_status = continuum_resume_session(
+        session,
+        did_suspend
+    );
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        rollback_verified = 0;
+    }
+    out_report->rollback_verified = rollback_verified ? 1 : 0;
+    return rollback_verified ? status : CONTINUUM_STATUS_ROLLBACK_FAILED;
+#endif
+}
+
+continuum_status continuum_remote_session_release_entry_stopped_child(
+    continuum_remote_session *session,
+    int32_t process_id
+) {
+    if (session == NULL || process_id <= 0
+        || session->identity.process_id != process_id
+        || !session->has_reconstructed_thread_set
+        || session->owned_suspend_count == 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    continuum_status status = continuum_validate_stopped_replacement_session(
+        session
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+    if (ptrace(PT_DETACH, process_id, (caddr_t)1, 0) != 0) {
+        return errno == ESRCH
+            ? CONTINUUM_STATUS_TARGET_EXITED
+            : CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+    status = continuum_discharge_owned_suspensions(
+        session,
+        CONTINUUM_RESUME_ATTEMPT_LIMIT
+    );
+    if (status == CONTINUUM_STATUS_OK) {
+        session->has_reconstructed_thread_set = 0;
+    } else if (task_terminate(session->task) == KERN_SUCCESS) {
+        // PT_DETACH already committed the ptrace transition. If the owned task
+        // suspension cannot be released exactly, fail closed so no later
+        // session cleanup can accidentally run a partially released child.
+        session->owned_suspend_count = 0;
+        session->has_reconstructed_thread_set = 0;
+    }
+    return status;
 }
 
 continuum_status continuum_remote_session_reconstruct_region(

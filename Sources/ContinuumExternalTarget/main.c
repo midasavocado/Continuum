@@ -2,6 +2,9 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <mach/mach.h>
+#if defined(__arm64__)
+#include <mach/arm/thread_status.h>
+#endif
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -14,6 +17,60 @@
 
 extern char **environ;
 static const char *self_executable = NULL;
+#define COLD_RAW_THREAD_STACK_SIZE (1024U * 1024U)
+
+#if defined(__arm64__)
+static volatile uint64_t cold_raw_thread_counter = 0;
+
+__attribute__((noreturn, noinline))
+static void cold_raw_thread_loop(void) {
+    for (;;) {
+        cold_raw_thread_counter += 1;
+        __asm__ volatile("" ::: "memory");
+    }
+}
+
+static int start_cold_raw_thread(void) {
+    void *stack = mmap(
+        NULL,
+        COLD_RAW_THREAD_STACK_SIZE,
+        PROT_READ | PROT_WRITE,
+        MAP_ANON | MAP_PRIVATE,
+        -1,
+        0
+    );
+    if (stack == MAP_FAILED) {
+        return 0;
+    }
+
+    uintptr_t stack_pointer = (uintptr_t)stack + COLD_RAW_THREAD_STACK_SIZE;
+    stack_pointer &= ~(uintptr_t)0xFU;
+    arm_thread_state64_t state;
+    memset(&state, 0, sizeof(state));
+    arm_thread_state64_set_pc_fptr(state, cold_raw_thread_loop);
+    arm_thread_state64_set_sp(state, (void *)stack_pointer);
+
+    thread_act_t thread = MACH_PORT_NULL;
+    kern_return_t result = thread_create_running(
+        mach_task_self(),
+        ARM_THREAD_STATE64,
+        (thread_state_t)&state,
+        ARM_THREAD_STATE64_COUNT,
+        &thread
+    );
+    if (result != KERN_SUCCESS) {
+        munmap(stack, COLD_RAW_THREAD_STACK_SIZE);
+        return 0;
+    }
+    mach_port_deallocate(mach_task_self(), thread);
+    return 1;
+}
+#else
+static int start_cold_raw_thread(void) {
+    errno = ENOTSUP;
+    return 0;
+}
+#endif
 
 typedef struct target_state {
     uint8_t *arena;
@@ -421,6 +478,10 @@ int main(int argc, char **argv) {
             if (descriptor >= 0) {
                 close(descriptor);
             }
+            return EXIT_FAILURE;
+        }
+        if (!start_cold_raw_thread()) {
+            close(descriptor);
             return EXIT_FAILURE;
         }
         while (getppid() != 1) {
