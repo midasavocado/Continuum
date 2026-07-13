@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <mach/mach.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +30,63 @@ void continuum_bootstrap_copy_and_trap(
     for (size_t index = 0; index < length; index += 1) {
         destination_bytes[index] = source_bytes[index];
     }
+    __builtin_debugtrap();
+    __builtin_unreachable();
+}
+
+static void *continuum_bootstrap_placeholder_start(void *context) {
+    return context;
+}
+
+int continuum_bootstrap_prepare_suspended_pthreads(
+    continuum_bootstrap_pthread_report *report,
+    size_t report_length,
+    uint32_t requested_count
+) {
+    if (report == NULL || report_length < sizeof(*report)
+        || requested_count == 0
+        || requested_count > CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT) {
+        return EINVAL;
+    }
+    memset(report, 0, sizeof(*report));
+    report->version = 1;
+    report->requested_count = requested_count;
+
+    for (uint32_t index = 0; index < requested_count; index += 1) {
+        pthread_t thread = NULL;
+        int result = pthread_create_suspended_np(
+            &thread,
+            NULL,
+            continuum_bootstrap_placeholder_start,
+            NULL
+        );
+        if (result != 0 || thread == NULL) {
+            report->error_code = result == 0 ? EINVAL : result;
+            return report->error_code;
+        }
+        report->pthread_addresses[index] = (uint64_t)(uintptr_t)thread;
+        mach_port_t mach_thread = pthread_mach_thread_np(thread);
+        report->mach_thread_ports[index] = mach_thread;
+        report->created_count += 1;
+        if (!MACH_PORT_VALID(mach_thread)) {
+            report->error_code = EINVAL;
+            return report->error_code;
+        }
+    }
+    return 0;
+}
+
+__attribute__((visibility("default"), noinline, noreturn))
+void continuum_bootstrap_prepare_pthreads_and_trap(
+    continuum_bootstrap_pthread_report *report,
+    size_t report_length,
+    uint32_t requested_count
+) {
+    (void)continuum_bootstrap_prepare_suspended_pthreads(
+        report,
+        report_length,
+        requested_count
+    );
     __builtin_debugtrap();
     __builtin_unreachable();
 }
@@ -296,6 +355,14 @@ static void continuum_bootstrap_report_copy_address(void) {
         ptrauth_key_function_pointer
     );
 #endif
+    uintptr_t pthread_prepare_address =
+        (uintptr_t)(void *)&continuum_bootstrap_prepare_pthreads_and_trap;
+#if __has_feature(ptrauth_calls)
+    pthread_prepare_address = (uintptr_t)ptrauth_strip(
+        (void *)pthread_prepare_address,
+        ptrauth_key_function_pointer
+    );
+#endif
     Dl_info image;
     memset(&image, 0, sizeof(image));
     if (dladdr((void *)copy_address, &image) == 0
@@ -304,7 +371,8 @@ static void continuum_bootstrap_report_copy_address(void) {
         return;
     }
     uintptr_t image_base = (uintptr_t)image.dli_fbase;
-    if (copy_address <= image_base) {
+    if (copy_address <= image_base
+        || pthread_prepare_address <= image_base) {
         close(descriptor);
         return;
     }
@@ -313,10 +381,11 @@ static void continuum_bootstrap_report_copy_address(void) {
     int length = snprintf(
         report,
         sizeof(report),
-        "CONTINUUM_BOOTSTRAP_V3 %d 0x%llx 0x%llx %u\n",
+        "CONTINUUM_BOOTSTRAP_V4 %d 0x%llx 0x%llx 0x%llx %u\n",
         getpid(),
         (unsigned long long)image_base,
         (unsigned long long)copy_address,
+        (unsigned long long)pthread_prepare_address,
         restored_descriptor_count
     );
     if (length > 0 && (size_t)length < sizeof(report)

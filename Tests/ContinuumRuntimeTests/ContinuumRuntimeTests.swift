@@ -1,5 +1,6 @@
 import XCTest
 import ContinuumRuntime
+import ContinuumBootstrap
 import Darwin
 
 final class ContinuumRuntimeTests: XCTestCase {
@@ -11,6 +12,33 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertGreaterThan(info.readable_region_count, 0)
         XCTAssertGreaterThan(info.writable_region_count, 0)
         XCTAssertGreaterThan(info.thread_count, 0)
+    }
+
+    func testBootstrapPreparesOneSuspendedOrdinaryPthread() {
+        var report = continuum_bootstrap_pthread_report()
+        XCTAssertEqual(
+            continuum_bootstrap_prepare_suspended_pthreads(
+                &report,
+                MemoryLayout.size(ofValue: report),
+                1
+            ),
+            0
+        )
+        XCTAssertEqual(report.version, 1)
+        XCTAssertEqual(report.requested_count, 1)
+        XCTAssertEqual(report.created_count, 1)
+        XCTAssertEqual(report.error_code, 0)
+        XCTAssertNotEqual(report.pthread_addresses.0, 0)
+        XCTAssertNotEqual(report.mach_thread_ports.0, 0)
+
+        let machThread = mach_port_t(report.mach_thread_ports.0)
+        XCTAssertEqual(thread_resume(machThread), KERN_SUCCESS)
+        guard let pthread = pthread_t(
+            bitPattern: UInt(report.pthread_addresses.0)
+        ) else {
+            return XCTFail("Bootstrap returned an invalid pthread address")
+        }
+        XCTAssertEqual(pthread_join(pthread, nil), 0)
     }
 
     func testTrackedMemoryMovesBackwardAndForward() {

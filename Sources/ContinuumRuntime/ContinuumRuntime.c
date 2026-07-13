@@ -452,6 +452,7 @@ struct continuum_remote_session {
     continuum_remote_identity identity;
     continuum_remote_region_descriptor registered_region;
     uint64_t bootstrap_copy_address;
+    uint64_t bootstrap_pthread_prepare_address;
     uint64_t reconstruction_address;
     uint64_t reconstruction_length;
     uint32_t owned_suspend_count;
@@ -1119,9 +1120,11 @@ continuum_status continuum_inspect_local_bootstrap_library(
     }
     continuum_status status = CONTINUUM_STATUS_VALIDATION_FAILED;
     void *symbol = dlsym(handle, "continuum_bootstrap_copy_and_trap");
+    void *pthread_symbol = dlsym(
+        handle, "continuum_bootstrap_prepare_pthreads_and_trap");
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    if (symbol == NULL || dladdr(symbol, &info) == 0
+    if (symbol == NULL || pthread_symbol == NULL || dladdr(symbol, &info) == 0
         || info.dli_fbase == NULL || info.dli_fname == NULL) {
         goto cleanup;
     }
@@ -1139,8 +1142,19 @@ continuum_status continuum_inspect_local_bootstrap_library(
         ptrauth_key_function_pointer
     );
 #endif
+    uintptr_t pthread_prepare_address = (uintptr_t)pthread_symbol;
+#if __has_feature(ptrauth_calls)
+    pthread_prepare_address = (uintptr_t)ptrauth_strip(
+        pthread_symbol,
+        ptrauth_key_function_pointer
+    );
+#endif
     uintptr_t image_base = (uintptr_t)info.dli_fbase;
-    if (copy_address <= image_base) {
+    Dl_info pthread_info;
+    memset(&pthread_info, 0, sizeof(pthread_info));
+    if (copy_address <= image_base || pthread_prepare_address <= image_base
+        || dladdr(pthread_symbol, &pthread_info) == 0
+        || pthread_info.dli_fbase != info.dli_fbase) {
         goto cleanup;
     }
     status = continuum_copy_local_image_uuid(
@@ -1153,6 +1167,9 @@ continuum_status continuum_inspect_local_bootstrap_library(
     out_identity->image_base = image_base;
     out_identity->copy_address = copy_address;
     out_identity->copy_offset = copy_address - image_base;
+    out_identity->pthread_prepare_address = pthread_prepare_address;
+    out_identity->pthread_prepare_offset =
+        pthread_prepare_address - image_base;
 
 cleanup:
     dlclose(handle);
@@ -4650,7 +4667,9 @@ continuum_status continuum_remote_session_set_bootstrap_copy_identity(
     if (status != CONTINUUM_STATUS_OK || identity == NULL
         || expected_library_path == NULL || expected_library_path[0] == '\0'
         || identity->image_base == 0 || identity->copy_address == 0
-        || identity->copy_offset == 0) {
+        || identity->copy_offset == 0
+        || identity->pthread_prepare_address == 0
+        || identity->pthread_prepare_offset == 0) {
         return status == CONTINUUM_STATUS_OK
             ? CONTINUUM_STATUS_INVALID_ARGUMENT
             : status;
@@ -4662,6 +4681,15 @@ continuum_status continuum_remote_session_set_bootstrap_copy_identity(
             identity->copy_offset,
             &expected_copy_address
         ) || expected_copy_address != identity->copy_address) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    uint64_t expected_pthread_prepare_address = 0;
+    if (!continuum_add_u64(
+            identity->image_base,
+            identity->pthread_prepare_offset,
+            &expected_pthread_prepare_address
+        ) || expected_pthread_prepare_address
+            != identity->pthread_prepare_address) {
         return CONTINUUM_STATUS_VALIDATION_FAILED;
     }
     status = continuum_validate_remote_bootstrap_image(
@@ -4688,7 +4716,23 @@ continuum_status continuum_remote_session_set_bootstrap_copy_identity(
             ? CONTINUUM_STATUS_VALIDATION_FAILED
             : status;
     }
+    executable_length = 0;
+    status = continuum_reconstruction_leaf_span(
+        session->task,
+        identity->pthread_prepare_address,
+        1,
+        VM_PROT_READ | VM_PROT_EXECUTE,
+        &executable_length,
+        &mach_result
+    );
+    if (status != CONTINUUM_STATUS_OK || executable_length != 1) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
     session->bootstrap_copy_address = identity->copy_address;
+    session->bootstrap_pthread_prepare_address =
+        identity->pthread_prepare_address;
     return CONTINUUM_STATUS_OK;
 }
 

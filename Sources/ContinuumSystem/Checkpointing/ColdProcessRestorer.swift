@@ -1096,9 +1096,9 @@ public actor ColdProcessRestorer {
         }
         let contents = String(decoding: bytes.prefix(count), as: UTF8.self)
         let fields = contents.split(whereSeparator: { $0.isWhitespace })
-        guard fields.count == 5,
-              fields[0] == "CONTINUUM_BOOTSTRAP_V3",
-              Int(fields[4]) == expectedRestoredDescriptorCount,
+        guard fields.count == 6,
+              fields[0] == "CONTINUUM_BOOTSTRAP_V4",
+              Int(fields[5]) == expectedRestoredDescriptorCount,
               Int32(fields[1]) == expectedProcessIdentifier else {
             throw ContinuumError.restoreUnavailable(
                 "Continuum's pre-main bootstrap descriptor is invalid."
@@ -1110,8 +1110,15 @@ public actor ColdProcessRestorer {
         let addressText = fields[3].hasPrefix("0x")
             ? fields[3].dropFirst(2)
             : fields[3][...]
+        let pthreadPrepareAddressText = fields[4].hasPrefix("0x")
+            ? fields[4].dropFirst(2)
+            : fields[4][...]
         guard let imageBase = UInt64(imageBaseText, radix: 16), imageBase != 0,
-              let address = UInt64(addressText, radix: 16), address != 0 else {
+              let address = UInt64(addressText, radix: 16), address != 0,
+              let pthreadPrepareAddress = UInt64(
+                pthreadPrepareAddressText,
+                radix: 16
+              ), pthreadPrepareAddress != 0 else {
             throw ContinuumError.restoreUnavailable(
                 "Continuum's pre-main bootstrap address is invalid."
             )
@@ -1119,7 +1126,13 @@ public actor ColdProcessRestorer {
         let (expectedAddress, overflow) = imageBase.addingReportingOverflow(
             localIdentity.copy_offset
         )
-        guard !overflow, expectedAddress == address else {
+        let (expectedPthreadPrepareAddress, pthreadPrepareOverflow) =
+            imageBase.addingReportingOverflow(
+                localIdentity.pthread_prepare_offset
+            )
+        guard !overflow, expectedAddress == address,
+              !pthreadPrepareOverflow,
+              expectedPthreadPrepareAddress == pthreadPrepareAddress else {
             throw ContinuumError.restoreUnavailable(
                 "Continuum's pre-main bootstrap symbol does not match its signed library."
             )
@@ -1127,6 +1140,7 @@ public actor ColdProcessRestorer {
         var identity = localIdentity
         identity.image_base = imageBase
         identity.copy_address = address
+        identity.pthread_prepare_address = pthreadPrepareAddress
         return identity
     }
 

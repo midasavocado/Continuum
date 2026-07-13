@@ -57,7 +57,10 @@ let package = Package(
         .testTarget(name: "ContinuumCoreTests", dependencies: ["ContinuumCore"]),
         .testTarget(name: "ContinuumStoreTests", dependencies: ["ContinuumCore", "ContinuumStore"]),
         .testTarget(name: "ContinuumSystemTests", dependencies: ["ContinuumCore", "ContinuumSystem"]),
-        .testTarget(name: "ContinuumRuntimeTests", dependencies: ["ContinuumRuntime"]),
+        .testTarget(
+            name: "ContinuumRuntimeTests",
+            dependencies: ["ContinuumRuntime", "ContinuumBootstrap"]
+        ),
         .testTarget(name: "ContinuumAppTests", dependencies: ["ContinuumApp", "ContinuumSystem"])
     ]
 )

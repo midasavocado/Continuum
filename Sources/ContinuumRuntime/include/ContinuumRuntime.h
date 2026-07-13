@@ -63,6 +63,8 @@ typedef struct continuum_bootstrap_identity {
     uint64_t image_base;
     uint64_t copy_address;
     uint64_t copy_offset;
+    uint64_t pthread_prepare_address;
+    uint64_t pthread_prepare_offset;
     uint8_t image_uuid[16];
 } continuum_bootstrap_identity;
 
