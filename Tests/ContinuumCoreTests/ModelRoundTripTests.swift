@@ -47,6 +47,12 @@ final class ModelRoundTripTests: XCTestCase {
                     executableDevice: 7,
                     executableInode: 9,
                     vmLayoutHash: 11,
+                    launchContract: DurableLaunchContract(
+                        executablePath: "/Applications/Test.app/Contents/MacOS/Test",
+                        arguments: ["Test", "--restore-me"],
+                        environment: ["LANG=en_US.UTF-8", "CONTINUUM_TEST=1"],
+                        workingDirectory: "/private/tmp"
+                    ),
                     regions: [
                         DurableMemoryRegion(
                             address: 0x1_0000_0000,

@@ -428,6 +428,24 @@ continuum_status continuum_remote_process_group_copy_member_info(
     continuum_remote_process_group_member_info *out_info
 );
 
+/// Copies the native KERN_PROCARGS2 payload for the captured member. The blob
+/// contains argc, executable path, argv, and environment in launch order.
+continuum_status continuum_remote_process_group_copy_member_procargs(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+);
+
+continuum_status continuum_remote_process_group_copy_member_working_directory(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+);
+
 /// Copies every regular vnode opened for writing by any captured group member.
 /// A null `entries` with zero capacity returns the required count. Call only
 /// from a coherent resource callback while the group is suspended.

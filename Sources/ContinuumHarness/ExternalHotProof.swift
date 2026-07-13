@@ -408,6 +408,19 @@ enum ExternalHotProof {
                 },
             "reopened durable checkpoint omitted process memory or registers"
         )
+        try require(
+            durableImage.members.allSatisfy { member in
+                guard let launch = member.launchContract else { return false }
+                return FileManager.default.isExecutableFile(
+                    atPath: launch.executablePath
+                )
+                    && !launch.arguments.isEmpty
+                    && launch.arguments[0].contains("ContinuumExternalTarget")
+                    && launch.environment.contains { $0.hasPrefix("PATH=") }
+                    && !launch.workingDirectory.isEmpty
+            },
+            "reopened durable checkpoint omitted the process relaunch contract"
+        )
         let durableMemoryChunks = durableImage.members.reduce(into: 0) {
             total, member in
             total += member.regions.reduce(0) { $0 + $1.chunks.count }

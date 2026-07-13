@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -3035,6 +3036,96 @@ continuum_status continuum_remote_process_group_copy_member_info(
         process_snapshot->resources.descriptor_table_hash;
     out_info->mach_name_count = process_snapshot->resources.mach_name_count;
     out_info->mach_space_hash = process_snapshot->resources.mach_space_hash;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_process_group_copy_member_procargs(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+) {
+    if (snapshot == NULL || out_required_length == NULL
+        || member_index >= snapshot->member_count
+        || snapshot->members[member_index].session == NULL
+        || (destination == NULL && destination_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    continuum_status status = continuum_validate_session_identity(
+        snapshot->members[member_index].session
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    int mib[] = {
+        CTL_KERN,
+        KERN_PROCARGS2,
+        snapshot->members[member_index].session->identity.process_id
+    };
+    size_t length = 0;
+    if (sysctl(mib, 3, NULL, &length, NULL, 0) != 0 || length == 0) {
+        return CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+    *out_required_length = length;
+    if (destination == NULL) {
+        return CONTINUUM_STATUS_OK;
+    }
+    if (destination_capacity < length) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    size_t copied_length = length;
+    if (sysctl(mib, 3, destination, &copied_length, NULL, 0) != 0) {
+        return CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+    *out_required_length = copied_length;
+    return copied_length <= destination_capacity
+        ? CONTINUUM_STATUS_OK
+        : CONTINUUM_STATUS_RANGE_ERROR;
+}
+
+continuum_status continuum_remote_process_group_copy_member_working_directory(
+    const continuum_remote_process_group_snapshot *snapshot,
+    size_t member_index,
+    void *destination,
+    size_t destination_capacity,
+    size_t *out_required_length
+) {
+    if (snapshot == NULL || out_required_length == NULL
+        || member_index >= snapshot->member_count
+        || snapshot->members[member_index].session == NULL
+        || (destination == NULL && destination_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    continuum_status status = continuum_validate_session_identity(
+        snapshot->members[member_index].session
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    struct proc_vnodepathinfo paths;
+    memset(&paths, 0, sizeof(paths));
+    int copied = proc_pidinfo(
+        snapshot->members[member_index].session->identity.process_id,
+        PROC_PIDVNODEPATHINFO,
+        0,
+        &paths,
+        (int)sizeof(paths)
+    );
+    if (copied != (int)sizeof(paths) || paths.pvi_cdir.vip_path[0] == '\0') {
+        return CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+    size_t length = strnlen(paths.pvi_cdir.vip_path, MAXPATHLEN) + 1;
+    *out_required_length = length;
+    if (destination == NULL) {
+        return CONTINUUM_STATUS_OK;
+    }
+    if (destination_capacity < length) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    memcpy(destination, paths.pvi_cdir.vip_path, length);
     return CONTINUUM_STATUS_OK;
 }
 

@@ -47,6 +47,7 @@ public struct DurableProcessImage: Codable, Hashable, Sendable {
     public let executableDevice: UInt64
     public let executableInode: UInt64
     public let vmLayoutHash: UInt64
+    public let launchContract: DurableLaunchContract?
     public let regions: [DurableMemoryRegion]
     public let threads: [DurableThreadImage]
 
@@ -56,6 +57,7 @@ public struct DurableProcessImage: Codable, Hashable, Sendable {
         executableDevice: UInt64,
         executableInode: UInt64,
         vmLayoutHash: UInt64,
+        launchContract: DurableLaunchContract? = nil,
         regions: [DurableMemoryRegion],
         threads: [DurableThreadImage]
     ) {
@@ -64,8 +66,30 @@ public struct DurableProcessImage: Codable, Hashable, Sendable {
         self.executableDevice = executableDevice
         self.executableInode = executableInode
         self.vmLayoutHash = vmLayoutHash
+        self.launchContract = launchContract
         self.regions = regions
         self.threads = threads
+    }
+}
+
+/// The process attributes required to recreate a fresh suspended shell before
+/// the restorer replaces its address space and thread state.
+public struct DurableLaunchContract: Codable, Hashable, Sendable {
+    public let executablePath: String
+    public let arguments: [String]
+    public let environment: [String]
+    public let workingDirectory: String
+
+    public init(
+        executablePath: String,
+        arguments: [String],
+        environment: [String],
+        workingDirectory: String
+    ) {
+        self.executablePath = executablePath
+        self.arguments = arguments
+        self.environment = environment
+        self.workingDirectory = workingDirectory
     }
 }
 

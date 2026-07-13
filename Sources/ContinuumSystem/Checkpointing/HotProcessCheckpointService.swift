@@ -420,6 +420,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 executableDevice: member.executable_device,
                 executableInode: member.executable_inode,
                 vmLayoutHash: member.vm_layout_hash,
+                launchContract: try launchContract(
+                    snapshot: snapshot,
+                    memberIndex: memberIndex
+                ),
                 regions: regions,
                 threads: threads
             ))
@@ -444,6 +448,119 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             data: try encoder.encode(image)
         ))
         return artifacts
+    }
+
+    private func launchContract(
+        snapshot: OpaquePointer,
+        memberIndex: Int
+    ) throws -> DurableLaunchContract {
+        var procargsLength = 0
+        try requireRuntimeOK(
+            continuum_remote_process_group_copy_member_procargs(
+                snapshot, memberIndex, nil, 0, &procargsLength
+            ),
+            operation: "measure process launch arguments"
+        )
+        var procargs = Data(count: procargsLength)
+        let procargsStatus = procargs.withUnsafeMutableBytes { bytes in
+            continuum_remote_process_group_copy_member_procargs(
+                snapshot,
+                memberIndex,
+                bytes.baseAddress,
+                bytes.count,
+                &procargsLength
+            )
+        }
+        try requireRuntimeOK(procargsStatus, operation: "capture process launch arguments")
+        if procargsLength < procargs.count {
+            procargs.removeSubrange(procargsLength..<procargs.count)
+        }
+
+        var directoryLength = 0
+        try requireRuntimeOK(
+            continuum_remote_process_group_copy_member_working_directory(
+                snapshot, memberIndex, nil, 0, &directoryLength
+            ),
+            operation: "measure process working directory"
+        )
+        var directory = Data(count: directoryLength)
+        let directoryStatus = directory.withUnsafeMutableBytes { bytes in
+            continuum_remote_process_group_copy_member_working_directory(
+                snapshot,
+                memberIndex,
+                bytes.baseAddress,
+                bytes.count,
+                &directoryLength
+            )
+        }
+        try requireRuntimeOK(directoryStatus, operation: "capture process working directory")
+
+        let parsed = try Self.parseProcargs(procargs)
+        let workingDirectory = directory.withUnsafeBytes { bytes -> String? in
+            guard let base = bytes.baseAddress?.assumingMemoryBound(to: CChar.self) else {
+                return nil
+            }
+            return String(validatingCString: base)
+        }
+        guard let workingDirectory else {
+            throw ContinuumError.runtimeUnsupported(
+                "The runtime captured an invalid process working directory."
+            )
+        }
+        return DurableLaunchContract(
+            executablePath: parsed.executablePath,
+            arguments: parsed.arguments,
+            environment: parsed.environment,
+            workingDirectory: workingDirectory
+        )
+    }
+
+    private static func parseProcargs(
+        _ data: Data
+    ) throws -> (executablePath: String, arguments: [String], environment: [String]) {
+        guard data.count >= MemoryLayout<Int32>.size else {
+            throw ContinuumError.runtimeUnsupported("The process launch payload was truncated.")
+        }
+        let argumentCount = data.withUnsafeBytes { bytes in
+            Int(bytes.loadUnaligned(as: Int32.self))
+        }
+        guard argumentCount >= 0 else {
+            throw ContinuumError.runtimeUnsupported("The process launch argument count was invalid.")
+        }
+
+        var offset = MemoryLayout<Int32>.size
+        func nextString() -> String? {
+            guard offset < data.count else { return nil }
+            let start = offset
+            while offset < data.count, data[offset] != 0 { offset += 1 }
+            guard offset < data.count else { return nil }
+            let value = String(data: data[start..<offset], encoding: .utf8)
+            offset += 1
+            return value
+        }
+
+        guard let executablePath = nextString(), !executablePath.isEmpty else {
+            throw ContinuumError.runtimeUnsupported("The process executable path was missing.")
+        }
+        while offset < data.count, data[offset] == 0 { offset += 1 }
+
+        var arguments: [String] = []
+        arguments.reserveCapacity(argumentCount)
+        for _ in 0..<argumentCount {
+            guard let argument = nextString() else {
+                throw ContinuumError.runtimeUnsupported("The process argument vector was truncated.")
+            }
+            arguments.append(argument)
+        }
+        while offset < data.count, data[offset] == 0 { offset += 1 }
+
+        var environment: [String] = []
+        while offset < data.count {
+            guard let entry = nextString() else { break }
+            if entry.isEmpty { break }
+            environment.append(entry)
+        }
+        return (executablePath, arguments, environment)
     }
 
     private func copyThreadState(
