@@ -11,7 +11,24 @@ public protocol SnapshotRepository: Sendable {
     func deleteSnapshot(_ snapshotID: SnapshotID) async throws
     func deleteAllSnapshots() async throws
     func artifacts(for snapshotID: SnapshotID) async throws -> [CapturedArtifact]
+    func artifact(for snapshotID: SnapshotID, logicalName: String) async throws -> CapturedArtifact
     func switchBranch(to branchID: BranchID) async throws
+}
+
+public extension SnapshotRepository {
+    func artifact(
+        for snapshotID: SnapshotID,
+        logicalName: String
+    ) async throws -> CapturedArtifact {
+        guard let artifact = try await artifacts(for: snapshotID).first(where: {
+            $0.logicalName == logicalName
+        }) else {
+            throw ContinuumError.restoreUnavailable(
+                "Snapshot data is missing \(logicalName)."
+            )
+        }
+        return artifact
+    }
 }
 
 public protocol AppInventoryProviding: Sendable {

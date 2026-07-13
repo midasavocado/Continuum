@@ -58,6 +58,17 @@ typedef struct continuum_remote_process_snapshot continuum_remote_process_snapsh
 typedef struct continuum_remote_process_group_snapshot
     continuum_remote_process_group_snapshot;
 
+typedef struct continuum_bootstrap_identity {
+    uint64_t image_base;
+    uint64_t copy_address;
+    uint64_t copy_offset;
+    uint8_t image_uuid[16];
+} continuum_bootstrap_identity;
+
+typedef struct continuum_sha256_digest {
+    uint8_t bytes[32];
+} continuum_sha256_digest;
+
 /// Creates a clean replacement process from a captured launch contract and
 /// leaves it kernel-suspended before any target instruction executes.
 continuum_status continuum_spawn_process_suspended(
@@ -66,6 +77,49 @@ continuum_status continuum_spawn_process_suspended(
     const char *const environment[],
     const char *working_directory,
     int32_t *out_process_id
+);
+
+/// The descriptor remains open in the child despite
+/// POSIX_SPAWN_CLOEXEC_DEFAULT. Continuum uses this for a private, unlinked
+/// bootstrap handshake instead of trusting a pathname that another process
+/// could replace.
+continuum_status continuum_spawn_process_suspended_with_inherited_descriptor(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    int32_t *out_process_id
+);
+
+/// Loads ContinuumBootstrap locally and resolves its exact exported copy
+/// symbol to a Mach-O UUID and image-relative offset.
+continuum_status continuum_inspect_local_bootstrap_library(
+    const char *library_path,
+    continuum_bootstrap_identity *out_identity
+);
+
+/// Terminates and reaps a direct child, including a child currently stopped
+/// under ptrace at Continuum's executable-entry boundary.
+continuum_status continuum_terminate_direct_child(
+    int32_t process_id,
+    uint32_t timeout_milliseconds
+);
+
+/// Advances a direct child from the kernel's initial spawn stop to the
+/// SIGSTOP raised by ContinuumBootstrap's dyld constructor. Success means the
+/// loader finished mapping launch-time images and app main has not executed.
+continuum_status continuum_advance_process_to_bootstrap_stop(
+    int32_t process_id,
+    uint32_t timeout_milliseconds
+);
+
+/// Advances a constructor-stopped direct child through dyld cleanup and stops
+/// it on an ARM64 hardware breakpoint at its LC_MAIN entry. The executable's
+/// first instruction has not run when this succeeds.
+continuum_status continuum_advance_process_to_entry_stop(
+    int32_t process_id,
+    uint32_t timeout_milliseconds
 );
 
 /// Runs while every member of a process group remains coherently suspended.
@@ -110,12 +164,22 @@ typedef struct continuum_owned_buffer {
 
 typedef struct continuum_remote_restore_report {
     uint64_t bytes_written;
+    uint64_t observed_mapping_address;
+    uint64_t observed_mapping_length;
     uint8_t readback_verified;
     uint8_t rollback_attempted;
     uint8_t rollback_verified;
     uint8_t max_protection_verified;
     uint32_t reconstruction_stage;
     int32_t mach_result;
+    int32_t observed_protection;
+    int32_t observed_maximum_protection;
+    int32_t observed_inheritance;
+    uint32_t observed_share_mode;
+    uint32_t observed_user_tag;
+    uint64_t observed_offset;
+    uint16_t observed_flags;
+    uint8_t observed_external_pager;
 } continuum_remote_restore_report;
 
 typedef enum continuum_reconstruction_stage {
@@ -139,6 +203,7 @@ typedef struct continuum_remote_process_snapshot_info {
     uint64_t excluded_bytes;
     uint64_t thread_count;
     uint64_t vm_layout_hash;
+    continuum_sha256_digest immutable_layout_digest;
     uint64_t thread_set_hash;
 } continuum_remote_process_snapshot_info;
 
@@ -146,6 +211,7 @@ typedef struct continuum_remote_process_layout_info {
     uint64_t region_count;
     uint64_t virtual_bytes;
     uint64_t layout_hash;
+    continuum_sha256_digest immutable_layout_digest;
 } continuum_remote_process_layout_info;
 
 typedef struct continuum_remote_process_restore_report {
@@ -219,6 +285,7 @@ typedef struct continuum_remote_process_group_member_info {
     uint64_t captured_bytes;
     uint64_t thread_count;
     uint64_t vm_layout_hash;
+    continuum_sha256_digest immutable_layout_digest;
     uint64_t thread_set_hash;
     uint64_t file_descriptor_count;
     uint64_t descriptor_table_hash;
@@ -310,6 +377,46 @@ continuum_status continuum_remote_session_reconstruct_region(
     const continuum_remote_process_region_info *region,
     const void *bytes,
     size_t length,
+    continuum_remote_restore_report *out_report
+);
+
+/// Allocates one saved mapping without materializing its complete contents in
+/// the controller. Callers may then stream chunks with
+/// continuum_remote_session_write_reconstructed_region before finalizing the
+/// saved inheritance and access protections.
+continuum_status continuum_remote_session_begin_reconstruct_region(
+    continuum_remote_session *session,
+    const continuum_remote_process_region_info *region,
+    continuum_remote_restore_report *out_report
+);
+
+/// Registers the exact ContinuumBootstrap symbol after verifying its remote
+/// Mach-O UUID, image-relative offset, load record, path, and executable map.
+/// It is used only when XNU refuses an external Mach write to an otherwise
+/// writable, non-overwritable mapping.
+continuum_status continuum_remote_session_set_bootstrap_copy_identity(
+    continuum_remote_session *session,
+    const continuum_bootstrap_identity *identity,
+    const char *expected_library_path
+);
+
+/// Writes and immediately reads back one bounded range of a mapping prepared
+/// by continuum_remote_session_begin_reconstruct_region.
+continuum_status continuum_remote_session_write_reconstructed_region(
+    continuum_remote_session *session,
+    const continuum_remote_process_region_info *region,
+    uint64_t offset,
+    const void *bytes,
+    size_t length,
+    continuum_remote_restore_report *out_report
+);
+
+/// Applies the saved inheritance and current/max protection policy after all
+/// chunks have been written. macOS may require the later in-process restorer
+/// to narrow the maximum-protection ceiling.
+continuum_status continuum_remote_session_finish_reconstruct_region(
+    continuum_remote_session *session,
+    const continuum_remote_process_region_info *region,
     continuum_remote_restore_report *out_report
 );
 

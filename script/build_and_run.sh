@@ -49,11 +49,17 @@ mkdir -p "$SCRATCH_ROOT/ClangModuleCache" "$SCRATCH_ROOT/SwiftPMModuleCache"
 export CLANG_MODULE_CACHE_PATH="$SCRATCH_ROOT/ClangModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$SCRATCH_ROOT/SwiftPMModuleCache"
 swift build "${SWIFT_BUILD_OPTIONS[@]}" --product "$APP_NAME"
+swift build "${SWIFT_BUILD_OPTIONS[@]}" --product ContinuumBootstrap
 BUILD_DIR="$(swift build "${SWIFTPM_OPTIONS[@]}" --show-bin-path)"
 BUILD_BINARY="$BUILD_DIR/$APP_NAME"
+BUILD_BOOTSTRAP="$BUILD_DIR/libContinuumBootstrap.dylib"
 
 if [[ ! -x "$BUILD_BINARY" ]]; then
   echo "error: SwiftPM did not produce $BUILD_BINARY" >&2
+  exit 1
+fi
+if [[ ! -f "$BUILD_BOOTSTRAP" ]]; then
+  echo "error: SwiftPM did not produce $BUILD_BOOTSTRAP" >&2
   exit 1
 fi
 
@@ -61,7 +67,9 @@ STAGED_BUNDLE="$SCRATCH_ROOT/Staged/$APP_NAME.app"
 STAGED_CONTENTS="$STAGED_BUNDLE/Contents"
 STAGED_MACOS="$STAGED_CONTENTS/MacOS"
 STAGED_RESOURCES="$STAGED_CONTENTS/Resources"
+STAGED_FRAMEWORKS="$STAGED_CONTENTS/Frameworks"
 STAGED_BINARY="$STAGED_MACOS/$APP_NAME"
+STAGED_BOOTSTRAP="$STAGED_FRAMEWORKS/libContinuumBootstrap.dylib"
 INFO_PLIST="$STAGED_CONTENTS/Info.plist"
 APP_ICON="$ROOT_DIR/Assets/Continuum.icns"
 APP_ENTITLEMENTS="$ROOT_DIR/Configuration/Continuum.entitlements"
@@ -76,8 +84,9 @@ if [[ ! -f "$APP_ENTITLEMENTS" ]]; then
   exit 1
 fi
 
-mkdir -p "$STAGED_MACOS" "$STAGED_RESOURCES"
+mkdir -p "$STAGED_MACOS" "$STAGED_RESOURCES" "$STAGED_FRAMEWORKS"
 cp "$BUILD_BINARY" "$STAGED_BINARY"
+cp "$BUILD_BOOTSTRAP" "$STAGED_BOOTSTRAP"
 cp "$APP_ICON" "$STAGED_RESOURCES/Continuum.icns"
 chmod +x "$STAGED_BINARY"
 
@@ -119,6 +128,13 @@ fi
 if [[ -z "$SIGNING_IDENTITY" ]]; then
   SIGNING_IDENTITY="-"
 fi
+
+/usr/bin/codesign \
+  --force \
+  --sign "$SIGNING_IDENTITY" \
+  --options runtime \
+  --timestamp=none \
+  "$STAGED_BOOTSTRAP"
 
 /usr/bin/codesign \
   --force \

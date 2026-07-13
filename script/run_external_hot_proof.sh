@@ -43,17 +43,26 @@ SIP_BEFORE="$(/usr/bin/csrutil status 2>&1)"
 cd "$ROOT_DIR"
 swift build "${SWIFT_OPTIONS[@]}" --product ContinuumHarness
 swift build "${SWIFT_OPTIONS[@]}" --product ContinuumExternalTarget
+swift build "${SWIFT_OPTIONS[@]}" --product ContinuumBootstrap
 BIN_DIR="$(swift build --scratch-path "$SCRATCH_DIR" --show-bin-path)"
 HARNESS="$BIN_DIR/ContinuumHarness"
 TARGET="$BIN_DIR/ContinuumExternalTarget"
+BOOTSTRAP="$BIN_DIR/libContinuumBootstrap.dylib"
 
-for binary in "$HARNESS" "$TARGET"; do
-  if [[ ! -x "$binary" ]]; then
-    echo "error: SwiftPM did not produce executable $binary" >&2
+for binary in "$HARNESS" "$TARGET" "$BOOTSTRAP"; do
+  if [[ ! -f "$binary" ]]; then
+    echo "error: SwiftPM did not produce $binary" >&2
     exit 1
   fi
   /usr/bin/xattr -cr "$binary"
 done
+
+/usr/bin/codesign \
+  --force \
+  --sign "$SIGNING_IDENTITY" \
+  --options runtime \
+  --timestamp=none \
+  "$BOOTSTRAP"
 
 /usr/bin/codesign \
   --force \
@@ -73,6 +82,7 @@ done
 
 /usr/bin/codesign --verify --strict --verbose=2 "$TARGET"
 /usr/bin/codesign --verify --strict --verbose=2 "$HARNESS"
+/usr/bin/codesign --verify --strict --verbose=2 "$BOOTSTRAP"
 
 TARGET_ENTITLEMENTS="$SCRATCH_DIR/target-entitlements.plist"
 HARNESS_ENTITLEMENTS="$SCRATCH_DIR/harness-entitlements.plist"
@@ -83,6 +93,10 @@ if [[ "$(/usr/bin/plutil -extract 'com\.apple\.security\.get-task-allow' raw "$T
   echo "error: signed target is missing com.apple.security.get-task-allow" >&2
   exit 1
 fi
+if [[ "$(/usr/bin/plutil -extract 'com\.apple\.security\.cs\.allow-dyld-environment-variables' raw "$TARGET_ENTITLEMENTS")" != "true" ]]; then
+  echo "error: signed target is missing com.apple.security.cs.allow-dyld-environment-variables" >&2
+  exit 1
+fi
 if [[ "$(/usr/bin/plutil -extract 'com\.apple\.security\.cs\.debugger' raw "$HARNESS_ENTITLEMENTS")" != "true" ]]; then
   echo "error: signed harness is missing com.apple.security.cs.debugger" >&2
   exit 1
@@ -90,10 +104,12 @@ fi
 
 echo "External hot proof signing identity: $SIGNING_IDENTITY"
 echo "Target entitlement verified: com.apple.security.get-task-allow"
+echo "Target entitlement verified: com.apple.security.cs.allow-dyld-environment-variables"
 echo "Harness entitlement verified: com.apple.security.cs.debugger"
 echo "$SIP_BEFORE"
 
-"$HARNESS" external-hot-proof --target "$TARGET" --cycles "$CYCLES"
+CONTINUUM_BOOTSTRAP_LIBRARY_PATH="$BOOTSTRAP" \
+  "$HARNESS" external-hot-proof --target "$TARGET" --cycles "$CYCLES"
 
 SIP_AFTER="$(/usr/bin/csrutil status 2>&1)"
 if [[ "$SIP_AFTER" != "$SIP_BEFORE" ]]; then

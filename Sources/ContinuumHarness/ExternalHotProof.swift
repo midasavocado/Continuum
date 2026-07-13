@@ -319,6 +319,9 @@ enum ExternalHotProof {
             originalRootProcessID: targetPID,
             savedArena: stateA
         )
+        let coldMemory = try await verifyDurableRootMemoryReconstruction(
+            targetPath: targetPath
+        )
 
         print("external-hot-proof: PASS")
         print("  target binary:       \(target.executablePath)")
@@ -339,6 +342,11 @@ enum ExternalHotProof {
         print("  descriptor mutation: rejected before memory write")
         print("  app backend adapter: captured + restored live snapshot state")
         print("  cold replacement:    deterministic layout + saved arena bytes, stopped before main")
+        print(
+            "  cold full memory:     \(coldMemory.reconstructedRegionCount) regions, "
+                + "\(coldMemory.reconstructedChunkCount) encrypted chunks, "
+                + "\(coldMemory.reconstructedBytes) bytes"
+        )
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -401,7 +409,7 @@ enum ExternalHotProof {
         )
         let durableManifest = try await reopenedStore.artifact(
             for: saved.id,
-            logicalName: "durable-checkpoint-v1.json"
+            logicalName: "durable-checkpoint-v2.json"
         )
         let durableImage = try JSONDecoder().decode(
             DurableCheckpointImage.self,
@@ -659,6 +667,129 @@ enum ExternalHotProof {
             firstLayoutHash == secondLayoutHash,
             "controlled cold replacements did not receive a deterministic VM layout"
         )
+    }
+
+    private static func verifyDurableRootMemoryReconstruction(
+        targetPath: String
+    ) async throws -> ColdProcessPreparation {
+        guard let bootstrapLibraryPath = ProcessInfo.processInfo.environment[
+            "CONTINUUM_BOOTSTRAP_LIBRARY_PATH"
+        ], FileManager.default.fileExists(atPath: bootstrapLibraryPath) else {
+            throw ExternalHotProofFailure.invariant(
+                "cold proof bootstrap library is missing"
+            )
+        }
+        var environment = ProcessInfo.processInfo.environment.map {
+            "\($0.key)=\($0.value)"
+        }.filter {
+            !$0.hasPrefix("DYLD_SHARED_REGION=")
+                && !$0.hasPrefix("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=")
+                && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
+                && !$0.hasPrefix("DYLD_INSERT_LIBRARIES=")
+                && !$0.hasPrefix("MallocLargeCache=")
+        }
+        environment.append("DYLD_SHARED_REGION=private")
+        environment.append("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1")
+        environment.append("CONTINUUM_BOOTSTRAP_STOP=1")
+        environment.append("MallocLargeCache=0")
+        environment.append("DYLD_INSERT_LIBRARIES=\(bootstrapLibraryPath)")
+        let arguments = [targetPath, "--continuum-idle-child"]
+
+        var originalProcessIdentifier: Int32 = 0
+        let spawnStatus = withCStringArray(arguments) { argumentEntries in
+            withCStringArray(environment) { environmentEntries in
+                targetPath.withCString { executable in
+                    "/private/tmp".withCString { directory in
+                        continuum_spawn_process_suspended(
+                            executable,
+                            argumentEntries,
+                            environmentEntries,
+                            directory,
+                            &originalProcessIdentifier
+                        )
+                    }
+                }
+            }
+        }
+        try check(spawnStatus, operation: "spawn deterministic durable target")
+        var originalWasReaped = false
+        defer {
+            if !originalWasReaped {
+                kill(originalProcessIdentifier, SIGKILL)
+                var status: Int32 = 0
+                waitpid(originalProcessIdentifier, &status, 0)
+            }
+        }
+        try check(
+            continuum_advance_process_to_bootstrap_stop(
+                originalProcessIdentifier,
+                5_000
+            ),
+            operation: "reach deterministic target pre-main bootstrap"
+        )
+        try require(
+            kill(originalProcessIdentifier, SIGCONT) == 0,
+            "deterministic durable target could not resume"
+        )
+        usleep(100_000)
+
+        let service = HotProcessCheckpointService(
+            maximumCapturedBytes: fullProcessCaptureBudget,
+            maximumRetainedSnapshots: 2
+        )
+        let app = AppIdentity(
+            bundleIdentifier: nil,
+            displayName: "Continuum Deterministic Target",
+            bundleURL: nil,
+            executableURL: URL(fileURLWithPath: targetPath),
+            version: "proof",
+            signingIdentifier: nil,
+            teamIdentifier: nil,
+            isApplePlatformBinary: false
+        )
+        let capture = try await service.capture(
+            app: app,
+            processIdentifiers: [originalProcessIdentifier],
+            kind: .manual,
+            branchID: UUID()
+        )
+        let storeRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "continuum-cold-memory-proof-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: storeRoot) }
+        let store = try EncryptedSnapshotStore(
+            rootURL: storeRoot,
+            encryptionKey: Data(repeating: 0xC7, count: 32)
+        )
+        let saved = try await store.save(capture)
+
+        kill(originalProcessIdentifier, SIGKILL)
+        var originalStatus: Int32 = 0
+        waitpid(originalProcessIdentifier, &originalStatus, 0)
+        originalWasReaped = true
+
+        let restorer = ColdProcessRestorer(
+            bootstrapLibraryURL: URL(fileURLWithPath: bootstrapLibraryPath)
+        )
+        let preparation = try await restorer.prepareRootProcess(
+            from: saved.id,
+            repository: store
+        )
+        try require(
+            preparation.capturedProcessIdentifier == originalProcessIdentifier,
+            "cold restorer selected the wrong durable process image"
+        )
+        try require(
+            preparation.reconstructedRegionCount > 0
+                && preparation.reconstructedChunkCount > 0
+                && preparation.reconstructedBytes
+                    == UInt64(capture.snapshot.logicalBytes),
+            "cold restorer did not populate the complete durable memory image"
+        )
+        await restorer.discard(preparation.id)
+        return preparation
     }
 
     private static func withCStringArray<Result>(

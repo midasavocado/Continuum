@@ -28,6 +28,7 @@ final class ModelRoundTripTests: XCTestCase {
     func testDurableCheckpointImageRoundTripsWithoutLivePointers() throws {
         let chunk = DurableChunkReference(
             hash: String(repeating: "a", count: 64),
+            artifactName: "memory/4242/0000000100000000/0000000000000000.bin",
             logicalBytes: 16_384,
             storedBytes: 1_024,
             compression: .lzfse
@@ -47,6 +48,7 @@ final class ModelRoundTripTests: XCTestCase {
                     executableDevice: 7,
                     executableInode: 9,
                     vmLayoutHash: 11,
+                    immutableLayoutDigest: String(repeating: "b", count: 64),
                     launchContract: DurableLaunchContract(
                         executablePath: "/Applications/Test.app/Contents/MacOS/Test",
                         arguments: ["Test", "--restore-me"],

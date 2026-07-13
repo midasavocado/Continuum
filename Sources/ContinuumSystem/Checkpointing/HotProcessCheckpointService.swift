@@ -339,6 +339,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     ))
                     references.append(DurableChunkReference(
                         hash: hash,
+                        artifactName: logicalName,
                         logicalBytes: UInt64(length),
                         storedBytes: 0,
                         compression: .none
@@ -402,6 +403,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     generalStateFlavor: thread.general_state_flavor,
                     generalState: DurableChunkReference(
                         hash: Self.sha256(general),
+                        artifactName: generalName,
                         logicalBytes: UInt64(general.count),
                         storedBytes: 0,
                         compression: .none
@@ -409,6 +411,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     vectorStateFlavor: thread.vector_state_flavor,
                     vectorState: DurableChunkReference(
                         hash: Self.sha256(vector),
+                        artifactName: vectorName,
                         logicalBytes: UInt64(vector.count),
                         storedBytes: 0,
                         compression: .none
@@ -422,6 +425,9 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 executableDevice: member.executable_device,
                 executableInode: member.executable_inode,
                 vmLayoutHash: member.vm_layout_hash,
+                immutableLayoutDigest: Self.hexDigest(
+                    member.immutable_layout_digest
+                ),
                 launchContract: try launchContract(
                     snapshot: snapshot,
                     memberIndex: memberIndex
@@ -446,7 +452,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         encoder.outputFormatting = [.sortedKeys]
         artifacts.append(CapturedArtifact(
             kind: .metadata,
-            logicalName: "durable-checkpoint-v1.json",
+            logicalName: "durable-checkpoint-v2.json",
             data: try encoder.encode(image)
         ))
         return artifacts
@@ -612,6 +618,13 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
 
     private static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func hexDigest(_ digest: continuum_sha256_digest) -> String {
+        var copy = digest
+        return withUnsafeBytes(of: &copy) { bytes in
+            bytes.map { String(format: "%02x", $0) }.joined()
+        }
     }
 
     private func groupMembers(

@@ -12,6 +12,11 @@ let package = Package(
         .library(name: "ContinuumStore", targets: ["ContinuumStore"]),
         .library(name: "ContinuumSystem", targets: ["ContinuumSystem"]),
         .library(name: "ContinuumRuntime", targets: ["ContinuumRuntime"]),
+        .library(
+            name: "ContinuumBootstrap",
+            type: .dynamic,
+            targets: ["ContinuumBootstrap"]
+        ),
         .executable(name: "Continuum", targets: ["ContinuumApp"]),
         .executable(name: "ContinuumHarness", targets: ["ContinuumHarness"]),
         .executable(name: "ContinuumExternalTarget", targets: ["ContinuumExternalTarget"])
@@ -25,6 +30,11 @@ let package = Package(
         ),
         .target(
             name: "ContinuumRuntime",
+            publicHeadersPath: "include",
+            linkerSettings: [.linkedFramework("Security")]
+        ),
+        .target(
+            name: "ContinuumBootstrap",
             publicHeadersPath: "include"
         ),
         .target(

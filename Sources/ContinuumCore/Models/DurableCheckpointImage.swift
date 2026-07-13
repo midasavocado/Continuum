@@ -3,7 +3,7 @@ import Foundation
 /// Versioned, pointer-free description of a process-tree checkpoint. Large
 /// byte ranges live in encrypted content-addressed chunks referenced here.
 public struct DurableCheckpointImage: Codable, Hashable, Sendable {
-    public static let currentFormatVersion = 1
+    public static let currentFormatVersion = 2
 
     public let formatVersion: Int
     public let checkpointID: CheckpointID
@@ -47,6 +47,7 @@ public struct DurableProcessImage: Codable, Hashable, Sendable {
     public let executableDevice: UInt64
     public let executableInode: UInt64
     public let vmLayoutHash: UInt64
+    public let immutableLayoutDigest: String?
     public let launchContract: DurableLaunchContract?
     public let regions: [DurableMemoryRegion]
     public let threads: [DurableThreadImage]
@@ -57,6 +58,7 @@ public struct DurableProcessImage: Codable, Hashable, Sendable {
         executableDevice: UInt64,
         executableInode: UInt64,
         vmLayoutHash: UInt64,
+        immutableLayoutDigest: String? = nil,
         launchContract: DurableLaunchContract? = nil,
         regions: [DurableMemoryRegion],
         threads: [DurableThreadImage]
@@ -66,6 +68,7 @@ public struct DurableProcessImage: Codable, Hashable, Sendable {
         self.executableDevice = executableDevice
         self.executableInode = executableInode
         self.vmLayoutHash = vmLayoutHash
+        self.immutableLayoutDigest = immutableLayoutDigest
         self.launchContract = launchContract
         self.regions = regions
         self.threads = threads
@@ -184,17 +187,20 @@ public struct DurableFileImage: Codable, Hashable, Sendable {
 
 public struct DurableChunkReference: Codable, Hashable, Sendable {
     public let hash: String
+    public let artifactName: String?
     public let logicalBytes: UInt64
     public let storedBytes: UInt64
     public let compression: DurableChunkCompression
 
     public init(
         hash: String,
+        artifactName: String? = nil,
         logicalBytes: UInt64,
         storedBytes: UInt64,
         compression: DurableChunkCompression
     ) {
         self.hash = hash
+        self.artifactName = artifactName
         self.logicalBytes = logicalBytes
         self.storedBytes = storedBytes
         self.compression = compression
