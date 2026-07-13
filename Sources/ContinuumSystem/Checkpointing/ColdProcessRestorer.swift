@@ -28,6 +28,20 @@ public struct ColdProcessCommit: Hashable, Sendable {
     public let retainedFileBytes: UInt64
 }
 
+public struct ColdFileSafetySnapshot: Hashable, Sendable {
+    public let id: UUID
+    public let createdAt: Date
+    public let fileCount: Int
+    public let logicalBytes: UInt64
+}
+
+public struct ColdFileSafetyRestore: Hashable, Sendable {
+    public let restoredSnapshotID: UUID
+    public let reciprocalSafetySnapshotID: UUID
+    public let restoredFileCount: Int
+    public let restoredBytes: UInt64
+}
+
 /// Rebuilds a durable process image into a disposable child that remains
 /// stopped before main. A certified single-thread image also receives its saved
 /// ARM64 general and vector register state. Validated regular writable files
@@ -632,6 +646,199 @@ public actor ColdProcessRestorer {
         )
     }
 
+    public func committedFileSafetySnapshots() throws -> [ColdFileSafetySnapshot] {
+        guard preparedReplacements.isEmpty else {
+            throw ContinuumError.transactionInProgress
+        }
+        guard FileManager.default.fileExists(atPath: fileSafetyRootURL.path) else {
+            return []
+        }
+        let roots = try FileManager.default.contentsOfDirectory(
+            at: fileSafetyRootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        var snapshots: [ColdFileSafetySnapshot] = []
+        for rootURL in roots {
+            let values = try rootURL.resourceValues(forKeys: [.isDirectoryKey])
+            guard values.isDirectory == true else { continue }
+            let journal = try Self.readFileTransactionJournal(rootURL: rootURL)
+            guard journal.formatVersion == 1,
+                  journal.transactionID.uuidString == rootURL.lastPathComponent else {
+                throw ContinuumError.integrityFailure(
+                    "A cold-file safety snapshot has an invalid identity."
+                )
+            }
+            guard journal.state == "committed" else { continue }
+            let store = try APFSLocalFileCheckpointStore(rootURL: rootURL)
+            let manifest = try store.manifestCoherently(
+                snapshotID: journal.safetySnapshotID
+            )
+            var logicalBytes: UInt64 = 0
+            for entry in manifest.entries {
+                guard entry.byteCount >= 0 else {
+                    throw ContinuumError.integrityFailure(
+                        "A cold-file safety snapshot has a negative byte count."
+                    )
+                }
+                let (next, overflow) = logicalBytes.addingReportingOverflow(
+                    UInt64(entry.byteCount)
+                )
+                guard !overflow else {
+                    throw ContinuumError.integrityFailure(
+                        "A cold-file safety snapshot exceeds numeric limits."
+                    )
+                }
+                logicalBytes = next
+            }
+            snapshots.append(ColdFileSafetySnapshot(
+                id: journal.transactionID,
+                createdAt: journal.createdAt,
+                fileCount: manifest.entries.count,
+                logicalBytes: logicalBytes
+            ))
+        }
+        return snapshots.sorted { $0.createdAt > $1.createdAt }
+    }
+
+    public func deleteCommittedFileSafetySnapshot(_ id: UUID) throws {
+        guard preparedReplacements.isEmpty else {
+            throw ContinuumError.transactionInProgress
+        }
+        let rootURL = fileSafetyRootURL.appendingPathComponent(
+            id.uuidString,
+            isDirectory: true
+        )
+        let journal = try Self.readFileTransactionJournal(rootURL: rootURL)
+        guard journal.transactionID == id, journal.state == "committed" else {
+            throw ContinuumError.restoreUnavailable(
+                "Only a committed cold-file safety snapshot can be deleted."
+            )
+        }
+        try FileManager.default.removeItem(at: rootURL)
+    }
+
+    @discardableResult
+    public func restoreCommittedFileSafetySnapshot(
+        _ id: UUID
+    ) async throws -> ColdFileSafetyRestore {
+        guard preparedReplacements.isEmpty else {
+            throw ContinuumError.transactionInProgress
+        }
+        let targetRootURL = fileSafetyRootURL.appendingPathComponent(
+            id.uuidString,
+            isDirectory: true
+        )
+        let targetJournal = try Self.readFileTransactionJournal(
+            rootURL: targetRootURL
+        )
+        guard targetJournal.transactionID == id,
+              targetJournal.state == "committed" else {
+            throw ContinuumError.restoreUnavailable(
+                "The requested cold-file safety snapshot is not committed."
+            )
+        }
+        guard targetJournal.replacementProcessIdentifier <= 0
+                || Self.processIsAbsent(
+                    targetJournal.replacementProcessIdentifier
+                ) else {
+            throw ContinuumError.restoreUnavailable(
+                "Close the process created by this restore before returning to its file safety snapshot."
+            )
+        }
+        let targetStore = try APFSLocalFileCheckpointStore(
+            rootURL: targetRootURL
+        )
+        let targetManifest = try targetStore.manifestCoherently(
+            snapshotID: targetJournal.safetySnapshotID
+        )
+        let targetPaths = targetManifest.entries.map(\.originalPath)
+        try Self.ensureNoExternalWriters(
+            paths: targetPaths,
+            allowedProcessIdentifier: 0
+        )
+
+        let reciprocalID = UUID()
+        let reciprocalRootURL = fileSafetyRootURL.appendingPathComponent(
+            reciprocalID.uuidString,
+            isDirectory: true
+        )
+        let reciprocalStore = try APFSLocalFileCheckpointStore(
+            rootURL: reciprocalRootURL
+        )
+        let reciprocalSnapshotID = UUID()
+        let reciprocalManifest: LocalFileCheckpointManifest
+        do {
+            reciprocalManifest = try await reciprocalStore.capture(
+                snapshotID: reciprocalSnapshotID,
+                files: targetPaths.map { URL(fileURLWithPath: $0) }
+            )
+            let reciprocalJournal = ColdFileTransactionJournal(
+                formatVersion: 1,
+                transactionID: reciprocalID,
+                safetySnapshotID: reciprocalSnapshotID,
+                replacementProcessIdentifier: 0,
+                state: "restoringCommitted",
+                createdAt: Date(),
+                entries: try reciprocalManifest.entries.map {
+                    ColdFileTransactionJournal.Entry(
+                        originalPath: $0.originalPath,
+                        device: $0.device,
+                        inode: $0.inode,
+                        installedSHA256: try Self.sha256File(
+                            atPath: $0.originalPath
+                        )
+                    )
+                }
+            )
+            try Self.writeFileTransactionJournal(
+                reciprocalJournal,
+                rootURL: reciprocalRootURL
+            )
+            try Self.ensureNoExternalWriters(
+                paths: targetPaths,
+                allowedProcessIdentifier: 0
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: reciprocalRootURL)
+            throw error
+        }
+
+        let report: LocalFileRestoreReport
+        do {
+            report = try targetStore.restoreCoherently(
+                snapshotID: targetJournal.safetySnapshotID
+            )
+            try Self.updateFileTransactionState(
+                rootURL: reciprocalRootURL,
+                state: "committed"
+            )
+        } catch {
+            do {
+                _ = try reciprocalStore.restoreCoherently(
+                    snapshotID: reciprocalSnapshotID
+                )
+                try FileManager.default.removeItem(at: reciprocalRootURL)
+            } catch {
+                throw ContinuumError.integrityFailure(
+                    "Cold-file safety restore failed and its reciprocal rollback also failed. The reciprocal safety root remains at \(reciprocalRootURL.path)."
+                )
+            }
+            throw error
+        }
+        guard report.restoredBytes >= 0 else {
+            throw ContinuumError.integrityFailure(
+                "Cold-file safety restore reported a negative byte count."
+            )
+        }
+        return ColdFileSafetyRestore(
+            restoredSnapshotID: id,
+            reciprocalSafetySnapshotID: reciprocalID,
+            restoredFileCount: report.restoredFileCount,
+            restoredBytes: UInt64(report.restoredBytes)
+        )
+    }
+
     @discardableResult
     public func recoverInterruptedFileTransactions() throws -> Int {
         guard preparedReplacements.isEmpty else {
@@ -659,14 +866,18 @@ public actor ColdProcessRestorer {
             if journal.state == "committed" {
                 continue
             }
-            guard journal.state == "prepared" else {
+            let interruptedCommittedRestore = journal.state
+                == "restoringCommitted"
+            guard journal.state == "prepared"
+                    || interruptedCommittedRestore else {
                 throw ContinuumError.integrityFailure(
                     "A durable cold-file transaction has an unknown state."
                 )
             }
-            guard Self.processIsAbsent(
-                journal.replacementProcessIdentifier
-            ) else {
+            guard journal.replacementProcessIdentifier <= 0
+                    || Self.processIsAbsent(
+                        journal.replacementProcessIdentifier
+                    ) else {
                 throw ContinuumError.restoreUnavailable(
                     "An interrupted cold replacement is still running; Continuum will not touch its files."
                 )
@@ -687,14 +898,16 @@ public actor ColdProcessRestorer {
                             : "Continuum could not prove exclusive ownership while recovering an interrupted file transaction."
                     )
                 }
-                guard try Self.fileIdentity(
-                    atPath: entry.originalPath
-                ) == (entry.device, entry.inode),
-                      try Self.sha256File(atPath: entry.originalPath)
-                        == entry.installedSHA256 else {
-                    throw ContinuumError.integrityFailure(
-                        "A file changed after an interrupted cold restore. Continuum preserved the safety transaction at \(rootURL.path) instead of overwriting newer bytes."
-                    )
+                if !interruptedCommittedRestore {
+                    guard try Self.fileIdentity(
+                        atPath: entry.originalPath
+                    ) == (entry.device, entry.inode),
+                          try Self.sha256File(atPath: entry.originalPath)
+                            == entry.installedSHA256 else {
+                        throw ContinuumError.integrityFailure(
+                            "A file changed after an interrupted cold restore. Continuum preserved the safety transaction at \(rootURL.path) instead of overwriting newer bytes."
+                        )
+                    }
                 }
             }
             let store = try APFSLocalFileCheckpointStore(rootURL: rootURL)
@@ -1230,14 +1443,24 @@ public actor ColdProcessRestorer {
         _ rollback: PreparedFileRollback,
         state: String
     ) throws {
-        guard state == "prepared" || state == "committed" else {
+        try updateFileTransactionState(
+            rootURL: rollback.rootURL,
+            state: state
+        )
+    }
+
+    private static func updateFileTransactionState(
+        rootURL: URL,
+        state: String
+    ) throws {
+        guard state == "prepared"
+                || state == "committed"
+                || state == "restoringCommitted" else {
             throw ContinuumError.integrityFailure(
                 "Continuum refused an invalid cold-file transaction state."
             )
         }
-        let journal = try readFileTransactionJournal(
-            rootURL: rollback.rootURL
-        )
+        let journal = try readFileTransactionJournal(rootURL: rootURL)
         let updated = ColdFileTransactionJournal(
             formatVersion: journal.formatVersion,
             transactionID: journal.transactionID,
@@ -1247,19 +1470,26 @@ public actor ColdProcessRestorer {
             createdAt: journal.createdAt,
             entries: journal.entries
         )
-        try writeFileTransactionJournal(
-            updated,
-            rootURL: rollback.rootURL
-        )
+        try writeFileTransactionJournal(updated, rootURL: rootURL)
     }
 
     private static func ensureNoExternalWriters(
         _ files: [LocalFileReplacement],
         allowedProcessIdentifier: Int32
     ) throws {
-        for file in files {
+        try ensureNoExternalWriters(
+            paths: files.map(\.originalPath),
+            allowedProcessIdentifier: allowedProcessIdentifier
+        )
+    }
+
+    private static func ensureNoExternalWriters(
+        paths: [String],
+        allowedProcessIdentifier: Int32
+    ) throws {
+        for path in paths {
             var conflictingProcessIdentifier: Int32 = 0
-            let status = file.originalPath.withCString {
+            let status = path.withCString {
                 continuum_find_writable_vnode_conflict(
                     $0,
                     allowedProcessIdentifier,
@@ -1271,18 +1501,16 @@ public actor ColdProcessRestorer {
                 continue
             case CONTINUUM_STATUS_FILE_WRITER_CONFLICT:
                 throw ContinuumError.restoreUnavailable(
-                    "Process \(conflictingProcessIdentifier) is writing \(file.originalPath). Continuum will not start a file transaction while another writer owns the vnode."
+                    "Process \(conflictingProcessIdentifier) is writing \(path). Continuum will not start a file transaction while another writer owns the vnode."
                 )
             case CONTINUUM_STATUS_ACCESS_DENIED:
                 throw ContinuumError.restoreUnavailable(
-                    "Continuum could not prove exclusive write ownership for \(file.originalPath)."
+                    "Continuum could not prove exclusive write ownership for \(path)."
                 )
             default:
-                let description = String(
-                    cString: continuum_status_string(status)
-                )
+                let description = String(cString: continuum_status_string(status))
                 throw ContinuumError.restoreUnavailable(
-                    "Continuum could not validate file writers for \(file.originalPath): \(description)."
+                    "Continuum could not validate file writers for \(path): \(description)."
                 )
             }
         }

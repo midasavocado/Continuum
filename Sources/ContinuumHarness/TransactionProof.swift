@@ -210,6 +210,153 @@ enum TransactionProof {
                 && remainingColdTransactions.isEmpty,
             "durable cold-file recovery did not restore and retire its journal"
         )
+        let committedTransactionID = UUID()
+        let committedTransactionURL = coldTransactionRoot.appendingPathComponent(
+            committedTransactionID.uuidString,
+            isDirectory: true
+        )
+        let committedStore = try APFSLocalFileCheckpointStore(
+            rootURL: committedTransactionURL
+        )
+        let committedSnapshotID = UUID()
+        _ = try await committedStore.capture(
+            snapshotID: committedSnapshotID,
+            files: [liveFileURL]
+        )
+        let committedJournal = ProofColdFileJournal(
+            formatVersion: 1,
+            transactionID: committedTransactionID,
+            safetySnapshotID: committedSnapshotID,
+            replacementProcessIdentifier: 0,
+            state: "committed",
+            createdAt: Date(),
+            entries: [
+                ProofColdFileJournal.Entry(
+                    originalPath: savedEntry.originalPath,
+                    device: savedEntry.device,
+                    inode: savedEntry.inode,
+                    installedSHA256: SHA256.hash(data: futureFileBytes).map {
+                        String(format: "%02x", $0)
+                    }.joined()
+                )
+            ]
+        )
+        try journalEncoder.encode(committedJournal).write(
+            to: committedTransactionURL.appendingPathComponent(
+                "ColdFileTransaction.json"
+            ),
+            options: .atomic
+        )
+        _ = try committedStore.replaceCoherently([
+            LocalFileReplacement(
+                originalPath: savedEntry.originalPath,
+                device: savedEntry.device,
+                inode: savedEntry.inode,
+                mode: savedEntry.mode,
+                data: savedFileBytes
+            )
+        ])
+
+        let committedSnapshots = try await coldRestorer
+            .committedFileSafetySnapshots()
+        try require(
+            committedSnapshots.count == 1
+                && committedSnapshots[0].id == committedTransactionID
+                && committedSnapshots[0].fileCount == 1
+                && committedSnapshots[0].logicalBytes == UInt64(futureFileBytes.count),
+            "committed cold-file safety snapshot was not catalogued"
+        )
+        let committedRestore = try await coldRestorer
+            .restoreCommittedFileSafetySnapshot(committedTransactionID)
+        let bytesAfterCommittedRestore = try Data(contentsOf: liveFileURL)
+        try require(
+            bytesAfterCommittedRestore == futureFileBytes
+                && committedRestore.restoredSnapshotID == committedTransactionID
+                && committedRestore.reciprocalSafetySnapshotID != committedTransactionID
+                && committedRestore.restoredFileCount == 1
+                && committedRestore.restoredBytes == UInt64(futureFileBytes.count),
+            "committed cold-file safety snapshot did not restore exact bytes"
+        )
+        let snapshotsAfterRestore = try await coldRestorer
+            .committedFileSafetySnapshots()
+        let snapshotIDsAfterRestore = Set(snapshotsAfterRestore.map(\.id))
+        try require(
+            snapshotsAfterRestore.count == 2
+                && snapshotIDsAfterRestore == Set([
+                    committedTransactionID,
+                    committedRestore.reciprocalSafetySnapshotID
+                ]),
+            "committed restore did not preserve the state being abandoned"
+        )
+        let interruptedRestoreID = UUID()
+        let interruptedRestoreURL = coldTransactionRoot.appendingPathComponent(
+            interruptedRestoreID.uuidString,
+            isDirectory: true
+        )
+        let interruptedRestoreStore = try APFSLocalFileCheckpointStore(
+            rootURL: interruptedRestoreURL
+        )
+        let interruptedRestoreSnapshotID = UUID()
+        _ = try await interruptedRestoreStore.capture(
+            snapshotID: interruptedRestoreSnapshotID,
+            files: [liveFileURL]
+        )
+        let interruptedRestoreJournal = ProofColdFileJournal(
+            formatVersion: 1,
+            transactionID: interruptedRestoreID,
+            safetySnapshotID: interruptedRestoreSnapshotID,
+            replacementProcessIdentifier: 0,
+            state: "restoringCommitted",
+            createdAt: Date(),
+            entries: [
+                ProofColdFileJournal.Entry(
+                    originalPath: savedEntry.originalPath,
+                    device: savedEntry.device,
+                    inode: savedEntry.inode,
+                    installedSHA256: SHA256.hash(data: futureFileBytes).map {
+                        String(format: "%02x", $0)
+                    }.joined()
+                )
+            ]
+        )
+        try journalEncoder.encode(interruptedRestoreJournal).write(
+            to: interruptedRestoreURL.appendingPathComponent(
+                "ColdFileTransaction.json"
+            ),
+            options: .atomic
+        )
+        _ = try interruptedRestoreStore.replaceCoherently([
+            LocalFileReplacement(
+                originalPath: savedEntry.originalPath,
+                device: savedEntry.device,
+                inode: savedEntry.inode,
+                mode: savedEntry.mode,
+                data: savedFileBytes
+            )
+        ])
+        let recoveredInterruptedRestore = try await coldRestorer
+            .recoverInterruptedFileTransactions()
+        let bytesAfterInterruptedRecovery = try Data(contentsOf: liveFileURL)
+        try require(
+            recoveredInterruptedRestore == 1
+                && bytesAfterInterruptedRecovery == futureFileBytes
+                && !fileManager.fileExists(atPath: interruptedRestoreURL.path),
+            "interrupted committed restore did not recover its reciprocal bytes"
+        )
+
+        try await coldRestorer.deleteCommittedFileSafetySnapshot(
+            committedTransactionID
+        )
+        try await coldRestorer.deleteCommittedFileSafetySnapshot(
+            committedRestore.reciprocalSafetySnapshotID
+        )
+        let snapshotsAfterDeletion = try await coldRestorer
+            .committedFileSafetySnapshots()
+        try require(
+            snapshotsAfterDeletion.isEmpty,
+            "deleted cold-file safety snapshots remained in the catalog"
+        )
+
         try fileManager.removeItem(at: fileCheckpointRoot)
         try fileManager.removeItem(at: liveFileURL)
 
@@ -230,6 +377,7 @@ enum TransactionProof {
         print("  coherent file bytes:  APFS clone exported after live mutation")
         print("  file rollback:         saved -> current on one preserved vnode")
         print("  crash recovery:        durable journal restored + retired")
+        print("  committed safety:      list -> reciprocal restore -> delete")
         print("  writer conflict:       external writable vnode rejected by PID")
     }
 
