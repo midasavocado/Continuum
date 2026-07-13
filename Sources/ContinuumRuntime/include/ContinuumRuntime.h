@@ -36,7 +36,8 @@ typedef enum continuum_status {
     CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED = 24,
     CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED = 25,
     CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR = 26,
-    CONTINUUM_STATUS_PROCESS_TREE_CHANGED = 27
+    CONTINUUM_STATUS_PROCESS_TREE_CHANGED = 27,
+    CONTINUUM_STATUS_SPAWN_FAILED = 28
 } continuum_status;
 
 typedef struct continuum_runtime_info {
@@ -56,6 +57,16 @@ typedef struct continuum_remote_thread_snapshot continuum_remote_thread_snapshot
 typedef struct continuum_remote_process_snapshot continuum_remote_process_snapshot;
 typedef struct continuum_remote_process_group_snapshot
     continuum_remote_process_group_snapshot;
+
+/// Creates a clean replacement process from a captured launch contract and
+/// leaves it kernel-suspended before any target instruction executes.
+continuum_status continuum_spawn_process_suspended(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t *out_process_id
+);
 
 /// Runs while every member of a process group remains coherently suspended.
 /// The callback must not resume or mutate process topology. Returning a failure

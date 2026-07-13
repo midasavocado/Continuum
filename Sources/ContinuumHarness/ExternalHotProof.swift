@@ -281,7 +281,7 @@ enum ExternalHotProof {
             try validate(target: target, expected: "B", digest: safetyB.digest, cycle: cycle)
         }
 
-        try await verifyShippingHotBackend(
+        let durableImage = try await verifyShippingHotBackend(
             target: target,
             targetPID: targetPID,
             helperPID: helperPID,
@@ -314,6 +314,10 @@ enum ExternalHotProof {
 
         try target.exitCleanly()
         exitedCleanly = true
+        try verifySuspendedColdReplacement(
+            durableImage,
+            originalRootProcessID: targetPID
+        )
 
         print("external-hot-proof: PASS")
         print("  target binary:       \(target.executablePath)")
@@ -333,6 +337,7 @@ enum ExternalHotProof {
         print("  coherent open files: root + helper APFS bytes restored")
         print("  descriptor mutation: rejected before memory write")
         print("  app backend adapter: captured + restored live snapshot state")
+        print("  cold replacement:    recreated from encrypted launch contract, stopped before main")
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -349,7 +354,7 @@ enum ExternalHotProof {
         rootSession: OpaquePointer,
         helperSession: OpaquePointer,
         expectedStateB: String
-    ) async throws {
+    ) async throws -> DurableCheckpointImage {
         let fileCheckpointRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "continuum-shipping-hot-proof-\(UUID().uuidString)",
@@ -493,6 +498,103 @@ enum ExternalHotProof {
             restoredFiles.valid == true && restoredFiles.helperValid == true,
             "shipping backend did not restore both open files from APFS clones"
         )
+        return durableImage
+    }
+
+    private static func verifySuspendedColdReplacement(
+        _ image: DurableCheckpointImage,
+        originalRootProcessID: Int32
+    ) throws {
+        guard let root = image.members.first(where: {
+            $0.processIdentifier == originalRootProcessID
+        }), let launch = root.launchContract else {
+            throw ExternalHotProofFailure.invariant(
+                "durable image did not retain the root launch contract"
+            )
+        }
+
+        var replacementProcessID: Int32 = 0
+        let status = withCStringArray(launch.arguments) { arguments in
+            withCStringArray(launch.environment) { environment in
+                launch.executablePath.withCString { executable in
+                    launch.workingDirectory.withCString { directory in
+                        continuum_spawn_process_suspended(
+                            executable,
+                            arguments,
+                            environment,
+                            directory,
+                            &replacementProcessID
+                        )
+                    }
+                }
+            }
+        }
+        try check(status, operation: "spawn suspended cold replacement")
+        guard replacementProcessID > 0 else {
+            throw ExternalHotProofFailure.invariant(
+                "cold replacement returned an invalid process identifier"
+            )
+        }
+        defer {
+            kill(replacementProcessID, SIGKILL)
+            var terminationStatus: Int32 = 0
+            waitpid(replacementProcessID, &terminationStatus, 0)
+        }
+
+        var processInfo = proc_bsdinfo()
+        try require(
+            proc_pidinfo(
+                replacementProcessID,
+                PROC_PIDTBSDINFO,
+                0,
+                &processInfo,
+                Int32(MemoryLayout<proc_bsdinfo>.size)
+            ) == Int32(MemoryLayout<proc_bsdinfo>.size),
+            "cold replacement could not be inspected"
+        )
+        try require(
+            processInfo.pbi_status == UInt32(SSTOP),
+            "cold replacement ran target code before reconstruction"
+        )
+
+        var executablePath = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let pathLength = proc_pidpath(
+            replacementProcessID,
+            &executablePath,
+            UInt32(executablePath.count)
+        )
+        try require(pathLength > 0, "cold replacement executable path was unavailable")
+        let reportedPath = String(
+            decoding: executablePath.prefix { $0 != 0 }.map {
+                UInt8(bitPattern: $0)
+            },
+            as: UTF8.self
+        )
+        let canonicalReportedPath = URL(fileURLWithPath: reportedPath)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalLaunchPath = URL(fileURLWithPath: launch.executablePath)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        try require(
+            canonicalReportedPath == canonicalLaunchPath,
+            "cold replacement launched a different executable"
+        )
+    }
+
+    private static func withCStringArray<Result>(
+        _ strings: [String],
+        _ body: (UnsafePointer<UnsafePointer<CChar>?>?) throws -> Result
+    ) rethrows -> Result {
+        let allocated: [UnsafeMutablePointer<CChar>?] = strings.map { value in
+            value.withCString { strdup($0) }
+        }
+        defer { allocated.forEach { free($0) } }
+        var pointers: [UnsafePointer<CChar>?] = allocated.map { pointer in
+            pointer.map { UnsafePointer<CChar>($0) }
+        }
+        pointers.append(nil)
+        return try pointers.withUnsafeBufferPointer { buffer in
+            try body(buffer.baseAddress)
+        }
     }
 
     private static func verifyDescriptorMutationIsRejected(

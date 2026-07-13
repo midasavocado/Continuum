@@ -86,6 +86,57 @@ final class ContinuumRuntimeTests: XCTestCase {
         )
     }
 
+    func testColdRestorerCreatesAProcessSuspendedBeforeMain() {
+        let executable = strdup("/usr/bin/true")!
+        let argument = strdup("true")!
+        let environment = strdup("PATH=/usr/bin:/bin")!
+        let directory = strdup("/private/tmp")!
+        defer {
+            free(executable)
+            free(argument)
+            free(environment)
+            free(directory)
+        }
+
+        let arguments: [UnsafePointer<CChar>?] = [UnsafePointer(argument), nil]
+        let environmentEntries: [UnsafePointer<CChar>?] = [
+            UnsafePointer(environment), nil
+        ]
+        var processID: Int32 = 0
+        let status = arguments.withUnsafeBufferPointer { argumentBuffer in
+            environmentEntries.withUnsafeBufferPointer { environmentBuffer in
+                continuum_spawn_process_suspended(
+                    executable,
+                    argumentBuffer.baseAddress,
+                    environmentBuffer.baseAddress,
+                    directory,
+                    &processID
+                )
+            }
+        }
+        XCTAssertEqual(status, CONTINUUM_STATUS_OK)
+        XCTAssertGreaterThan(processID, 0)
+        guard processID > 0 else { return }
+        defer {
+            kill(processID, SIGKILL)
+            var terminationStatus: Int32 = 0
+            waitpid(processID, &terminationStatus, 0)
+        }
+
+        var processInfo = proc_bsdinfo()
+        XCTAssertEqual(
+            proc_pidinfo(
+                processID,
+                PROC_PIDTBSDINFO,
+                0,
+                &processInfo,
+                Int32(MemoryLayout<proc_bsdinfo>.size)
+            ),
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        XCTAssertEqual(processInfo.pbi_status, UInt32(SSTOP))
+    }
+
     func testRepeatedCreateCheckpointDestroy() {
         for value in UInt8(0)..<64 {
             let memory = UnsafeMutableRawPointer.allocate(byteCount: 512, alignment: 16)
@@ -711,7 +762,8 @@ final class ContinuumRuntimeTests: XCTestCase {
             CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED,
             CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED,
             CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR,
-            CONTINUUM_STATUS_PROCESS_TREE_CHANGED
+            CONTINUUM_STATUS_PROCESS_TREE_CHANGED,
+            CONTINUUM_STATUS_SPAWN_FAILED
         ]
 
         for status in statuses {

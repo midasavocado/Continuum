@@ -11,6 +11,7 @@
 #endif
 #include <limits.h>
 #include <fcntl.h>
+#include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -18,11 +19,68 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+extern char **environ;
+
 #define CONTINUUM_WRITE_CHUNK_SIZE (64U * 1024U * 1024U)
 #define CONTINUUM_FNV_OFFSET UINT64_C(1469598103934665603)
 #define CONTINUUM_FNV_PRIME UINT64_C(1099511628211)
 #define CONTINUUM_RESUME_ATTEMPT_LIMIT 3U
 #define CONTINUUM_DESTROY_RESUME_ATTEMPT_LIMIT 32U
+
+continuum_status continuum_spawn_process_suspended(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t *out_process_id
+) {
+    if (executable_path == NULL || executable_path[0] == '\0'
+        || arguments == NULL || arguments[0] == NULL
+        || working_directory == NULL || working_directory[0] == '\0'
+        || out_process_id == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_process_id = 0;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    int result = posix_spawn_file_actions_init(&actions);
+    if (result != 0) {
+        return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    result = posix_spawn_file_actions_addchdir_np(&actions, working_directory);
+    if (result != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    result = posix_spawnattr_init(&attributes);
+    if (result != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+
+    short flags = POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT;
+    result = posix_spawnattr_setflags(&attributes, flags);
+    pid_t process_id = 0;
+    if (result == 0) {
+        result = posix_spawn(
+            &process_id,
+            executable_path,
+            &actions,
+            &attributes,
+            (char *const *)arguments,
+            environment == NULL ? environ : (char *const *)environment
+        );
+    }
+
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    if (result != 0 || process_id <= 0) {
+        return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    *out_process_id = (int32_t)process_id;
+    return CONTINUUM_STATUS_OK;
+}
 
 typedef struct continuum_checkpoint {
     uint64_t identifier;
@@ -3935,6 +3993,8 @@ const char *continuum_status_string(continuum_status status) {
             return "target has an unsupported descriptor type";
         case CONTINUUM_STATUS_PROCESS_TREE_CHANGED:
             return "target process tree changed";
+        case CONTINUUM_STATUS_SPAWN_FAILED:
+            return "replacement process spawn failed";
     }
     return "unknown status";
 }
