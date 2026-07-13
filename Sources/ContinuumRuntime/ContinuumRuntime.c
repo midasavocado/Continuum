@@ -15,17 +15,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 extern char **environ;
+extern int posix_spawnattr_disable_ptr_auth_a_keys_np(
+    posix_spawnattr_t *attributes,
+    uint32_t flags
+);
 
 #define CONTINUUM_WRITE_CHUNK_SIZE (64U * 1024U * 1024U)
 #define CONTINUUM_FNV_OFFSET UINT64_C(1469598103934665603)
 #define CONTINUUM_FNV_PRIME UINT64_C(1099511628211)
 #define CONTINUUM_RESUME_ATTEMPT_LIMIT 3U
 #define CONTINUUM_DESTROY_RESUME_ATTEMPT_LIMIT 32U
+#define CONTINUUM_POSIX_SPAWN_DISABLE_ASLR 0x0100
 
 continuum_status continuum_spawn_process_suspended(
     const char *executable_path,
@@ -59,8 +65,13 @@ continuum_status continuum_spawn_process_suspended(
         return CONTINUUM_STATUS_SPAWN_FAILED;
     }
 
-    short flags = POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT;
+    short flags = POSIX_SPAWN_START_SUSPENDED
+        | POSIX_SPAWN_CLOEXEC_DEFAULT
+        | CONTINUUM_POSIX_SPAWN_DISABLE_ASLR;
     result = posix_spawnattr_setflags(&attributes, flags);
+    if (result == 0) {
+        result = posix_spawnattr_disable_ptr_auth_a_keys_np(&attributes, 0);
+    }
     pid_t process_id = 0;
     if (result == 0) {
         result = posix_spawn(
@@ -89,6 +100,8 @@ typedef struct continuum_checkpoint {
 
 typedef struct continuum_remote_thread_entry {
     uint64_t identifier;
+    uint64_t thread_handle;
+    uint64_t dispatch_queue_address;
     uint32_t general_flavor;
     uint8_t *general_bytes;
     size_t general_length;
@@ -675,6 +688,8 @@ static continuum_status continuum_capture_thread_snapshot(
             break;
         }
         entry->identifier = identifier_info.thread_id;
+        entry->thread_handle = identifier_info.thread_handle;
+        entry->dispatch_queue_address = identifier_info.dispatch_qaddr;
 
         mach_msg_type_number_t general_count = ARM_THREAD_STATE64_COUNT;
         entry->general_length = general_count * sizeof(natural_t);
@@ -2222,6 +2237,261 @@ continuum_status continuum_remote_session_identity(
     }
     *out_identity = session->identity;
     return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_session_inspect_process_layout(
+    continuum_remote_session *session,
+    continuum_remote_process_layout_info *out_info
+) {
+    if (session == NULL || out_info == NULL || session->task == MACH_PORT_NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_info, 0, sizeof(*out_info));
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    uint64_t hash = CONTINUUM_FNV_OFFSET;
+    mach_vm_address_t address = 0;
+    natural_t depth = 0;
+    while (status == CONTINUUM_STATUS_OK) {
+        mach_vm_size_t region_size = 0;
+        vm_region_submap_info_data_64_t info;
+        memset(&info, 0, sizeof(info));
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t result = mach_vm_region_recurse(
+            session->task,
+            &address,
+            &region_size,
+            &depth,
+            (vm_region_recurse_info_t)&info,
+            &count
+        );
+        if (result == KERN_INVALID_ADDRESS) {
+            break;
+        }
+        if (result != KERN_SUCCESS || region_size == 0) {
+            status = CONTINUUM_STATUS_MACH_ERROR;
+            break;
+        }
+        if (info.is_submap) {
+            depth += 1;
+            continue;
+        }
+
+        continuum_hash_u64(&hash, address);
+        continuum_hash_u64(&hash, region_size);
+        continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.protection);
+        continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.max_protection);
+        continuum_hash_u64(&hash, (uint64_t)(uint32_t)info.inheritance);
+        continuum_hash_u64(&hash, continuum_canonical_share_mode(info.share_mode));
+        continuum_hash_u64(&hash, info.user_tag);
+        out_info->region_count += 1;
+        if (!continuum_add_u64(
+                out_info->virtual_bytes,
+                region_size,
+                &out_info->virtual_bytes
+            )) {
+            status = CONTINUUM_STATUS_RANGE_ERROR;
+            break;
+        }
+        if (UINT64_MAX - address < region_size) {
+            break;
+        }
+        address += region_size;
+    }
+    out_info->layout_hash = hash;
+
+    continuum_status resume_status = continuum_resume_session(session, did_suspend);
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        status = resume_status;
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        memset(out_info, 0, sizeof(*out_info));
+    }
+    return status;
+}
+
+continuum_status continuum_remote_session_reconstruct_region(
+    continuum_remote_session *session,
+    const continuum_remote_process_region_info *region,
+    const void *bytes,
+    size_t length,
+    continuum_remote_restore_report *out_report
+) {
+    if (session == NULL || region == NULL || bytes == NULL || out_report == NULL
+        || session->task == MACH_PORT_NULL || session->is_self
+        || region->address == 0 || region->length == 0
+        || region->length != length
+        || (region->address % (uint64_t)getpagesize()) != 0
+        || (region->length % (uint64_t)getpagesize()) != 0
+        || (region->protection & (VM_PROT_READ | VM_PROT_WRITE))
+            != (VM_PROT_READ | VM_PROT_WRITE)
+        || !continuum_is_private_or_cow_share_mode(region->share_mode)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_report, 0, sizeof(*out_report));
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    struct proc_bsdinfo process_info;
+    memset(&process_info, 0, sizeof(process_info));
+    int copied = proc_pidinfo(
+        session->identity.process_id,
+        PROC_PIDTBSDINFO,
+        0,
+        &process_info,
+        (int)sizeof(process_info)
+    );
+    if (copied != (int)sizeof(process_info)
+        || process_info.pbi_ppid != getpid()
+        || process_info.pbi_status != SSTOP) {
+        return CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    mach_vm_address_t address = region->address;
+    kern_return_t result = mach_vm_deallocate(
+        session->task,
+        address,
+        region->length
+    );
+    if (result != KERN_SUCCESS && result != KERN_INVALID_ADDRESS) {
+        out_report->reconstruction_stage =
+            CONTINUUM_RECONSTRUCTION_STAGE_DEALLOCATE;
+        out_report->mach_result = result;
+        status = CONTINUUM_STATUS_MACH_ERROR;
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        result = mach_vm_allocate(
+        session->task,
+        &address,
+        region->length,
+        VM_FLAGS_FIXED
+        );
+        if (result != KERN_SUCCESS || address != region->address) {
+            out_report->reconstruction_stage =
+                CONTINUUM_RECONSTRUCTION_STAGE_ALLOCATE;
+            out_report->mach_result = result;
+            status = CONTINUUM_STATUS_MACH_ERROR;
+        }
+    }
+
+    uint64_t bytes_written = 0;
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_write_task_bytes(
+            session->task,
+            address,
+            bytes,
+            length,
+            &bytes_written
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            out_report->reconstruction_stage =
+                CONTINUUM_RECONSTRUCTION_STAGE_WRITE;
+        }
+    }
+
+    uint8_t *readback = NULL;
+    if (status == CONTINUUM_STATUS_OK) {
+        readback = malloc(length);
+        if (readback == NULL) {
+            status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_read_task_bytes(
+            session->task,
+            address,
+            region->length,
+            readback
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            out_report->reconstruction_stage =
+                CONTINUUM_RECONSTRUCTION_STAGE_READBACK;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK && memcmp(readback, bytes, length) != 0) {
+        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    free(readback);
+
+    if (status == CONTINUUM_STATUS_OK) {
+        result = mach_vm_inherit(
+            session->task,
+            address,
+            region->length,
+            region->inheritance
+        );
+        if (result != KERN_SUCCESS) {
+            out_report->reconstruction_stage =
+                CONTINUUM_RECONSTRUCTION_STAGE_INHERIT;
+            out_report->mach_result = result;
+            status = CONTINUUM_STATUS_MACH_ERROR;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        vm_prot_t access_protection = region->protection
+            & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        result = mach_vm_protect(
+            session->task,
+            address,
+            region->length,
+            FALSE,
+            access_protection
+        );
+        if (result != KERN_SUCCESS) {
+            out_report->reconstruction_stage =
+                CONTINUUM_RECONSTRUCTION_STAGE_PROTECT;
+            out_report->mach_result = result;
+            status = CONTINUUM_STATUS_MACH_ERROR;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        vm_prot_t maximum_access_protection = region->maximum_protection
+            & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+        result = mach_vm_protect(
+            session->task,
+            address,
+            region->length,
+            TRUE,
+            maximum_access_protection
+        );
+        if (result != KERN_SUCCESS) {
+            out_report->reconstruction_stage =
+                CONTINUUM_RECONSTRUCTION_STAGE_MAX_PROTECT;
+            out_report->mach_result = result;
+            if (result != KERN_PROTECTION_FAILURE) {
+                status = CONTINUUM_STATUS_MACH_ERROR;
+            }
+        } else {
+            out_report->max_protection_verified = 1;
+        }
+    }
+
+    continuum_status resume_status = continuum_resume_session(session, did_suspend);
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        status = resume_status;
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        out_report->bytes_written = bytes_written;
+        out_report->readback_verified = 1;
+    }
+    return status;
 }
 
 continuum_status continuum_remote_session_capture_resource_fingerprint(
@@ -3856,6 +4126,8 @@ continuum_status continuum_remote_thread_snapshot_info(
     }
     const continuum_remote_thread_entry *entry = &snapshot->entries[index];
     out_info->thread_identifier = entry->identifier;
+    out_info->thread_handle = entry->thread_handle;
+    out_info->dispatch_queue_address = entry->dispatch_queue_address;
     out_info->general_state_flavor = entry->general_flavor;
     out_info->general_state_length = entry->general_length;
     out_info->vector_state_flavor = entry->vector_flavor;

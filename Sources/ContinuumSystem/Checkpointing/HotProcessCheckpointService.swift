@@ -397,6 +397,8 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 ))
                 threads.append(DurableThreadImage(
                     threadIdentifier: thread.thread_identifier,
+                    threadHandle: thread.thread_handle,
+                    dispatchQueueAddress: thread.dispatch_queue_address,
                     generalStateFlavor: thread.general_state_flavor,
                     generalState: DurableChunkReference(
                         hash: Self.sha256(general),
@@ -511,7 +513,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             executablePath: parsed.executablePath,
             arguments: parsed.arguments,
             environment: parsed.environment,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            addressSpacePolicy: parsed.environment.contains(
+                "CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1"
+            ) ? .continuumDeterministic : .systemASLR
         )
     }
 

@@ -51,7 +51,8 @@ final class ModelRoundTripTests: XCTestCase {
                         executablePath: "/Applications/Test.app/Contents/MacOS/Test",
                         arguments: ["Test", "--restore-me"],
                         environment: ["LANG=en_US.UTF-8", "CONTINUUM_TEST=1"],
-                        workingDirectory: "/private/tmp"
+                        workingDirectory: "/private/tmp",
+                        addressSpacePolicy: .continuumDeterministic
                     ),
                     regions: [
                         DurableMemoryRegion(
@@ -68,6 +69,8 @@ final class ModelRoundTripTests: XCTestCase {
                     threads: [
                         DurableThreadImage(
                             threadIdentifier: 13,
+                            threadHandle: 0x1_2345_0000,
+                            dispatchQueueAddress: 0x1_2346_0000,
                             generalStateFlavor: 6,
                             generalState: chunk,
                             vectorStateFlavor: 17,

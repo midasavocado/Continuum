@@ -113,7 +113,21 @@ typedef struct continuum_remote_restore_report {
     uint8_t readback_verified;
     uint8_t rollback_attempted;
     uint8_t rollback_verified;
+    uint8_t max_protection_verified;
+    uint32_t reconstruction_stage;
+    int32_t mach_result;
 } continuum_remote_restore_report;
+
+typedef enum continuum_reconstruction_stage {
+    CONTINUUM_RECONSTRUCTION_STAGE_NONE = 0,
+    CONTINUUM_RECONSTRUCTION_STAGE_DEALLOCATE = 1,
+    CONTINUUM_RECONSTRUCTION_STAGE_ALLOCATE = 2,
+    CONTINUUM_RECONSTRUCTION_STAGE_WRITE = 3,
+    CONTINUUM_RECONSTRUCTION_STAGE_READBACK = 4,
+    CONTINUUM_RECONSTRUCTION_STAGE_INHERIT = 5,
+    CONTINUUM_RECONSTRUCTION_STAGE_PROTECT = 6,
+    CONTINUUM_RECONSTRUCTION_STAGE_MAX_PROTECT = 7
+} continuum_reconstruction_stage;
 
 /// Coverage reported for a full-process hot snapshot. Only readable+writable
 /// SM_PRIVATE/SM_COW mappings are captured; every other mapping is counted as
@@ -127,6 +141,12 @@ typedef struct continuum_remote_process_snapshot_info {
     uint64_t vm_layout_hash;
     uint64_t thread_set_hash;
 } continuum_remote_process_snapshot_info;
+
+typedef struct continuum_remote_process_layout_info {
+    uint64_t region_count;
+    uint64_t virtual_bytes;
+    uint64_t layout_hash;
+} continuum_remote_process_layout_info;
 
 typedef struct continuum_remote_process_restore_report {
     uint64_t regions_written;
@@ -149,6 +169,8 @@ typedef struct continuum_remote_process_region_info {
 
 typedef struct continuum_remote_thread_state_info {
     uint64_t thread_identifier;
+    uint64_t thread_handle;
+    uint64_t dispatch_queue_address;
     uint32_t general_state_flavor;
     size_t general_state_length;
     uint32_t vector_state_flavor;
@@ -271,6 +293,24 @@ continuum_status continuum_remote_session_open(
 continuum_status continuum_remote_session_identity(
     const continuum_remote_session *session,
     continuum_remote_identity *out_identity
+);
+
+/// Hashes the complete leaf VM map without reading process memory. This is
+/// used to prove deterministic replacement layouts before reconstruction.
+continuum_status continuum_remote_session_inspect_process_layout(
+    continuum_remote_session *session,
+    continuum_remote_process_layout_info *out_info
+);
+
+/// Recreates one private writable mapping inside a replacement child that is
+/// still stopped before main. The child is disposable; failures never touch
+/// the original process or any unrelated task.
+continuum_status continuum_remote_session_reconstruct_region(
+    continuum_remote_session *session,
+    const continuum_remote_process_region_info *region,
+    const void *bytes,
+    size_t length,
+    continuum_remote_restore_report *out_report
 );
 
 /// Captures a read-only kernel-resource fingerprint while an external target

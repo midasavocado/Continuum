@@ -316,7 +316,8 @@ enum ExternalHotProof {
         exitedCleanly = true
         try verifySuspendedColdReplacement(
             durableImage,
-            originalRootProcessID: targetPID
+            originalRootProcessID: targetPID,
+            savedArena: stateA
         )
 
         print("external-hot-proof: PASS")
@@ -337,7 +338,7 @@ enum ExternalHotProof {
         print("  coherent open files: root + helper APFS bytes restored")
         print("  descriptor mutation: rejected before memory write")
         print("  app backend adapter: captured + restored live snapshot state")
-        print("  cold replacement:    recreated from encrypted launch contract, stopped before main")
+        print("  cold replacement:    deterministic layout + saved arena bytes, stopped before main")
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -503,7 +504,8 @@ enum ExternalHotProof {
 
     private static func verifySuspendedColdReplacement(
         _ image: DurableCheckpointImage,
-        originalRootProcessID: Int32
+        originalRootProcessID: Int32,
+        savedArena: RemoteCapture
     ) throws {
         guard let root = image.members.first(where: {
             $0.processIdentifier == originalRootProcessID
@@ -513,70 +515,149 @@ enum ExternalHotProof {
             )
         }
 
-        var replacementProcessID: Int32 = 0
-        let status = withCStringArray(launch.arguments) { arguments in
-            withCStringArray(launch.environment) { environment in
-                launch.executablePath.withCString { executable in
-                    launch.workingDirectory.withCString { directory in
-                        continuum_spawn_process_suspended(
-                            executable,
-                            arguments,
-                            environment,
-                            directory,
-                            &replacementProcessID
-                        )
+        var controlledEnvironment = launch.environment.filter {
+            !$0.hasPrefix("DYLD_SHARED_REGION=")
+        }
+        controlledEnvironment.append("DYLD_SHARED_REGION=private")
+        controlledEnvironment.append("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1")
+
+        func inspectReplacementLayout(reconstructArena: Bool) throws -> UInt64 {
+            var replacementProcessID: Int32 = 0
+            let status = withCStringArray(launch.arguments) { arguments in
+                withCStringArray(controlledEnvironment) { environment in
+                    launch.executablePath.withCString { executable in
+                        launch.workingDirectory.withCString { directory in
+                            continuum_spawn_process_suspended(
+                                executable,
+                                arguments,
+                                environment,
+                                directory,
+                                &replacementProcessID
+                            )
+                        }
                     }
                 }
             }
-        }
-        try check(status, operation: "spawn suspended cold replacement")
-        guard replacementProcessID > 0 else {
-            throw ExternalHotProofFailure.invariant(
-                "cold replacement returned an invalid process identifier"
+            try check(status, operation: "spawn suspended cold replacement")
+            guard replacementProcessID > 0 else {
+                throw ExternalHotProofFailure.invariant(
+                    "cold replacement returned an invalid process identifier"
+                )
+            }
+            defer {
+                kill(replacementProcessID, SIGKILL)
+                var terminationStatus: Int32 = 0
+                waitpid(replacementProcessID, &terminationStatus, 0)
+            }
+
+            var processInfo = proc_bsdinfo()
+            try require(
+                proc_pidinfo(
+                    replacementProcessID,
+                    PROC_PIDTBSDINFO,
+                    0,
+                    &processInfo,
+                    Int32(MemoryLayout<proc_bsdinfo>.size)
+                ) == Int32(MemoryLayout<proc_bsdinfo>.size),
+                "cold replacement could not be inspected"
             )
-        }
-        defer {
-            kill(replacementProcessID, SIGKILL)
-            var terminationStatus: Int32 = 0
-            waitpid(replacementProcessID, &terminationStatus, 0)
-        }
+            try require(
+                processInfo.pbi_status == UInt32(SSTOP),
+                "cold replacement ran target code before reconstruction"
+            )
 
-        var processInfo = proc_bsdinfo()
-        try require(
-            proc_pidinfo(
+            var executablePath = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+            let pathLength = proc_pidpath(
                 replacementProcessID,
-                PROC_PIDTBSDINFO,
-                0,
-                &processInfo,
-                Int32(MemoryLayout<proc_bsdinfo>.size)
-            ) == Int32(MemoryLayout<proc_bsdinfo>.size),
-            "cold replacement could not be inspected"
-        )
-        try require(
-            processInfo.pbi_status == UInt32(SSTOP),
-            "cold replacement ran target code before reconstruction"
-        )
+                &executablePath,
+                UInt32(executablePath.count)
+            )
+            try require(pathLength > 0, "cold replacement executable path was unavailable")
+            let reportedPath = String(
+                decoding: executablePath.prefix { $0 != 0 }.map {
+                    UInt8(bitPattern: $0)
+                },
+                as: UTF8.self
+            )
+            let canonicalReportedPath = URL(fileURLWithPath: reportedPath)
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            let canonicalLaunchPath = URL(fileURLWithPath: launch.executablePath)
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            try require(
+                canonicalReportedPath == canonicalLaunchPath,
+                "cold replacement launched a different executable"
+            )
 
-        var executablePath = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        let pathLength = proc_pidpath(
-            replacementProcessID,
-            &executablePath,
-            UInt32(executablePath.count)
-        )
-        try require(pathLength > 0, "cold replacement executable path was unavailable")
-        let reportedPath = String(
-            decoding: executablePath.prefix { $0 != 0 }.map {
-                UInt8(bitPattern: $0)
-            },
-            as: UTF8.self
-        )
-        let canonicalReportedPath = URL(fileURLWithPath: reportedPath)
-            .resolvingSymlinksInPath().standardizedFileURL.path
-        let canonicalLaunchPath = URL(fileURLWithPath: launch.executablePath)
-            .resolvingSymlinksInPath().standardizedFileURL.path
+            var session: OpaquePointer?
+            try check(
+                continuum_remote_session_open(replacementProcessID, &session),
+                operation: "open suspended replacement task"
+            )
+            guard let session else {
+                throw ExternalHotProofFailure.invariant(
+                    "cold replacement returned no task session"
+                )
+            }
+            defer { continuum_remote_session_destroy(session) }
+
+            var layoutInfo = continuum_remote_process_layout_info()
+            try check(
+                continuum_remote_session_inspect_process_layout(
+                    session,
+                    &layoutInfo
+                ),
+                operation: "inspect suspended replacement VM layout"
+            )
+            try require(layoutInfo.region_count > 0, "cold replacement had no VM regions")
+
+            if reconstructArena {
+                var region = continuum_remote_process_region_info()
+                region.address = savedArena.descriptor.address
+                region.length = savedArena.descriptor.length
+                region.protection = savedArena.descriptor.protection
+                region.maximum_protection = savedArena.descriptor.maximum_protection
+                region.inheritance = Int32(bitPattern: VM_INHERIT_COPY)
+                region.share_mode = savedArena.descriptor.share_mode
+                region.user_tag = 0
+                var report = continuum_remote_restore_report()
+                let reconstructionStatus = savedArena.bytes.withUnsafeBytes { bytes in
+                    continuum_remote_session_reconstruct_region(
+                        session,
+                        &region,
+                        bytes.baseAddress,
+                        bytes.count,
+                        &report
+                    )
+                }
+                guard reconstructionStatus == CONTINUUM_STATUS_OK else {
+                    throw ExternalHotProofFailure.invariant(
+                        "cold arena reconstruction failed at stage "
+                            + "\(report.reconstruction_stage), Mach "
+                            + "\(report.mach_result): "
+                            + runtimeStatusDescription(reconstructionStatus)
+                    )
+                }
+                try require(
+                    report.bytes_written == savedArena.bytes.count
+                        && report.readback_verified != 0,
+                    "cold replacement did not verify reconstructed arena bytes"
+                )
+                try require(
+                    report.max_protection_verified != 0
+                        || (report.reconstruction_stage
+                            == CONTINUUM_RECONSTRUCTION_STAGE_MAX_PROTECT.rawValue
+                            && report.mach_result == KERN_PROTECTION_FAILURE),
+                    "cold replacement hid an unexpected maximum-protection result"
+                )
+            }
+            return layoutInfo.layout_hash
+        }
+
+        let firstLayoutHash = try inspectReplacementLayout(reconstructArena: true)
+        let secondLayoutHash = try inspectReplacementLayout(reconstructArena: false)
         try require(
-            canonicalReportedPath == canonicalLaunchPath,
-            "cold replacement launched a different executable"
+            firstLayoutHash == secondLayoutHash,
+            "controlled cold replacements did not receive a deterministic VM layout"
         )
     }
 

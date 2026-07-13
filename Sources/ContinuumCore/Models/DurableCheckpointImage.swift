@@ -79,18 +79,26 @@ public struct DurableLaunchContract: Codable, Hashable, Sendable {
     public let arguments: [String]
     public let environment: [String]
     public let workingDirectory: String
+    public let addressSpacePolicy: DurableAddressSpacePolicy?
 
     public init(
         executablePath: String,
         arguments: [String],
         environment: [String],
-        workingDirectory: String
+        workingDirectory: String,
+        addressSpacePolicy: DurableAddressSpacePolicy? = nil
     ) {
         self.executablePath = executablePath
         self.arguments = arguments
         self.environment = environment
         self.workingDirectory = workingDirectory
+        self.addressSpacePolicy = addressSpacePolicy
     }
+}
+
+public enum DurableAddressSpacePolicy: String, Codable, Hashable, Sendable {
+    case systemASLR
+    case continuumDeterministic
 }
 
 public struct DurableMemoryRegion: Codable, Hashable, Sendable {
@@ -126,6 +134,8 @@ public struct DurableMemoryRegion: Codable, Hashable, Sendable {
 
 public struct DurableThreadImage: Codable, Hashable, Sendable {
     public let threadIdentifier: UInt64
+    public let threadHandle: UInt64?
+    public let dispatchQueueAddress: UInt64?
     public let generalStateFlavor: UInt32
     public let generalState: DurableChunkReference
     public let vectorStateFlavor: UInt32
@@ -133,12 +143,16 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
 
     public init(
         threadIdentifier: UInt64,
+        threadHandle: UInt64? = nil,
+        dispatchQueueAddress: UInt64? = nil,
         generalStateFlavor: UInt32,
         generalState: DurableChunkReference,
         vectorStateFlavor: UInt32,
         vectorState: DurableChunkReference
     ) {
         self.threadIdentifier = threadIdentifier
+        self.threadHandle = threadHandle
+        self.dispatchQueueAddress = dispatchQueueAddress
         self.generalStateFlavor = generalStateFlavor
         self.generalState = generalState
         self.vectorStateFlavor = vectorStateFlavor

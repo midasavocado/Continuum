@@ -271,6 +271,11 @@ final class ContinuumRuntimeTests: XCTestCase {
             continuum_remote_session_capture_resource_fingerprint(session, nil),
             CONTINUUM_STATUS_INVALID_ARGUMENT
         )
+        var layoutInfo = continuum_remote_process_layout_info()
+        XCTAssertEqual(
+            continuum_remote_session_inspect_process_layout(nil, &layoutInfo),
+            CONTINUUM_STATUS_INVALID_ARGUMENT
+        )
     }
 
     func testProcessGroupAPIsRejectInvalidOrSelfTargets() {
