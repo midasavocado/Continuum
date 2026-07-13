@@ -271,12 +271,20 @@ typedef struct continuum_remote_process_region_info {
     uint32_t user_tag;
 } continuum_remote_process_region_info;
 
+typedef enum continuum_remote_thread_origin {
+    CONTINUUM_REMOTE_THREAD_ORIGIN_UNKNOWN = 0,
+    CONTINUUM_REMOTE_THREAD_ORIGIN_RAW_MACH = 1,
+    CONTINUUM_REMOTE_THREAD_ORIGIN_PTHREAD = 2,
+    CONTINUUM_REMOTE_THREAD_ORIGIN_WORKQUEUE = 3
+} continuum_remote_thread_origin;
+
 typedef struct continuum_remote_thread_state_info {
     uint64_t thread_identifier;
     uint64_t thread_handle;
     uint64_t pthread_object_address;
     uint64_t dispatch_queue_address;
     uint64_t stack_pointer;
+    continuum_remote_thread_origin origin;
     uint32_t general_state_flavor;
     size_t general_state_length;
     uint32_t vector_state_flavor;

@@ -331,6 +331,7 @@ typedef struct continuum_remote_thread_entry {
     uint64_t thread_handle;
     uint64_t pthread_object_address;
     uint64_t dispatch_queue_address;
+    continuum_remote_thread_origin origin;
     uint32_t general_flavor;
     uint8_t *general_bytes;
     size_t general_length;
@@ -361,6 +362,64 @@ static uint64_t continuum_pthread_object_address(uint64_t thread_handle) {
         return 0;
     }
     return thread_handle - layout->pthread_tsd_base_offset;
+}
+
+static continuum_remote_thread_origin continuum_thread_origin(
+    mach_port_t task,
+    uint64_t thread_handle,
+    uint64_t pthread_object_address
+) {
+    // Apple libpthread layout v1 places its flags word 78 bytes from pthread_t.
+    // Refuse classification unless the exported TSD geometry also matches.
+    enum {
+        CONTINUUM_PTHREAD_TSD_OFFSET_V1 = 224,
+        CONTINUUM_PTHREAD_FLAGS_OFFSET_V1 = 78,
+        CONTINUUM_PTHREAD_WORKQUEUE_MASK_V1 = 1 << 10
+    };
+    if (thread_handle == 0) {
+        return CONTINUUM_REMOTE_THREAD_ORIGIN_RAW_MACH;
+    }
+    const continuum_pthread_layout_offsets *layout = dlsym(
+        RTLD_DEFAULT,
+        "pthread_layout_offsets"
+    );
+    if (pthread_object_address == 0 || layout == NULL
+        || layout->version != 1
+        || layout->pthread_tsd_base_offset
+            != CONTINUUM_PTHREAD_TSD_OFFSET_V1
+        || layout->pthread_tsd_base_address_offset != 0) {
+        return CONTINUUM_REMOTE_THREAD_ORIGIN_UNKNOWN;
+    }
+
+    uint64_t observed_pthread_self = 0;
+    mach_vm_size_t copied = 0;
+    kern_return_t result = mach_vm_read_overwrite(
+        task,
+        thread_handle,
+        sizeof(observed_pthread_self),
+        (mach_vm_address_t)&observed_pthread_self,
+        &copied
+    );
+    if (result != KERN_SUCCESS || copied != sizeof(observed_pthread_self)
+        || observed_pthread_self != pthread_object_address) {
+        return CONTINUUM_REMOTE_THREAD_ORIGIN_UNKNOWN;
+    }
+
+    uint16_t flags = 0;
+    copied = 0;
+    result = mach_vm_read_overwrite(
+        task,
+        pthread_object_address + CONTINUUM_PTHREAD_FLAGS_OFFSET_V1,
+        sizeof(flags),
+        (mach_vm_address_t)&flags,
+        &copied
+    );
+    if (result != KERN_SUCCESS || copied != sizeof(flags)) {
+        return CONTINUUM_REMOTE_THREAD_ORIGIN_UNKNOWN;
+    }
+    return (flags & CONTINUUM_PTHREAD_WORKQUEUE_MASK_V1) != 0
+        ? CONTINUUM_REMOTE_THREAD_ORIGIN_WORKQUEUE
+        : CONTINUUM_REMOTE_THREAD_ORIGIN_PTHREAD;
 }
 
 typedef struct continuum_remote_process_region {
@@ -2576,6 +2635,11 @@ static continuum_status continuum_capture_thread_snapshot(
             identifier_info.thread_handle
         );
         entry->dispatch_queue_address = identifier_info.dispatch_qaddr;
+        entry->origin = continuum_thread_origin(
+            task,
+            entry->thread_handle,
+            entry->pthread_object_address
+        );
 
         mach_msg_type_number_t general_count = ARM_THREAD_STATE64_COUNT;
         entry->general_length = general_count * sizeof(natural_t);
@@ -7403,6 +7467,7 @@ continuum_status continuum_remote_thread_snapshot_info(
     out_info->thread_handle = entry->thread_handle;
     out_info->pthread_object_address = entry->pthread_object_address;
     out_info->dispatch_queue_address = entry->dispatch_queue_address;
+    out_info->origin = entry->origin;
     out_info->general_state_flavor = entry->general_flavor;
     out_info->general_state_length = entry->general_length;
     out_info->vector_state_flavor = entry->vector_flavor;

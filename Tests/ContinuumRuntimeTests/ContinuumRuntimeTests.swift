@@ -391,6 +391,15 @@ final class ContinuumRuntimeTests: XCTestCase {
     }
 
     func testRemoteSelfSessionCapturesThreadEvidenceAndRestoresArenaBytes() {
+        let workerStarted = DispatchSemaphore(value: 0)
+        let workerRelease = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            workerStarted.signal()
+            workerRelease.wait()
+        }
+        XCTAssertEqual(workerStarted.wait(timeout: .now() + 2), .success)
+        defer { workerRelease.signal() }
+
         let length = 16_384
         guard let memory = mmap(
             nil,
@@ -464,8 +473,27 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertGreaterThan(first.thread_identifier, 0)
         XCTAssertGreaterThan(first.thread_handle, 0)
         XCTAssertGreaterThan(first.pthread_object_address, 0)
+        XCTAssertEqual(
+            first.origin,
+            CONTINUUM_REMOTE_THREAD_ORIGIN_PTHREAD
+        )
         XCTAssertGreaterThan(first.general_state_length, 0)
         XCTAssertGreaterThan(first.vector_state_length, 0)
+        var foundWorkqueue = false
+        for index in 0..<threadCount {
+            var info = continuum_remote_thread_state_info()
+            XCTAssertEqual(
+                continuum_remote_thread_snapshot_info(threads, index, &info),
+                CONTINUUM_STATUS_OK
+            )
+            if info.origin == CONTINUUM_REMOTE_THREAD_ORIGIN_WORKQUEUE {
+                foundWorkqueue = true
+            }
+        }
+        XCTAssertTrue(
+            foundWorkqueue,
+            "Expected the blocked DispatchQueue worker to be classified"
+        )
 
         var generalLength = 0
         XCTAssertEqual(

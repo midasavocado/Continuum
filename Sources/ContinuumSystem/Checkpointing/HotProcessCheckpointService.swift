@@ -423,6 +423,17 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 let pthreadObjectAddress = thread.pthread_object_address == 0
                     ? nil
                     : thread.pthread_object_address
+                let origin: DurableThreadOrigin
+                switch thread.origin {
+                case CONTINUUM_REMOTE_THREAD_ORIGIN_RAW_MACH:
+                    origin = .rawMach
+                case CONTINUUM_REMOTE_THREAD_ORIGIN_PTHREAD:
+                    origin = .pthread
+                case CONTINUUM_REMOTE_THREAD_ORIGIN_WORKQUEUE:
+                    origin = .workqueue
+                default:
+                    origin = .unknown
+                }
                 let pthreadRegion = regions.first { region in
                     guard let pthreadObjectAddress,
                           let stackPointer else {
@@ -440,6 +451,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     threadIdentifier: thread.thread_identifier,
                     threadHandle: thread.thread_handle,
                     pthreadObjectAddress: pthreadObjectAddress,
+                    origin: origin,
                     dispatchQueueAddress: thread.dispatch_queue_address,
                     stackPointer: stackPointer,
                     pthreadRegionAddress: pthreadRegion?.address,

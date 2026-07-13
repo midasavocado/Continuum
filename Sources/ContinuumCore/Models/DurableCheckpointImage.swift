@@ -138,10 +138,18 @@ public struct DurableMemoryRegion: Codable, Hashable, Sendable {
     }
 }
 
+public enum DurableThreadOrigin: String, Codable, Hashable, Sendable {
+    case rawMach
+    case pthread
+    case workqueue
+    case unknown
+}
+
 public struct DurableThreadImage: Codable, Hashable, Sendable {
     public let threadIdentifier: UInt64
     public let threadHandle: UInt64?
     public let pthreadObjectAddress: UInt64?
+    public let origin: DurableThreadOrigin?
     public let dispatchQueueAddress: UInt64?
     public let stackPointer: UInt64?
     public let pthreadRegionAddress: UInt64?
@@ -155,6 +163,7 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
         threadIdentifier: UInt64,
         threadHandle: UInt64? = nil,
         pthreadObjectAddress: UInt64? = nil,
+        origin: DurableThreadOrigin? = nil,
         dispatchQueueAddress: UInt64? = nil,
         stackPointer: UInt64? = nil,
         pthreadRegionAddress: UInt64? = nil,
@@ -167,6 +176,7 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
         self.threadIdentifier = threadIdentifier
         self.threadHandle = threadHandle
         self.pthreadObjectAddress = pthreadObjectAddress
+        self.origin = origin
         self.dispatchQueueAddress = dispatchQueueAddress
         self.stackPointer = stackPointer
         self.pthreadRegionAddress = pthreadRegionAddress
