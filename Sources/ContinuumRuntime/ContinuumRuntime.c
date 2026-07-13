@@ -450,10 +450,20 @@ typedef struct continuum_bootstrap_pthread_wire_report {
     uint32_t requested_count;
     uint32_t created_count;
     int32_t error_code;
+    uint64_t primary_pthread_address;
+    uint32_t primary_mach_thread_port;
+    uint64_t primary_stack_base_address;
+    uint64_t primary_stack_length;
+    uint64_t primary_stack_region_address;
+    uint64_t primary_stack_region_length;
+    uint64_t primary_pthread_region_address;
+    uint64_t primary_pthread_region_length;
     uint64_t pthread_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint32_t mach_thread_ports[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t stack_base_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t stack_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t stack_region_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t stack_region_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t pthread_region_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t pthread_region_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
 } continuum_bootstrap_pthread_wire_report;
@@ -4751,6 +4761,333 @@ continuum_status continuum_remote_session_set_bootstrap_copy_identity(
     return CONTINUUM_STATUS_OK;
 }
 
+static continuum_status continuum_validate_remote_pthread_geometry(
+    mach_port_t task,
+    uint64_t pthread_address,
+    uint64_t stack_base,
+    uint64_t stack_length,
+    uint64_t stack_region_address,
+    uint64_t stack_region_length,
+    uint64_t pthread_region_address,
+    uint64_t pthread_region_length
+) {
+    uint64_t stack_end = 0;
+    uint64_t stack_region_end = 0;
+    uint64_t pthread_region_end = 0;
+    if (task == MACH_PORT_NULL || pthread_address == 0 || stack_base == 0
+        || stack_length == 0 || stack_region_address == 0
+        || stack_region_length == 0 || pthread_region_address == 0
+        || pthread_region_length == 0
+        || !continuum_add_u64(stack_base, stack_length, &stack_end)
+        || !continuum_add_u64(
+            stack_region_address,
+            stack_region_length,
+            &stack_region_end
+        )
+        || !continuum_add_u64(
+            pthread_region_address,
+            pthread_region_length,
+            &pthread_region_end
+        )
+        || stack_base < stack_region_address
+        || stack_end > stack_region_end
+        || pthread_address < pthread_region_address
+        || pthread_address >= pthread_region_end) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    mach_vm_size_t writable_span = 0;
+    kern_return_t mach_result = KERN_SUCCESS;
+    continuum_status status = continuum_reconstruction_leaf_span(
+        task,
+        stack_region_address,
+        stack_region_length,
+        VM_PROT_READ | VM_PROT_WRITE,
+        &writable_span,
+        &mach_result
+    );
+    if (status != CONTINUUM_STATUS_OK
+        || writable_span != stack_region_length) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+    if (pthread_region_address == stack_region_address
+        && pthread_region_length == stack_region_length) {
+        return CONTINUUM_STATUS_OK;
+    }
+
+    writable_span = 0;
+    status = continuum_reconstruction_leaf_span(
+        task,
+        pthread_region_address,
+        pthread_region_length,
+        VM_PROT_READ | VM_PROT_WRITE,
+        &writable_span,
+        &mach_result
+    );
+    if (status != CONTINUUM_STATUS_OK
+        || writable_span != pthread_region_length) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_plan_exact_pthread_reconstruction(
+    const continuum_saved_pthread_geometry *saved,
+    size_t saved_count,
+    const continuum_remote_pthread_bootstrap_report *replacement,
+    continuum_pthread_reconstruction_plan *out_plan
+) {
+    if (out_plan == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_plan, 0, sizeof(*out_plan));
+    if (saved == NULL || replacement == NULL || saved_count == 0
+        || saved_count > CONTINUUM_PTHREAD_PLAN_LIMIT
+        || replacement->version != 3
+        || replacement->requested_count > CONTINUUM_REMOTE_PTHREAD_LIMIT
+        || replacement->created_count != replacement->requested_count
+        || replacement->error_code != 0
+        || saved_count != (size_t)replacement->created_count + 1U
+        || replacement->primary_pthread_address == 0
+        || replacement->primary_thread_identifier == 0
+        || replacement->primary_thread_handle == 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+
+    uint64_t used_workers = 0;
+    int used_primary = 0;
+    continuum_status status = CONTINUUM_STATUS_OK;
+    for (size_t index = 0; index < saved_count; index += 1) {
+        const continuum_saved_pthread_geometry *candidate = &saved[index];
+        uint64_t saved_stack_region_end = 0;
+        uint64_t saved_pthread_region_end = 0;
+        if (candidate->saved_thread_identifier == 0
+            || candidate->pthread_address == 0
+            || candidate->stack_pointer == 0
+            || candidate->stack_region_address == 0
+            || candidate->stack_region_length == 0
+            || candidate->pthread_region_address == 0
+            || candidate->pthread_region_length == 0
+            || !continuum_add_u64(
+                candidate->stack_region_address,
+                candidate->stack_region_length,
+                &saved_stack_region_end
+            )
+            || !continuum_add_u64(
+                candidate->pthread_region_address,
+                candidate->pthread_region_length,
+                &saved_pthread_region_end
+            )
+            || candidate->stack_pointer < candidate->stack_region_address
+            || candidate->stack_pointer >= saved_stack_region_end
+            || candidate->pthread_address
+                < candidate->pthread_region_address
+            || candidate->pthread_address >= saved_pthread_region_end) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+            break;
+        }
+        for (size_t prior = 0; prior < index; prior += 1) {
+            if (saved[prior].saved_thread_identifier
+                    == candidate->saved_thread_identifier
+                || saved[prior].pthread_address
+                    == candidate->pthread_address) {
+                status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                break;
+            }
+        }
+        if (status != CONTINUUM_STATUS_OK) {
+            break;
+        }
+
+        uint64_t replacement_thread_identifier = 0;
+        uint64_t replacement_thread_handle = 0;
+        uint64_t replacement_stack_base = 0;
+        uint64_t replacement_stack_length = 0;
+        uint64_t replacement_stack_region_address = 0;
+        uint64_t replacement_stack_region_length = 0;
+        uint64_t replacement_pthread_region_address = 0;
+        uint64_t replacement_pthread_region_length = 0;
+        int is_primary = candidate->pthread_address
+            == replacement->primary_pthread_address;
+        if (is_primary) {
+            if (used_primary) {
+                status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                break;
+            }
+            used_primary = 1;
+            replacement_thread_identifier =
+                replacement->primary_thread_identifier;
+            replacement_thread_handle =
+                replacement->primary_thread_handle;
+            replacement_stack_base =
+                replacement->primary_stack_base_address;
+            replacement_stack_length =
+                replacement->primary_stack_length;
+            replacement_stack_region_address =
+                replacement->primary_stack_region_address;
+            replacement_stack_region_length =
+                replacement->primary_stack_region_length;
+            replacement_pthread_region_address =
+                replacement->primary_pthread_region_address;
+            replacement_pthread_region_length =
+                replacement->primary_pthread_region_length;
+        } else {
+            size_t worker_index = SIZE_MAX;
+            for (uint32_t worker = 0;
+                 worker < replacement->created_count;
+                 worker += 1) {
+                if (replacement->pthread_addresses[worker]
+                    == candidate->pthread_address) {
+                    if (worker_index != SIZE_MAX) {
+                        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                        break;
+                    }
+                    worker_index = worker;
+                }
+            }
+            if (status != CONTINUUM_STATUS_OK || worker_index == SIZE_MAX
+                || (used_workers & (UINT64_C(1) << worker_index)) != 0) {
+                status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                break;
+            }
+            used_workers |= UINT64_C(1) << worker_index;
+            replacement_thread_identifier =
+                replacement->thread_identifiers[worker_index];
+            replacement_thread_handle =
+                replacement->thread_handles[worker_index];
+            replacement_stack_base =
+                replacement->stack_base_addresses[worker_index];
+            replacement_stack_length =
+                replacement->stack_lengths[worker_index];
+            replacement_stack_region_address =
+                replacement->stack_region_addresses[worker_index];
+            replacement_stack_region_length =
+                replacement->stack_region_lengths[worker_index];
+            replacement_pthread_region_address =
+                replacement->pthread_region_addresses[worker_index];
+            replacement_pthread_region_length =
+                replacement->pthread_region_lengths[worker_index];
+        }
+
+        uint64_t replacement_stack_end = 0;
+        uint64_t replacement_stack_region_end = 0;
+        uint64_t replacement_pthread_region_end = 0;
+        if (replacement_thread_identifier == 0
+            || replacement_thread_handle == 0
+            || replacement_stack_region_address
+                != candidate->stack_region_address
+            || replacement_stack_region_length
+                != candidate->stack_region_length
+            || replacement_pthread_region_address
+                != candidate->pthread_region_address
+            || replacement_pthread_region_length
+                != candidate->pthread_region_length
+            || !continuum_add_u64(
+                replacement_stack_base,
+                replacement_stack_length,
+                &replacement_stack_end
+            )
+            || !continuum_add_u64(
+                replacement_stack_region_address,
+                replacement_stack_region_length,
+                &replacement_stack_region_end
+            )
+            || !continuum_add_u64(
+                replacement_pthread_region_address,
+                replacement_pthread_region_length,
+                &replacement_pthread_region_end
+            )
+            || replacement_stack_base < replacement_stack_region_address
+            || replacement_stack_end > replacement_stack_region_end
+            || candidate->stack_pointer < replacement_stack_base
+            || candidate->stack_pointer >= replacement_stack_end
+            || (replacement_stack_region_address
+                    != replacement_pthread_region_address
+                && replacement_stack_region_address
+                    < replacement_pthread_region_end
+                && replacement_pthread_region_address
+                    < replacement_stack_region_end)
+            || (replacement_stack_region_address
+                    == replacement_pthread_region_address
+                && (replacement_stack_region_length
+                        != replacement_pthread_region_length
+                    || candidate->pthread_address
+                        <= replacement_stack_region_address
+                    || candidate->pthread_address
+                        >= replacement_stack_region_end))) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+            break;
+        }
+
+        uint64_t stack_copy_address = replacement_stack_region_address;
+        uint64_t stack_copy_length = replacement_stack_region_length;
+        uint64_t preserved_pthread_address =
+            replacement_pthread_region_address;
+        if (replacement_stack_region_address
+            == replacement_pthread_region_address) {
+            stack_copy_length = candidate->pthread_address
+                - replacement_stack_region_address;
+            preserved_pthread_address = candidate->pthread_address;
+        }
+        uint64_t preserved_pthread_length =
+            replacement_pthread_region_end - preserved_pthread_address;
+        uint64_t next_stack_bytes = 0;
+        uint64_t next_preserved_bytes = 0;
+        if (preserved_pthread_length == 0
+            || !continuum_add_u64(
+                out_plan->stack_copy_bytes,
+                stack_copy_length,
+                &next_stack_bytes
+            )
+            || !continuum_add_u64(
+                out_plan->preserved_pthread_bytes,
+                preserved_pthread_length,
+                &next_preserved_bytes
+            )) {
+            status = CONTINUUM_STATUS_RANGE_ERROR;
+            break;
+        }
+
+        continuum_pthread_reconstruction_plan_entry *entry =
+            &out_plan->entries[index];
+        entry->saved_thread_identifier =
+            candidate->saved_thread_identifier;
+        entry->replacement_thread_identifier =
+            replacement_thread_identifier;
+        entry->replacement_thread_handle = replacement_thread_handle;
+        entry->pthread_address = candidate->pthread_address;
+        entry->stack_copy_address = stack_copy_address;
+        entry->stack_copy_length = stack_copy_length;
+        entry->preserved_pthread_address = preserved_pthread_address;
+        entry->preserved_pthread_length = preserved_pthread_length;
+        entry->is_primary = is_primary;
+        out_plan->stack_copy_bytes = next_stack_bytes;
+        out_plan->preserved_pthread_bytes = next_preserved_bytes;
+        if (is_primary) {
+            out_plan->primary_saved_thread_identifier =
+                candidate->saved_thread_identifier;
+        }
+    }
+
+    uint64_t expected_workers = replacement->created_count == 64
+        ? UINT64_MAX
+        : ((UINT64_C(1) << replacement->created_count) - 1U);
+    if (status == CONTINUUM_STATUS_OK
+        && (!used_primary || used_workers != expected_workers)) {
+        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        memset(out_plan, 0, sizeof(*out_plan));
+        return status;
+    }
+    out_plan->entry_count = (uint32_t)saved_count;
+    return CONTINUUM_STATUS_OK;
+}
+
 continuum_status continuum_remote_session_prepare_suspended_pthreads(
     continuum_remote_session *session,
     uint32_t requested_count,
@@ -4765,8 +5102,7 @@ continuum_status continuum_remote_session_prepare_suspended_pthreads(
     (void)requested_count;
     return CONTINUUM_STATUS_UNSUPPORTED_ARCHITECTURE;
 #else
-    if (session == NULL || requested_count == 0
-        || requested_count > CONTINUUM_REMOTE_PTHREAD_LIMIT
+    if (session == NULL || requested_count > CONTINUUM_REMOTE_PTHREAD_LIMIT
         || session->bootstrap_pthread_prepare_address == 0
         || session->has_active_reconstruction
         || session->has_prepared_pthread_set
@@ -4911,7 +5247,7 @@ continuum_status continuum_remote_session_prepare_suspended_pthreads(
     if (status != CONTINUUM_STATUS_OK) {
         goto cleanup_allocations;
     }
-    if (wire_report.version != 2
+    if (wire_report.version != 3
         || wire_report.requested_count != requested_count
         || wire_report.created_count != requested_count
         || wire_report.error_code != 0) {
@@ -4932,56 +5268,120 @@ continuum_status continuum_remote_session_prepare_suspended_pthreads(
         goto cleanup_prepared_threads;
     }
 
+    if (!MACH_PORT_VALID(wire_report.primary_mach_thread_port)) {
+        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        goto cleanup_prepared_threads;
+    }
+    status = continuum_validate_remote_pthread_geometry(
+        session->task,
+        wire_report.primary_pthread_address,
+        wire_report.primary_stack_base_address,
+        wire_report.primary_stack_length,
+        wire_report.primary_stack_region_address,
+        wire_report.primary_stack_region_length,
+        wire_report.primary_pthread_region_address,
+        wire_report.primary_pthread_region_length
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        goto cleanup_prepared_threads;
+    }
+
+    thread_identifier_info_data_t primary_identity;
+    memset(&primary_identity, 0, sizeof(primary_identity));
+    mach_msg_type_number_t primary_identity_count =
+        THREAD_IDENTIFIER_INFO_COUNT;
+    mach_result = thread_info(
+        original_threads[0],
+        THREAD_IDENTIFIER_INFO,
+        (thread_info_t)&primary_identity,
+        &primary_identity_count
+    );
+    if (mach_result != KERN_SUCCESS || primary_identity.thread_id == 0
+        || primary_identity.thread_handle == 0
+        || continuum_pthread_object_address(primary_identity.thread_handle)
+            != wire_report.primary_pthread_address) {
+        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        goto cleanup_prepared_threads;
+    }
+
+    mach_port_t reported_primary_port = MACH_PORT_NULL;
+    mach_msg_type_name_t reported_primary_type = 0;
+    mach_result = mach_port_extract_right(
+        session->task,
+        wire_report.primary_mach_thread_port,
+        MACH_MSG_TYPE_COPY_SEND,
+        &reported_primary_port,
+        &reported_primary_type
+    );
+    if (mach_result != KERN_SUCCESS
+        || !MACH_PORT_VALID(reported_primary_port)
+        || reported_primary_type != MACH_MSG_TYPE_PORT_SEND) {
+        if (MACH_PORT_VALID(reported_primary_port)) {
+            mach_port_deallocate(
+                mach_task_self(),
+                reported_primary_port
+            );
+        }
+        status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
+        goto cleanup_prepared_threads;
+    }
+    thread_identifier_info_data_t reported_primary_identity;
+    memset(&reported_primary_identity, 0, sizeof(reported_primary_identity));
+    mach_msg_type_number_t reported_primary_identity_count =
+        THREAD_IDENTIFIER_INFO_COUNT;
+    mach_result = thread_info(
+        reported_primary_port,
+        THREAD_IDENTIFIER_INFO,
+        (thread_info_t)&reported_primary_identity,
+        &reported_primary_identity_count
+    );
+    mach_port_deallocate(mach_task_self(), reported_primary_port);
+    if (mach_result != KERN_SUCCESS
+        || reported_primary_identity.thread_id
+            != primary_identity.thread_id
+        || reported_primary_identity.thread_handle
+            != primary_identity.thread_handle) {
+        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        goto cleanup_prepared_threads;
+    }
+
     out_report->version = wire_report.version;
     out_report->requested_count = wire_report.requested_count;
     out_report->created_count = wire_report.created_count;
     out_report->error_code = wire_report.error_code;
+    out_report->primary_pthread_address =
+        wire_report.primary_pthread_address;
+    out_report->primary_thread_identifier = primary_identity.thread_id;
+    out_report->primary_thread_handle = primary_identity.thread_handle;
+    out_report->primary_stack_base_address =
+        wire_report.primary_stack_base_address;
+    out_report->primary_stack_length = wire_report.primary_stack_length;
+    out_report->primary_stack_region_address =
+        wire_report.primary_stack_region_address;
+    out_report->primary_stack_region_length =
+        wire_report.primary_stack_region_length;
+    out_report->primary_pthread_region_address =
+        wire_report.primary_pthread_region_address;
+    out_report->primary_pthread_region_length =
+        wire_report.primary_pthread_region_length;
     for (uint32_t index = 0; index < requested_count; index += 1) {
-        uint64_t stack_end = 0;
-        uint64_t region_end = 0;
-        if (wire_report.pthread_addresses[index] == 0
-            || !MACH_PORT_VALID(wire_report.mach_thread_ports[index])
-            || wire_report.stack_base_addresses[index] == 0
-            || wire_report.stack_lengths[index] == 0
-            || wire_report.pthread_region_addresses[index] == 0
-            || wire_report.pthread_region_lengths[index] == 0
-            || !continuum_add_u64(
-                wire_report.stack_base_addresses[index],
-                wire_report.stack_lengths[index],
-                &stack_end
-            )
-            || !continuum_add_u64(
-                wire_report.pthread_region_addresses[index],
-                wire_report.pthread_region_lengths[index],
-                &region_end
-            )
-            || wire_report.stack_base_addresses[index]
-                < wire_report.pthread_region_addresses[index]
-            || stack_end > region_end
-            || wire_report.pthread_addresses[index]
-                < wire_report.pthread_region_addresses[index]
-            || wire_report.pthread_addresses[index] >= region_end) {
+        if (!MACH_PORT_VALID(wire_report.mach_thread_ports[index])) {
             status = CONTINUUM_STATUS_VALIDATION_FAILED;
             break;
         }
-
-        mach_vm_size_t writable_span = 0;
-        status = continuum_reconstruction_leaf_span(
+        status = continuum_validate_remote_pthread_geometry(
             session->task,
+            wire_report.pthread_addresses[index],
+            wire_report.stack_base_addresses[index],
+            wire_report.stack_lengths[index],
+            wire_report.stack_region_addresses[index],
+            wire_report.stack_region_lengths[index],
             wire_report.pthread_region_addresses[index],
-            wire_report.pthread_region_lengths[index],
-            VM_PROT_READ | VM_PROT_WRITE,
-            &writable_span,
-            &mach_result
+            wire_report.pthread_region_lengths[index]
         );
-        if (status != CONTINUUM_STATUS_OK
-            || writable_span != wire_report.pthread_region_lengths[index]) {
-            if (status == CONTINUUM_STATUS_OK) {
-                status = CONTINUUM_STATUS_VALIDATION_FAILED;
-            }
+        if (status != CONTINUUM_STATUS_OK) {
             break;
         }
-
         mach_port_t thread_port = MACH_PORT_NULL;
         mach_msg_type_name_t acquired_type = 0;
         mach_result = mach_port_extract_right(
@@ -5023,7 +5423,11 @@ continuum_status continuum_remote_session_prepare_suspended_pthreads(
         if (mach_result != KERN_SUCCESS || identity.thread_id == 0
             || identity.thread_handle == 0 || basic.suspend_count < 1
             || continuum_pthread_object_address(identity.thread_handle)
-                != wire_report.pthread_addresses[index]) {
+                != wire_report.pthread_addresses[index]
+            || wire_report.pthread_addresses[index]
+                == wire_report.primary_pthread_address
+            || identity.thread_id == primary_identity.thread_id
+            || identity.thread_handle == primary_identity.thread_handle) {
             status = CONTINUUM_STATUS_VALIDATION_FAILED;
             break;
         }
@@ -5052,6 +5456,10 @@ continuum_status continuum_remote_session_prepare_suspended_pthreads(
             wire_report.stack_base_addresses[index];
         out_report->stack_lengths[index] =
             wire_report.stack_lengths[index];
+        out_report->stack_region_addresses[index] =
+            wire_report.stack_region_addresses[index];
+        out_report->stack_region_lengths[index] =
+            wire_report.stack_region_lengths[index];
         out_report->pthread_region_addresses[index] =
             wire_report.pthread_region_addresses[index];
         out_report->pthread_region_lengths[index] =

@@ -228,14 +228,58 @@ typedef struct continuum_remote_pthread_bootstrap_report {
     uint32_t requested_count;
     uint32_t created_count;
     int32_t error_code;
+    uint64_t primary_pthread_address;
+    uint64_t primary_thread_identifier;
+    uint64_t primary_thread_handle;
+    uint64_t primary_stack_base_address;
+    uint64_t primary_stack_length;
+    uint64_t primary_stack_region_address;
+    uint64_t primary_stack_region_length;
+    uint64_t primary_pthread_region_address;
+    uint64_t primary_pthread_region_length;
     uint64_t pthread_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t thread_identifiers[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t thread_handles[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t stack_base_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t stack_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t stack_region_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
+    uint64_t stack_region_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t pthread_region_addresses[CONTINUUM_REMOTE_PTHREAD_LIMIT];
     uint64_t pthread_region_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
 } continuum_remote_pthread_bootstrap_report;
+
+enum { CONTINUUM_PTHREAD_PLAN_LIMIT = CONTINUUM_REMOTE_PTHREAD_LIMIT + 1 };
+
+typedef struct continuum_saved_pthread_geometry {
+    uint64_t saved_thread_identifier;
+    uint64_t pthread_address;
+    uint64_t stack_pointer;
+    uint64_t stack_region_address;
+    uint64_t stack_region_length;
+    uint64_t pthread_region_address;
+    uint64_t pthread_region_length;
+} continuum_saved_pthread_geometry;
+
+typedef struct continuum_pthread_reconstruction_plan_entry {
+    uint64_t saved_thread_identifier;
+    uint64_t replacement_thread_identifier;
+    uint64_t replacement_thread_handle;
+    uint64_t pthread_address;
+    uint64_t stack_copy_address;
+    uint64_t stack_copy_length;
+    uint64_t preserved_pthread_address;
+    uint64_t preserved_pthread_length;
+    uint8_t is_primary;
+} continuum_pthread_reconstruction_plan_entry;
+
+typedef struct continuum_pthread_reconstruction_plan {
+    uint32_t entry_count;
+    uint64_t primary_saved_thread_identifier;
+    uint64_t stack_copy_bytes;
+    uint64_t preserved_pthread_bytes;
+    continuum_pthread_reconstruction_plan_entry
+        entries[CONTINUUM_PTHREAD_PLAN_LIMIT];
+} continuum_pthread_reconstruction_plan;
 
 
 typedef enum continuum_reconstruction_stage {
@@ -474,6 +518,17 @@ continuum_status continuum_remote_session_prepare_suspended_pthreads(
     continuum_remote_session *session,
     uint32_t requested_count,
     continuum_remote_pthread_bootstrap_report *out_report
+);
+
+/// Requires exact primary/worker pthread and mapping addresses. It plans only
+/// stack-byte transplantation and explicitly preserves live libpthread
+/// metadata; callers must not interpret a successful plan as a complete
+/// pthread/TSD restore.
+continuum_status continuum_plan_exact_pthread_reconstruction(
+    const continuum_saved_pthread_geometry *saved,
+    size_t saved_count,
+    const continuum_remote_pthread_bootstrap_report *replacement,
+    continuum_pthread_reconstruction_plan *out_plan
 );
 
 /// Writes and immediately reads back one bounded range of a mapping prepared

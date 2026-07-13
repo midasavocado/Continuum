@@ -24,14 +24,24 @@ final class ContinuumRuntimeTests: XCTestCase {
             ),
             0
         )
-        XCTAssertEqual(report.version, 2)
+        XCTAssertEqual(report.version, 3)
         XCTAssertEqual(report.requested_count, 1)
         XCTAssertEqual(report.created_count, 1)
         XCTAssertEqual(report.error_code, 0)
+        XCTAssertNotEqual(report.primary_pthread_address, 0)
+        XCTAssertNotEqual(report.primary_mach_thread_port, 0)
+        XCTAssertNotEqual(report.primary_stack_base_address, 0)
+        XCTAssertGreaterThan(report.primary_stack_length, 0)
+        XCTAssertNotEqual(report.primary_stack_region_address, 0)
+        XCTAssertGreaterThan(report.primary_stack_region_length, 0)
+        XCTAssertNotEqual(report.primary_pthread_region_address, 0)
+        XCTAssertGreaterThan(report.primary_pthread_region_length, 0)
         XCTAssertNotEqual(report.pthread_addresses.0, 0)
         XCTAssertNotEqual(report.mach_thread_ports.0, 0)
         XCTAssertNotEqual(report.stack_base_addresses.0, 0)
         XCTAssertGreaterThan(report.stack_lengths.0, 0)
+        XCTAssertNotEqual(report.stack_region_addresses.0, 0)
+        XCTAssertGreaterThan(report.stack_region_lengths.0, 0)
         XCTAssertNotEqual(report.pthread_region_addresses.0, 0)
         XCTAssertGreaterThan(report.pthread_region_lengths.0, 0)
 
@@ -40,16 +50,40 @@ final class ContinuumRuntimeTests: XCTestCase {
         let (stackEnd, stackOverflow) = stackBase.addingReportingOverflow(
             report.stack_lengths.0
         )
-        let regionBase = report.pthread_region_addresses.0
-        let (regionEnd, regionOverflow) = regionBase.addingReportingOverflow(
-            report.pthread_region_lengths.0
-        )
+        let stackRegionBase = report.stack_region_addresses.0
+        let (stackRegionEnd, stackRegionOverflow) =
+            stackRegionBase.addingReportingOverflow(
+                report.stack_region_lengths.0
+            )
+        let pthreadRegionBase = report.pthread_region_addresses.0
+        let (pthreadRegionEnd, pthreadRegionOverflow) =
+            pthreadRegionBase.addingReportingOverflow(
+                report.pthread_region_lengths.0
+            )
         XCTAssertFalse(stackOverflow)
-        XCTAssertFalse(regionOverflow)
-        XCTAssertGreaterThanOrEqual(stackBase, regionBase)
-        XCTAssertLessThanOrEqual(stackEnd, regionEnd)
-        XCTAssertGreaterThanOrEqual(pthreadAddress, regionBase)
-        XCTAssertLessThan(pthreadAddress, regionEnd)
+        XCTAssertFalse(stackRegionOverflow)
+        XCTAssertFalse(pthreadRegionOverflow)
+        XCTAssertGreaterThanOrEqual(stackBase, stackRegionBase)
+        XCTAssertLessThanOrEqual(stackEnd, stackRegionEnd)
+        XCTAssertGreaterThanOrEqual(pthreadAddress, pthreadRegionBase)
+        XCTAssertLessThan(pthreadAddress, pthreadRegionEnd)
+        XCTAssertEqual(stackEnd, pthreadAddress)
+
+        let (primaryStackEnd, primaryStackOverflow) =
+            report.primary_stack_base_address.addingReportingOverflow(
+                report.primary_stack_length
+            )
+        let (primaryStackRegionEnd, primaryRegionOverflow) =
+            report.primary_stack_region_address.addingReportingOverflow(
+                report.primary_stack_region_length
+            )
+        XCTAssertFalse(primaryStackOverflow)
+        XCTAssertFalse(primaryRegionOverflow)
+        XCTAssertGreaterThanOrEqual(
+            report.primary_stack_base_address,
+            report.primary_stack_region_address
+        )
+        XCTAssertLessThanOrEqual(primaryStackEnd, primaryStackRegionEnd)
 
         let machThread = mach_port_t(report.mach_thread_ports.0)
         XCTAssertEqual(thread_resume(machThread), KERN_SUCCESS)
@@ -59,6 +93,20 @@ final class ContinuumRuntimeTests: XCTestCase {
             return XCTFail("Bootstrap returned an invalid pthread address")
         }
         XCTAssertEqual(pthread_join(pthread, nil), 0)
+
+        var primaryOnly = continuum_bootstrap_pthread_report()
+        XCTAssertEqual(
+            continuum_bootstrap_prepare_suspended_pthreads(
+                &primaryOnly,
+                MemoryLayout.size(ofValue: primaryOnly),
+                0
+            ),
+            0
+        )
+        XCTAssertEqual(primaryOnly.version, 3)
+        XCTAssertEqual(primaryOnly.requested_count, 0)
+        XCTAssertEqual(primaryOnly.created_count, 0)
+        XCTAssertNotEqual(primaryOnly.primary_pthread_address, 0)
     }
 
     func testRemotePthreadBootstrapRejectsInvalidArguments() {
@@ -77,6 +125,119 @@ final class ContinuumRuntimeTests: XCTestCase {
             continuum_remote_session_prepare_suspended_pthreads(nil, 0, nil),
             CONTINUUM_STATUS_INVALID_ARGUMENT
         )
+    }
+
+    func testExactPthreadPlanCopiesOnlyStacksAtMatchingAddresses() {
+        var replacement = continuum_remote_pthread_bootstrap_report()
+        replacement.version = 3
+        replacement.requested_count = 1
+        replacement.created_count = 1
+        replacement.primary_pthread_address = 0x1000_5000
+        replacement.primary_thread_identifier = 10
+        replacement.primary_thread_handle = 0x1000_50E0
+        replacement.primary_stack_base_address = 0x2000_0000
+        replacement.primary_stack_length = 0x8000
+        replacement.primary_stack_region_address = 0x2000_0000
+        replacement.primary_stack_region_length = 0x8000
+        replacement.primary_pthread_region_address = 0x1000_0000
+        replacement.primary_pthread_region_length = 0x10000
+        replacement.pthread_addresses.0 = 0x3008_3000
+        replacement.thread_identifiers.0 = 20
+        replacement.thread_handles.0 = 0x3008_30E0
+        replacement.stack_base_addresses.0 = 0x3000_0000
+        replacement.stack_lengths.0 = 0x83000
+        replacement.stack_region_addresses.0 = 0x3000_0000
+        replacement.stack_region_lengths.0 = 0x88000
+        replacement.pthread_region_addresses.0 = 0x3000_0000
+        replacement.pthread_region_lengths.0 = 0x88000
+
+        var saved = [
+            continuum_saved_pthread_geometry(
+                saved_thread_identifier: 200,
+                pthread_address: 0x3008_3000,
+                stack_pointer: 0x3004_0000,
+                stack_region_address: 0x3000_0000,
+                stack_region_length: 0x88000,
+                pthread_region_address: 0x3000_0000,
+                pthread_region_length: 0x88000
+            ),
+            continuum_saved_pthread_geometry(
+                saved_thread_identifier: 100,
+                pthread_address: 0x1000_5000,
+                stack_pointer: 0x2000_4000,
+                stack_region_address: 0x2000_0000,
+                stack_region_length: 0x8000,
+                pthread_region_address: 0x1000_0000,
+                pthread_region_length: 0x10000
+            )
+        ]
+        var plan = continuum_pthread_reconstruction_plan()
+        let status = saved.withUnsafeBufferPointer { savedBuffer in
+            continuum_plan_exact_pthread_reconstruction(
+                savedBuffer.baseAddress,
+                savedBuffer.count,
+                &replacement,
+                &plan
+            )
+        }
+        XCTAssertEqual(status, CONTINUUM_STATUS_OK)
+        XCTAssertEqual(plan.entry_count, 2)
+        XCTAssertEqual(plan.primary_saved_thread_identifier, 100)
+        XCTAssertEqual(plan.stack_copy_bytes, 0x8B000)
+        XCTAssertEqual(plan.preserved_pthread_bytes, 0x15000)
+        XCTAssertEqual(plan.entries.0.saved_thread_identifier, 200)
+        XCTAssertEqual(plan.entries.0.replacement_thread_identifier, 20)
+        XCTAssertEqual(plan.entries.0.stack_copy_address, 0x3000_0000)
+        XCTAssertEqual(plan.entries.0.stack_copy_length, 0x83000)
+        XCTAssertEqual(
+            plan.entries.0.preserved_pthread_address,
+            0x3008_3000
+        )
+        XCTAssertEqual(plan.entries.0.preserved_pthread_length, 0x5000)
+        XCTAssertEqual(plan.entries.0.is_primary, 0)
+        XCTAssertEqual(plan.entries.1.saved_thread_identifier, 100)
+        XCTAssertEqual(plan.entries.1.replacement_thread_identifier, 10)
+        XCTAssertEqual(plan.entries.1.stack_copy_address, 0x2000_0000)
+        XCTAssertEqual(plan.entries.1.stack_copy_length, 0x8000)
+        XCTAssertEqual(
+            plan.entries.1.preserved_pthread_address,
+            0x1000_0000
+        )
+        XCTAssertEqual(plan.entries.1.preserved_pthread_length, 0x10000)
+        XCTAssertEqual(plan.entries.1.is_primary, 1)
+
+        saved[0].stack_region_address += 0x1000
+        let mismatchStatus = saved.withUnsafeBufferPointer { savedBuffer in
+            continuum_plan_exact_pthread_reconstruction(
+                savedBuffer.baseAddress,
+                savedBuffer.count,
+                &replacement,
+                &plan
+            )
+        }
+        XCTAssertEqual(
+            mismatchStatus,
+            CONTINUUM_STATUS_VALIDATION_FAILED
+        )
+        XCTAssertEqual(plan.entry_count, 0)
+
+        saved[0].stack_region_address = 0x2FFF_F000
+        saved[0].stack_region_length = 0x89000
+        replacement.stack_region_addresses.0 = 0x2FFF_F000
+        replacement.stack_region_lengths.0 = 0x89000
+        let overlappingStatus = saved.withUnsafeBufferPointer { savedBuffer in
+            continuum_plan_exact_pthread_reconstruction(
+                savedBuffer.baseAddress,
+                savedBuffer.count,
+                &replacement,
+                &plan
+            )
+        }
+        XCTAssertEqual(
+            overlappingStatus,
+            CONTINUUM_STATUS_VALIDATION_FAILED
+        )
+        XCTAssertEqual(plan.entry_count, 0)
     }
 
     func testTrackedMemoryMovesBackwardAndForward() {

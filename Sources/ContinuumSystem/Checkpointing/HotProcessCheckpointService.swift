@@ -435,17 +435,20 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     origin = .unknown
                 }
                 let pthreadRegion = regions.first { region in
-                    guard let pthreadObjectAddress,
-                          let stackPointer else {
-                        return false
-                    }
+                    guard let pthreadObjectAddress else { return false }
+                    let (end, overflow) = region.address
+                        .addingReportingOverflow(region.length)
+                    return !overflow
+                        && pthreadObjectAddress >= region.address
+                        && pthreadObjectAddress < end
+                }
+                let stackRegion = regions.first { region in
+                    guard let stackPointer else { return false }
                     let (end, overflow) = region.address
                         .addingReportingOverflow(region.length)
                     return !overflow
                         && stackPointer >= region.address
                         && stackPointer < end
-                        && pthreadObjectAddress >= region.address
-                        && pthreadObjectAddress < end
                 }
                 threads.append(DurableThreadImage(
                     threadIdentifier: thread.thread_identifier,
@@ -454,6 +457,8 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     origin: origin,
                     dispatchQueueAddress: thread.dispatch_queue_address,
                     stackPointer: stackPointer,
+                    stackRegionAddress: stackRegion?.address,
+                    stackRegionLength: stackRegion?.length,
                     pthreadRegionAddress: pthreadRegion?.address,
                     pthreadRegionLength: pthreadRegion?.length,
                     generalStateFlavor: thread.general_state_flavor,

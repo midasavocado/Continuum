@@ -76,6 +76,8 @@ final class ModelRoundTripTests: XCTestCase {
                             origin: .pthread,
                             dispatchQueueAddress: 0x1_2346_0000,
                             stackPointer: 0x1_0000_3000,
+                            stackRegionAddress: 0x1_0000_0000,
+                            stackRegionLength: 16_384,
                             pthreadRegionAddress: 0x1_0000_0000,
                             pthreadRegionLength: 16_384,
                             generalStateFlavor: 6,

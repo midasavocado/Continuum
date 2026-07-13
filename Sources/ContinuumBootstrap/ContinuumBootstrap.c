@@ -34,24 +34,17 @@ void continuum_bootstrap_copy_and_trap(
     __builtin_unreachable();
 }
 
-static int continuum_bootstrap_pthread_geometry(
-    pthread_t thread,
-    uint64_t *out_stack_base,
-    uint64_t *out_stack_length,
+static int continuum_bootstrap_region(
+    uintptr_t point,
     uint64_t *out_region_address,
     uint64_t *out_region_length
 ) {
-    uintptr_t stack_top = (uintptr_t)pthread_get_stackaddr_np(thread);
-    size_t stack_length = pthread_get_stacksize_np(thread);
-    uintptr_t pthread_address = (uintptr_t)thread;
-    if (stack_top == 0 || stack_length == 0 || stack_length > stack_top
-        || pthread_address == 0 || out_stack_base == NULL
-        || out_stack_length == NULL || out_region_address == NULL
+    if (point == 0 || out_region_address == NULL
         || out_region_length == NULL) {
         return EINVAL;
     }
 
-    mach_vm_address_t region_address = pthread_address;
+    mach_vm_address_t region_address = point;
     mach_vm_size_t region_length = 0;
     natural_t depth = 0;
     vm_region_submap_info_data_64_t info;
@@ -72,21 +65,66 @@ static int continuum_bootstrap_pthread_geometry(
         }
         depth += 1;
     }
-    uint64_t stack_base = stack_top - stack_length;
     uint64_t region_end = region_address + region_length;
     if (result != KERN_SUCCESS || region_length == 0
-        || region_end < region_address || pthread_address < region_address
-        || pthread_address >= region_end
+        || region_end < region_address || point < region_address
+        || point >= region_end
         || (info.protection & (VM_PROT_READ | VM_PROT_WRITE))
-            != (VM_PROT_READ | VM_PROT_WRITE)
-        || stack_base < region_address
-        || stack_top > region_end) {
+            != (VM_PROT_READ | VM_PROT_WRITE)) {
         return EINVAL;
+    }
+    *out_region_address = region_address;
+    *out_region_length = region_length;
+    return 0;
+}
+
+static int continuum_bootstrap_pthread_geometry(
+    pthread_t thread,
+    uint64_t *out_stack_base,
+    uint64_t *out_stack_length,
+    uint64_t *out_stack_region_address,
+    uint64_t *out_stack_region_length,
+    uint64_t *out_pthread_region_address,
+    uint64_t *out_pthread_region_length
+) {
+    uintptr_t stack_top = (uintptr_t)pthread_get_stackaddr_np(thread);
+    size_t stack_length = pthread_get_stacksize_np(thread);
+    uintptr_t pthread_address = (uintptr_t)thread;
+    if (stack_top == 0 || stack_length == 0 || stack_length > stack_top
+        || pthread_address == 0 || out_stack_base == NULL
+        || out_stack_length == NULL || out_stack_region_address == NULL
+        || out_stack_region_length == NULL
+        || out_pthread_region_address == NULL
+        || out_pthread_region_length == NULL) {
+        return EINVAL;
+    }
+
+    uint64_t stack_base = stack_top - stack_length;
+    int result = continuum_bootstrap_region(
+        stack_base,
+        out_stack_region_address,
+        out_stack_region_length
+    );
+    if (result != 0) {
+        return result;
+    }
+    uint64_t stack_region_end =
+        *out_stack_region_address + *out_stack_region_length;
+    if (stack_region_end < *out_stack_region_address
+        || stack_base < *out_stack_region_address
+        || stack_top > stack_region_end) {
+        return EINVAL;
+    }
+    result = continuum_bootstrap_region(
+        pthread_address,
+        out_pthread_region_address,
+        out_pthread_region_length
+    );
+    if (result != 0) {
+        return result;
     }
     *out_stack_base = stack_base;
     *out_stack_length = stack_length;
-    *out_region_address = region_address;
-    *out_region_length = region_length;
     return 0;
 }
 
@@ -100,17 +138,38 @@ int continuum_bootstrap_prepare_suspended_pthreads(
     uint32_t requested_count
 ) {
     if (report == NULL || report_length < sizeof(*report)
-        || requested_count == 0
         || requested_count > CONTINUUM_BOOTSTRAP_PTHREAD_LIMIT) {
         return EINVAL;
     }
     memset(report, 0, sizeof(*report));
-    report->version = 2;
+    report->version = 3;
     report->requested_count = requested_count;
+
+    pthread_t primary = pthread_self();
+    report->primary_pthread_address = (uint64_t)(uintptr_t)primary;
+    report->primary_mach_thread_port = pthread_mach_thread_np(primary);
+    if (primary == NULL
+        || !MACH_PORT_VALID(report->primary_mach_thread_port)) {
+        report->error_code = EINVAL;
+        return report->error_code;
+    }
+    int result = continuum_bootstrap_pthread_geometry(
+        primary,
+        &report->primary_stack_base_address,
+        &report->primary_stack_length,
+        &report->primary_stack_region_address,
+        &report->primary_stack_region_length,
+        &report->primary_pthread_region_address,
+        &report->primary_pthread_region_length
+    );
+    if (result != 0) {
+        report->error_code = result;
+        return report->error_code;
+    }
 
     for (uint32_t index = 0; index < requested_count; index += 1) {
         pthread_t thread = NULL;
-        int result = pthread_create_suspended_np(
+        result = pthread_create_suspended_np(
             &thread,
             NULL,
             continuum_bootstrap_placeholder_start,
@@ -132,6 +191,8 @@ int continuum_bootstrap_prepare_suspended_pthreads(
             thread,
             &report->stack_base_addresses[index],
             &report->stack_lengths[index],
+            &report->stack_region_addresses[index],
+            &report->stack_region_lengths[index],
             &report->pthread_region_addresses[index],
             &report->pthread_region_lengths[index]
         );

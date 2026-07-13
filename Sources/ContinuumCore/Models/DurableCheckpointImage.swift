@@ -3,7 +3,7 @@ import Foundation
 /// Versioned, pointer-free description of a process-tree checkpoint. Large
 /// byte ranges live in encrypted content-addressed chunks referenced here.
 public struct DurableCheckpointImage: Codable, Hashable, Sendable {
-    public static let currentFormatVersion = 3
+    public static let currentFormatVersion = 4
 
     public let formatVersion: Int
     public let checkpointID: CheckpointID
@@ -152,6 +152,8 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
     public let origin: DurableThreadOrigin?
     public let dispatchQueueAddress: UInt64?
     public let stackPointer: UInt64?
+    public let stackRegionAddress: UInt64?
+    public let stackRegionLength: UInt64?
     public let pthreadRegionAddress: UInt64?
     public let pthreadRegionLength: UInt64?
     public let generalStateFlavor: UInt32
@@ -166,6 +168,8 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
         origin: DurableThreadOrigin? = nil,
         dispatchQueueAddress: UInt64? = nil,
         stackPointer: UInt64? = nil,
+        stackRegionAddress: UInt64? = nil,
+        stackRegionLength: UInt64? = nil,
         pthreadRegionAddress: UInt64? = nil,
         pthreadRegionLength: UInt64? = nil,
         generalStateFlavor: UInt32,
@@ -179,6 +183,8 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
         self.origin = origin
         self.dispatchQueueAddress = dispatchQueueAddress
         self.stackPointer = stackPointer
+        self.stackRegionAddress = stackRegionAddress
+        self.stackRegionLength = stackRegionLength
         self.pthreadRegionAddress = pthreadRegionAddress
         self.pthreadRegionLength = pthreadRegionLength
         self.generalStateFlavor = generalStateFlavor
