@@ -263,14 +263,25 @@ public actor ColdProcessRestorer {
             Self.withCStringArray(environment) { environmentEntries in
                 launch.executablePath.withCString { executable in
                     launch.workingDirectory.withCString { directory in
-                        continuum_spawn_process_suspended_with_inherited_descriptor(
-                            executable,
-                            arguments,
-                            environmentEntries,
-                            directory,
-                            descriptor,
-                            &replacementProcessIdentifier
-                        )
+                        if usesDeterministicAddressSpace {
+                            continuum_spawn_process_suspended_with_inherited_descriptor(
+                                executable,
+                                arguments,
+                                environmentEntries,
+                                directory,
+                                descriptor,
+                                &replacementProcessIdentifier
+                            )
+                        } else {
+                            continuum_spawn_process_suspended_with_inherited_descriptor_system_aslr(
+                                executable,
+                                arguments,
+                                environmentEntries,
+                                directory,
+                                descriptor,
+                                &replacementProcessIdentifier
+                            )
+                        }
                     }
                 }
             }

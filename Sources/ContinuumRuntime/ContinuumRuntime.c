@@ -54,6 +54,7 @@ static continuum_status continuum_spawn_process_suspended_internal(
     const char *const environment[],
     const char *working_directory,
     int32_t inherited_descriptor,
+    int disable_aslr,
     int32_t *out_process_id
 ) {
     if (executable_path == NULL || executable_path[0] == '\0'
@@ -88,8 +89,10 @@ static continuum_status continuum_spawn_process_suspended_internal(
     }
 
     short flags = POSIX_SPAWN_START_SUSPENDED
-        | POSIX_SPAWN_CLOEXEC_DEFAULT
-        | CONTINUUM_POSIX_SPAWN_DISABLE_ASLR;
+        | POSIX_SPAWN_CLOEXEC_DEFAULT;
+    if (disable_aslr) {
+        flags |= CONTINUUM_POSIX_SPAWN_DISABLE_ASLR;
+    }
     result = posix_spawnattr_setflags(&attributes, flags);
     if (result == 0) {
         result = posix_spawnattr_disable_ptr_auth_a_keys_np(&attributes, 0);
@@ -128,6 +131,7 @@ continuum_status continuum_spawn_process_suspended(
         environment,
         working_directory,
         -1,
+        1,
         out_process_id
     );
 }
@@ -150,6 +154,31 @@ continuum_status continuum_spawn_process_suspended_with_inherited_descriptor(
         environment,
         working_directory,
         inherited_descriptor,
+        1,
+        out_process_id
+    );
+}
+
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_system_aslr(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    int32_t *out_process_id
+) {
+    if (inherited_descriptor < 0
+        || fcntl(inherited_descriptor, F_GETFD) < 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_spawn_process_suspended_internal(
+        executable_path,
+        arguments,
+        environment,
+        working_directory,
+        inherited_descriptor,
+        0,
         out_process_id
     );
 }

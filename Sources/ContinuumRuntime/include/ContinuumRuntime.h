@@ -95,6 +95,18 @@ continuum_status continuum_spawn_process_suspended_with_inherited_descriptor(
     int32_t *out_process_id
 );
 
+/// Preserves normal macOS ASLR for a replacement captured from an app that
+/// was not launched under Continuum's deterministic address-space policy.
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_system_aslr(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    int32_t *out_process_id
+);
+
 /// Loads ContinuumBootstrap locally and resolves its exact exported copy
 /// symbol to a Mach-O UUID and image-relative offset.
 continuum_status continuum_inspect_local_bootstrap_library(
