@@ -21,6 +21,30 @@ public struct LocalFileCheckpointPayload: Hashable, Sendable {
     public let data: Data
 }
 
+/// Saved bytes plus the vnode identity they are allowed to replace. Writing
+/// through the existing vnode preserves descriptors held by a stopped process.
+public struct LocalFileReplacement: Hashable, Sendable {
+    public let originalPath: String
+    public let device: UInt64
+    public let inode: UInt64
+    public let mode: UInt32
+    public let data: Data
+
+    public init(
+        originalPath: String,
+        device: UInt64,
+        inode: UInt64,
+        mode: UInt32,
+        data: Data
+    ) {
+        self.originalPath = originalPath
+        self.device = device
+        self.inode = inode
+        self.mode = mode
+        self.data = data
+    }
+}
+
 public struct LocalFileRestoreReport: Equatable, Sendable {
     public let restoredFileCount: Int
     public let restoredBytes: Int64
@@ -244,6 +268,41 @@ public actor APFSLocalFileCheckpointStore {
         )
     }
 
+    /// Replaces bytes in already-existing regular files without replacing
+    /// their vnodes. Callers create a safety checkpoint first and restore it if
+    /// any later phase fails.
+    public nonisolated func replaceCoherently(
+        _ replacements: [LocalFileReplacement]
+    ) throws -> LocalFileRestoreReport {
+        var restoredBytes: Int64 = 0
+        var seenPaths: Set<String> = []
+        for replacement in replacements {
+            guard replacement.originalPath.hasPrefix("/"),
+                  seenPaths.insert(replacement.originalPath).inserted,
+                  replacement.data.count <= Int(Int64.max) else {
+                throw LocalFileCheckpointError.unsupportedFile(
+                    replacement.originalPath
+                )
+            }
+            let liveURL = URL(fileURLWithPath: replacement.originalPath)
+            let liveStat = try Self.regularFileStat(at: liveURL)
+            guard UInt64(liveStat.st_dev) == replacement.device,
+                  UInt64(liveStat.st_ino) == replacement.inode,
+                  (UInt32(liveStat.st_mode) & (UInt32(S_IFMT) | 0o7777))
+                    == (replacement.mode & (UInt32(S_IFMT) | 0o7777)) else {
+                throw LocalFileCheckpointError.fileIdentityChanged(
+                    replacement.originalPath
+                )
+            }
+            try Self.restoreBytes(replacement.data, to: liveURL)
+            restoredBytes += Int64(replacement.data.count)
+        }
+        return LocalFileRestoreReport(
+            restoredFileCount: replacements.count,
+            restoredBytes: restoredBytes
+        )
+    }
+
     public func delete(snapshotID: UUID) throws {
         try deleteCoherently(snapshotID: snapshotID)
     }
@@ -310,6 +369,44 @@ public actor APFSLocalFileCheckpointStore {
             offset += Int64(readCount)
         }
 
+        guard Darwin.fsync(destinationFD) == 0 else {
+            throw LocalFileCheckpointError.io(path: destination.path, code: errno)
+        }
+    }
+
+    private static func restoreBytes(
+        _ source: Data,
+        to destination: URL
+    ) throws {
+        let destinationFD = destination.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard destinationFD >= 0 else {
+            throw LocalFileCheckpointError.io(path: destination.path, code: errno)
+        }
+        defer { _ = Darwin.close(destinationFD) }
+
+        guard Darwin.ftruncate(destinationFD, off_t(source.count)) == 0 else {
+            throw LocalFileCheckpointError.io(path: destination.path, code: errno)
+        }
+        var offset = 0
+        while offset < source.count {
+            let written = source.withUnsafeBytes { bytes in
+                Darwin.pwrite(
+                    destinationFD,
+                    bytes.baseAddress?.advanced(by: offset),
+                    source.count - offset,
+                    off_t(offset)
+                )
+            }
+            guard written > 0 else {
+                throw LocalFileCheckpointError.io(
+                    path: destination.path,
+                    code: errno
+                )
+            }
+            offset += written
+        }
         guard Darwin.fsync(destinationFD) == 0 else {
             throw LocalFileCheckpointError.io(path: destination.path, code: errno)
         }

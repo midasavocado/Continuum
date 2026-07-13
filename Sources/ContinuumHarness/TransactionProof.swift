@@ -67,7 +67,11 @@ enum TransactionProof {
             isDirectory: true
         )
         let savedFileBytes = Data("continuum-saved-local-file-state".utf8)
+        let futureFileBytes = Data("continuum-future-local-file-state".utf8)
         try savedFileBytes.write(to: liveFileURL)
+        let originalInode = try fileManager.attributesOfItem(
+            atPath: liveFileURL.path
+        )[.systemFileNumber] as? NSNumber
         let fileCheckpointStore = try APFSLocalFileCheckpointStore(
             rootURL: fileCheckpointRoot
         )
@@ -76,7 +80,7 @@ enum TransactionProof {
             snapshotID: fileCheckpointID,
             files: [liveFileURL]
         )
-        try Data("continuum-future-local-file-state".utf8).write(to: liveFileURL)
+        try futureFileBytes.write(to: liveFileURL)
         let filePayloads = try fileCheckpointStore.payloadsCoherently(
             snapshotID: fileCheckpointID
         )
@@ -85,6 +89,48 @@ enum TransactionProof {
                 && filePayloads[0].entry.originalPath == liveFileURL.path
                 && filePayloads[0].data == savedFileBytes,
             "the coherent APFS clone did not export its captured bytes"
+        )
+
+        let rollbackCheckpointID = UUID()
+        _ = try await fileCheckpointStore.capture(
+            snapshotID: rollbackCheckpointID,
+            files: [liveFileURL]
+        )
+        let savedEntry = filePayloads[0].entry
+        let replacementReport = try fileCheckpointStore.replaceCoherently([
+            LocalFileReplacement(
+                originalPath: savedEntry.originalPath,
+                device: savedEntry.device,
+                inode: savedEntry.inode,
+                mode: savedEntry.mode,
+                data: filePayloads[0].data
+            )
+        ])
+        let inodeAfterReplacement = try fileManager.attributesOfItem(
+            atPath: liveFileURL.path
+        )[.systemFileNumber] as? NSNumber
+        let replacedFileBytes = try Data(contentsOf: liveFileURL)
+        try require(
+            replacementReport.restoredFileCount == 1
+                && replacementReport.restoredBytes == Int64(savedFileBytes.count)
+                && replacedFileBytes == savedFileBytes
+                && inodeAfterReplacement == originalInode,
+            "saved file replacement did not preserve the live vnode"
+        )
+
+        let rollbackReport = try await fileCheckpointStore.restore(
+            snapshotID: rollbackCheckpointID
+        )
+        let inodeAfterRollback = try fileManager.attributesOfItem(
+            atPath: liveFileURL.path
+        )[.systemFileNumber] as? NSNumber
+        let rolledBackFileBytes = try Data(contentsOf: liveFileURL)
+        try require(
+            rollbackReport.restoredFileCount == 1
+                && rollbackReport.restoredBytes == Int64(futureFileBytes.count)
+                && rolledBackFileBytes == futureFileBytes
+                && inodeAfterRollback == originalInode,
+            "file safety rollback did not restore the abandoned current bytes"
         )
         try fileManager.removeItem(at: fileCheckpointRoot)
         try fileManager.removeItem(at: liveFileURL)
@@ -104,6 +150,7 @@ enum TransactionProof {
         print("  abandoned future:      \(commit.abandonedFutureBranchID.uuidString)")
         print("  encrypted store files: \(persistedFiles.count)")
         print("  coherent file bytes:  APFS clone exported after live mutation")
+        print("  file rollback:         saved -> current on one preserved vnode")
     }
 
     private static func verifyIndex(
