@@ -12,11 +12,15 @@ public struct ColdProcessPreparation: Hashable, Sendable {
     public let reconstructedChunkCount: Int
     public let reconstructedBytes: UInt64
     public let deferredMaximumProtectionRegionCount: Int
+    public let reconstructedThreadCount: Int
+    public let reconstructedThreadStateBytes: UInt64
+    public let replacementThreadIdentifier: UInt64
 }
 
 /// Rebuilds a durable process image into a disposable child that remains
-/// stopped before main. Thread and resource restoration intentionally happen
-/// in later phases; this actor never resumes a memory-only replacement.
+/// stopped before main. A certified single-thread image also receives its saved
+/// ARM64 general and vector register state. Resource restoration and execution
+/// resume intentionally remain later phases.
 public actor ColdProcessRestorer {
     private struct PreparedReplacement: @unchecked Sendable {
         let processIdentifier: Int32
@@ -391,6 +395,59 @@ public actor ColdProcessRestorer {
             reconstructedRegionCount = nextRegionCount
         }
 
+        guard process.threads.count == 1, let thread = process.threads.first else {
+            throw ContinuumError.restoreUnavailable(
+                "Cold thread reconstruction currently requires exactly one captured thread."
+            )
+        }
+        let generalState = try await threadStateData(
+            thread.generalState,
+            fallbackName: "threads/\(process.processIdentifier)/\(thread.threadIdentifier)-general.bin",
+            snapshotID: snapshotID,
+            repository: repository
+        )
+        let vectorState = try await threadStateData(
+            thread.vectorState,
+            fallbackName: "threads/\(process.processIdentifier)/\(thread.threadIdentifier)-vector.bin",
+            snapshotID: snapshotID,
+            repository: repository
+        )
+        var threadReport = continuum_remote_thread_reconstruction_report()
+        let threadStatus = generalState.withUnsafeBytes { generalBytes in
+            vectorState.withUnsafeBytes { vectorBytes in
+                continuum_remote_session_reconstruct_single_thread(
+                    session,
+                    thread.generalStateFlavor,
+                    generalBytes.baseAddress,
+                    generalBytes.count,
+                    thread.vectorStateFlavor,
+                    vectorBytes.baseAddress,
+                    vectorBytes.count,
+                    &threadReport
+                )
+            }
+        }
+        try requireRuntimeOK(
+            threadStatus,
+            operation: "reconstruct the captured ARM64 thread state"
+        )
+        guard threadReport.general_state_verified != 0,
+              threadReport.vector_state_verified != 0,
+              threadReport.general_state_bytes == UInt64(generalState.count),
+              threadReport.vector_state_bytes == UInt64(vectorState.count),
+              threadReport.replacement_thread_identifier != 0 else {
+            throw ContinuumError.integrityFailure(
+                "The replacement thread did not match the captured register image."
+            )
+        }
+        let (threadStateBytes, threadByteOverflow) = UInt64(generalState.count)
+            .addingReportingOverflow(UInt64(vectorState.count))
+        guard !threadByteOverflow else {
+            throw ContinuumError.integrityFailure(
+                "The durable thread image exceeds Continuum's numeric limits."
+            )
+        }
+
         let preparationID = UUID()
         preparedReplacements[preparationID] = PreparedReplacement(
             processIdentifier: replacementProcessIdentifier,
@@ -404,7 +461,10 @@ public actor ColdProcessRestorer {
             reconstructedRegionCount: reconstructedRegionCount,
             reconstructedChunkCount: reconstructedChunkCount,
             reconstructedBytes: reconstructedBytes,
-            deferredMaximumProtectionRegionCount: deferredMaximumProtectionRegionCount
+            deferredMaximumProtectionRegionCount: deferredMaximumProtectionRegionCount,
+            reconstructedThreadCount: 1,
+            reconstructedThreadStateBytes: threadStateBytes,
+            replacementThreadIdentifier: threadReport.replacement_thread_identifier
         )
     }
 
@@ -568,6 +628,33 @@ public actor ColdProcessRestorer {
         identity.image_base = imageBase
         identity.copy_address = address
         return identity
+    }
+
+    private func threadStateData(
+        _ reference: DurableChunkReference,
+        fallbackName: String,
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository
+    ) async throws -> Data {
+        guard reference.logicalBytes > 0,
+              reference.logicalBytes <= 4_096 else {
+            throw ContinuumError.integrityFailure(
+                "The durable thread image exceeds Continuum's four-kilobyte state limit."
+            )
+        }
+        let logicalName = reference.artifactName ?? fallbackName
+        let artifact = try await repository.artifact(
+            for: snapshotID,
+            logicalName: logicalName
+        )
+        guard artifact.kind == .threadState,
+              UInt64(artifact.data.count) == reference.logicalBytes,
+              Self.sha256(artifact.data) == reference.hash else {
+            throw ContinuumError.integrityFailure(
+                "Thread state \(logicalName) does not match its manifest."
+            )
+        }
+        return artifact.data
     }
 
     private static func legacyMemoryArtifactName(

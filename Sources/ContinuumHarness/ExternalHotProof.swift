@@ -347,6 +347,11 @@ enum ExternalHotProof {
                 + "\(coldMemory.reconstructedChunkCount) encrypted chunks, "
                 + "\(coldMemory.reconstructedBytes) bytes"
         )
+        print(
+            "  cold thread state:    \(coldMemory.reconstructedThreadCount) thread, "
+                + "\(coldMemory.reconstructedThreadStateBytes) bytes, replacement ID "
+                + "\(coldMemory.replacementThreadIdentifier)"
+        )
         print("  restore cycles:      \(fullProcessCycleCount) process-group + \(cycles) arena-only")
         print(
             "  verified restores:   \((fullProcessCycleCount + cycles) * 2) (target-owned validation)"
@@ -787,6 +792,12 @@ enum ExternalHotProof {
                 && preparation.reconstructedBytes
                     == UInt64(capture.snapshot.logicalBytes),
             "cold restorer did not populate the complete durable memory image"
+        )
+        try require(
+            preparation.reconstructedThreadCount == 1
+                && preparation.reconstructedThreadStateBytes > 0
+                && preparation.replacementThreadIdentifier > 0,
+            "cold restorer did not reconstruct and verify the saved thread state"
         )
         await restorer.discard(preparation.id)
         return preparation

@@ -182,6 +182,14 @@ typedef struct continuum_remote_restore_report {
     uint8_t observed_external_pager;
 } continuum_remote_restore_report;
 
+typedef struct continuum_remote_thread_reconstruction_report {
+    uint64_t replacement_thread_identifier;
+    uint64_t general_state_bytes;
+    uint64_t vector_state_bytes;
+    uint8_t general_state_verified;
+    uint8_t vector_state_verified;
+} continuum_remote_thread_reconstruction_report;
+
 typedef enum continuum_reconstruction_stage {
     CONTINUUM_RECONSTRUCTION_STAGE_NONE = 0,
     CONTINUUM_RECONSTRUCTION_STAGE_DEALLOCATE = 1,
@@ -418,6 +426,21 @@ continuum_status continuum_remote_session_finish_reconstruct_region(
     continuum_remote_session *session,
     const continuum_remote_process_region_info *region,
     continuum_remote_restore_report *out_report
+);
+
+/// Replaces the user-visible ARM64 and NEON state of the sole thread in a
+/// direct-child replacement that remains stopped under Continuum. This is a
+/// reconstruction proof only: it does not resume the process, recreate kernel
+/// wait state, or claim that resource restoration is complete.
+continuum_status continuum_remote_session_reconstruct_single_thread(
+    continuum_remote_session *session,
+    uint32_t general_state_flavor,
+    const void *general_state,
+    size_t general_state_length,
+    uint32_t vector_state_flavor,
+    const void *vector_state,
+    size_t vector_state_length,
+    continuum_remote_thread_reconstruction_report *out_report
 );
 
 /// Captures a read-only kernel-resource fingerprint while an external target

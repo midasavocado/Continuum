@@ -4142,25 +4142,16 @@ continuum_status continuum_remote_session_inspect_process_layout(
     return status;
 }
 
-static continuum_status continuum_validate_reconstruction_target(
-    continuum_remote_session *session,
-    const continuum_remote_process_region_info *region
+static continuum_status continuum_validate_stopped_replacement_session(
+    continuum_remote_session *session
 ) {
-    if (session == NULL || region == NULL
-        || session->task == MACH_PORT_NULL || session->is_self
-        || region->address == 0 || region->length == 0
-        || (region->address % (uint64_t)getpagesize()) != 0
-        || (region->length % (uint64_t)getpagesize()) != 0
-        || (region->protection & (VM_PROT_READ | VM_PROT_WRITE))
-            != (VM_PROT_READ | VM_PROT_WRITE)
-        || !continuum_is_private_or_cow_share_mode(region->share_mode)) {
+    if (session == NULL || session->task == MACH_PORT_NULL || session->is_self) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
     }
     continuum_status status = continuum_validate_session_identity(session);
     if (status != CONTINUUM_STATUS_OK) {
         return status;
     }
-
     struct proc_bsdinfo process_info;
     memset(&process_info, 0, sizeof(process_info));
     int copied = proc_pidinfo(
@@ -4176,6 +4167,21 @@ static continuum_status continuum_validate_reconstruction_target(
         return CONTINUUM_STATUS_ACCESS_DENIED;
     }
     return CONTINUUM_STATUS_OK;
+}
+
+static continuum_status continuum_validate_reconstruction_target(
+    continuum_remote_session *session,
+    const continuum_remote_process_region_info *region
+) {
+    if (region == NULL || region->address == 0 || region->length == 0
+        || (region->address % (uint64_t)getpagesize()) != 0
+        || (region->length % (uint64_t)getpagesize()) != 0
+        || (region->protection & (VM_PROT_READ | VM_PROT_WRITE))
+            != (VM_PROT_READ | VM_PROT_WRITE)
+        || !continuum_is_private_or_cow_share_mode(region->share_mode)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_validate_stopped_replacement_session(session);
 }
 
 static continuum_status continuum_prepare_reconstruction_range(
@@ -4760,6 +4766,219 @@ continuum_status continuum_remote_session_finish_reconstruct_region(
     session->reconstruction_length = 0;
     session->has_active_reconstruction = 0;
     return status;
+}
+
+#if defined(__arm64__)
+static int continuum_arm64_general_states_equal(
+    const arm_thread_state64_t *saved,
+    const arm_thread_state64_t *observed
+) {
+    if (saved == NULL || observed == NULL
+        || memcmp(saved->__x, observed->__x, sizeof(saved->__x)) != 0
+        || saved->__cpsr != observed->__cpsr) {
+        return 0;
+    }
+    return arm_thread_state64_get_pc(*saved)
+            == arm_thread_state64_get_pc(*observed)
+        && arm_thread_state64_get_lr(*saved)
+            == arm_thread_state64_get_lr(*observed)
+        && arm_thread_state64_get_sp(*saved)
+            == arm_thread_state64_get_sp(*observed)
+        && arm_thread_state64_get_fp(*saved)
+            == arm_thread_state64_get_fp(*observed);
+}
+#endif
+
+continuum_status continuum_remote_session_reconstruct_single_thread(
+    continuum_remote_session *session,
+    uint32_t general_state_flavor,
+    const void *general_state,
+    size_t general_state_length,
+    uint32_t vector_state_flavor,
+    const void *vector_state,
+    size_t vector_state_length,
+    continuum_remote_thread_reconstruction_report *out_report
+) {
+    if (out_report == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_report, 0, sizeof(*out_report));
+#if !defined(__arm64__)
+    (void)session;
+    (void)general_state_flavor;
+    (void)general_state;
+    (void)general_state_length;
+    (void)vector_state_flavor;
+    (void)vector_state;
+    (void)vector_state_length;
+    return CONTINUUM_STATUS_UNSUPPORTED_ARCHITECTURE;
+#else
+    if (general_state == NULL || vector_state == NULL
+        || general_state_flavor != ARM_THREAD_STATE64
+        || vector_state_flavor != ARM_NEON_STATE64
+        || general_state_length != sizeof(arm_thread_state64_t)
+        || vector_state_length != sizeof(arm_neon_state64_t)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    continuum_status status = continuum_validate_stopped_replacement_session(
+        session
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+    if (session->has_active_reconstruction) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+
+    arm_thread_state64_t saved_general;
+    arm_neon_state64_t saved_vector;
+    memcpy(&saved_general, general_state, sizeof(saved_general));
+    memcpy(&saved_vector, vector_state, sizeof(saved_vector));
+
+    uintptr_t program_counter = arm_thread_state64_get_pc(saved_general);
+    uintptr_t stack_pointer = arm_thread_state64_get_sp(saved_general);
+    if (program_counter == 0 || (program_counter & UINT64_C(3)) != 0
+        || stack_pointer < 16 || (stack_pointer & UINT64_C(15)) != 0) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    mach_vm_size_t span = 0;
+    kern_return_t mach_result = KERN_SUCCESS;
+    status = continuum_reconstruction_leaf_span(
+        session->task,
+        program_counter,
+        sizeof(uint32_t),
+        VM_PROT_READ | VM_PROT_EXECUTE,
+        &span,
+        &mach_result
+    );
+    if (status != CONTINUUM_STATUS_OK || span != sizeof(uint32_t)) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+    status = continuum_reconstruction_leaf_span(
+        session->task,
+        stack_pointer - 16,
+        16,
+        VM_PROT_READ | VM_PROT_WRITE,
+        &span,
+        &mach_result
+    );
+    if (status != CONTINUUM_STATUS_OK || span != 16) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t thread_count = 0;
+    mach_result = task_threads(session->task, &threads, &thread_count);
+    if (mach_result != KERN_SUCCESS) {
+        return CONTINUUM_STATUS_THREAD_STATE_FAILED;
+    }
+
+    int did_suspend = 0;
+    if (thread_count != 1) {
+        status = CONTINUUM_STATUS_THREAD_SET_CHANGED;
+    } else {
+        thread_identifier_info_data_t identifier_info;
+        memset(&identifier_info, 0, sizeof(identifier_info));
+        mach_msg_type_number_t identifier_count = THREAD_IDENTIFIER_INFO_COUNT;
+        mach_result = thread_info(
+            threads[0],
+            THREAD_IDENTIFIER_INFO,
+            (thread_info_t)&identifier_info,
+            &identifier_count
+        );
+        if (mach_result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
+        } else {
+            out_report->replacement_thread_identifier = identifier_info.thread_id;
+            status = continuum_suspend_session(session, &did_suspend);
+        }
+    }
+
+    if (status == CONTINUUM_STATUS_OK) {
+        mach_result = thread_set_state(
+            threads[0],
+            ARM_NEON_STATE64,
+            (thread_state_t)&saved_vector,
+            ARM_NEON_STATE64_COUNT
+        );
+        if (mach_result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_THREAD_RESTORE_FAILED;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        mach_result = thread_set_state(
+            threads[0],
+            ARM_THREAD_STATE64,
+            (thread_state_t)&saved_general,
+            ARM_THREAD_STATE64_COUNT
+        );
+        if (mach_result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_THREAD_RESTORE_FAILED;
+        }
+    }
+
+    arm_neon_state64_t observed_vector;
+    arm_thread_state64_t observed_general;
+    memset(&observed_vector, 0, sizeof(observed_vector));
+    memset(&observed_general, 0, sizeof(observed_general));
+    if (status == CONTINUUM_STATUS_OK) {
+        mach_msg_type_number_t vector_count = ARM_NEON_STATE64_COUNT;
+        mach_result = thread_get_state(
+            threads[0],
+            ARM_NEON_STATE64,
+            (thread_state_t)&observed_vector,
+            &vector_count
+        );
+        if (mach_result != KERN_SUCCESS
+            || vector_count != ARM_NEON_STATE64_COUNT
+            || memcmp(&saved_vector, &observed_vector, sizeof(saved_vector)) != 0) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        } else {
+            out_report->vector_state_bytes = sizeof(saved_vector);
+            out_report->vector_state_verified = 1;
+        }
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        mach_msg_type_number_t general_count = ARM_THREAD_STATE64_COUNT;
+        mach_result = thread_get_state(
+            threads[0],
+            ARM_THREAD_STATE64,
+            (thread_state_t)&observed_general,
+            &general_count
+        );
+        if (mach_result != KERN_SUCCESS
+            || general_count != ARM_THREAD_STATE64_COUNT
+            || !continuum_arm64_general_states_equal(
+                &saved_general,
+                &observed_general
+            )) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        } else {
+            out_report->general_state_bytes = sizeof(saved_general);
+            out_report->general_state_verified = 1;
+        }
+    }
+
+    continuum_status resume_status = continuum_resume_session(session, did_suspend);
+    if (resume_status != CONTINUUM_STATUS_OK) {
+        status = resume_status;
+    }
+    for (mach_msg_type_number_t index = 0; index < thread_count; index += 1) {
+        mach_port_deallocate(mach_task_self(), threads[index]);
+    }
+    if (threads != NULL) {
+        vm_deallocate(
+            mach_task_self(),
+            (vm_address_t)threads,
+            (vm_size_t)(thread_count * sizeof(thread_act_t))
+        );
+    }
+    return status;
+#endif
 }
 
 continuum_status continuum_remote_session_reconstruct_region(
