@@ -37,7 +37,8 @@ typedef enum continuum_status {
     CONTINUUM_STATUS_MACH_NAMESPACE_CHANGED = 25,
     CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR = 26,
     CONTINUUM_STATUS_PROCESS_TREE_CHANGED = 27,
-    CONTINUUM_STATUS_SPAWN_FAILED = 28
+    CONTINUUM_STATUS_SPAWN_FAILED = 28,
+    CONTINUUM_STATUS_FILE_WRITER_CONFLICT = 29
 } continuum_status;
 
 typedef struct continuum_runtime_info {
@@ -625,6 +626,15 @@ continuum_status continuum_remote_process_group_copy_member_working_directory(
     void *destination,
     size_t destination_capacity,
     size_t *out_required_length
+);
+
+/// Returns FILE_WRITER_CONFLICT when another visible process has the exact
+/// regular vnode at `path` open for writing. `allowed_process_id` may identify
+/// Continuum's stopped replacement. Access-denied inspection fails closed.
+continuum_status continuum_find_writable_vnode_conflict(
+    const char *path,
+    int32_t allowed_process_id,
+    int32_t *out_conflicting_process_id
 );
 
 /// Copies every regular vnode opened for writing by any captured group member.

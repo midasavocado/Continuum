@@ -1,7 +1,9 @@
 import ContinuumCore
+import ContinuumRuntime
 import ContinuumStore
 import ContinuumSystem
 import CryptoKit
+import Darwin
 import Foundation
 
 enum TransactionProof {
@@ -135,6 +137,11 @@ enum TransactionProof {
             "file safety rollback did not restore the abandoned current bytes"
         )
 
+        try await verifyWriterConflictGate(
+            liveFileURL: liveFileURL,
+            rootURL: rootURL
+        )
+
         let coldTransactionRoot = rootURL.appendingPathComponent(
             "cold-file-transactions",
             isDirectory: true
@@ -221,6 +228,8 @@ enum TransactionProof {
         print("  encrypted store files: \(persistedFiles.count)")
         print("  coherent file bytes:  APFS clone exported after live mutation")
         print("  file rollback:         saved -> current on one preserved vnode")
+        print("  crash recovery:        durable journal restored + retired")
+        print("  writer conflict:       external writable vnode rejected by PID")
     }
 
     private static func verifyIndex(
@@ -256,6 +265,69 @@ enum TransactionProof {
         try require(activeBranch.tipSnapshotID == commit.targetSnapshotID, "active branch has the wrong tip")
         try require(activeBranch.isActive, "new branch was not activated")
         try require(index.branches.filter(\.isActive).count == 1, "store has more than one active branch")
+    }
+
+    private static func verifyWriterConflictGate(
+        liveFileURL: URL,
+        rootURL: URL
+    ) async throws {
+        let readyURL = rootURL.appendingPathComponent("writer-ready")
+        let writer = Process()
+        writer.executableURL = URL(fileURLWithPath: "/bin/sh")
+        writer.arguments = [
+            "-c",
+            "exec 9>>\"$1\"; : > \"$2\"; exec sleep 30",
+            "continuum-writer-proof",
+            liveFileURL.path,
+            readyURL.path
+        ]
+        try writer.run()
+        defer {
+            if writer.isRunning {
+                writer.terminate()
+                writer.waitUntilExit()
+            }
+            try? FileManager.default.removeItem(at: readyURL)
+        }
+
+        for _ in 0..<200 {
+            if FileManager.default.fileExists(atPath: readyURL.path) {
+                break
+            }
+            usleep(10_000)
+        }
+        try require(
+            FileManager.default.fileExists(atPath: readyURL.path),
+            "writer-conflict proof process did not become ready"
+        )
+        var conflictingProcessIdentifier: Int32 = 0
+        let conflictStatus = liveFileURL.path.withCString {
+            continuum_find_writable_vnode_conflict(
+                $0,
+                0,
+                &conflictingProcessIdentifier
+            )
+        }
+        try require(
+            conflictStatus == CONTINUUM_STATUS_FILE_WRITER_CONFLICT
+                && conflictingProcessIdentifier == writer.processIdentifier,
+            "writer-conflict gate did not identify the external vnode writer"
+        )
+
+        writer.terminate()
+        writer.waitUntilExit()
+        var staleConflict: Int32 = 0
+        let clearStatus = liveFileURL.path.withCString {
+            continuum_find_writable_vnode_conflict(
+                $0,
+                0,
+                &staleConflict
+            )
+        }
+        try require(
+            clearStatus == CONTINUUM_STATUS_OK && staleConflict == 0,
+            "writer-conflict gate remained blocked after the writer exited"
+        )
     }
 
     private static func regularFiles(

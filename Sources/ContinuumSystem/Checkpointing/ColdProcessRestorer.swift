@@ -39,6 +39,7 @@ public actor ColdProcessRestorer {
         let rootURL: URL
         let replacedFileCount: Int
         let replacedBytes: UInt64
+        let installedFiles: [LocalFileReplacement]
     }
 
     private struct ColdFileTransactionJournal: Codable, Sendable {
@@ -600,6 +601,21 @@ public actor ColdProcessRestorer {
                 )
             }
             for entry in journal.entries {
+                var conflictingProcessIdentifier: Int32 = 0
+                let writerStatus = entry.originalPath.withCString {
+                    continuum_find_writable_vnode_conflict(
+                        $0,
+                        0,
+                        &conflictingProcessIdentifier
+                    )
+                }
+                guard writerStatus == CONTINUUM_STATUS_OK else {
+                    throw ContinuumError.restoreUnavailable(
+                        writerStatus == CONTINUUM_STATUS_FILE_WRITER_CONFLICT
+                            ? "Process \(conflictingProcessIdentifier) is writing an interrupted transaction target. Continuum preserved its safety root."
+                            : "Continuum could not prove exclusive ownership while recovering an interrupted file transaction."
+                    )
+                }
                 guard try Self.fileIdentity(
                     atPath: entry.originalPath
                 ) == (entry.device, entry.inode),
@@ -889,6 +905,10 @@ public actor ColdProcessRestorer {
         let safetySnapshotID = UUID()
         var safetyCaptured = false
         do {
+            try ensureNoExternalWriters(
+                replacements,
+                allowedProcessIdentifier: replacementProcessIdentifier
+            )
             _ = try await store.capture(
                 snapshotID: safetySnapshotID,
                 files: replacements.map {
@@ -915,6 +935,10 @@ public actor ColdProcessRestorer {
                 journal,
                 rootURL: rootURL
             )
+            try ensureNoExternalWriters(
+                replacements,
+                allowedProcessIdentifier: replacementProcessIdentifier
+            )
             let report = try store.replaceCoherently(replacements)
             var byteCount: UInt64 = 0
             for replacement in replacements {
@@ -940,7 +964,8 @@ public actor ColdProcessRestorer {
                 snapshotID: safetySnapshotID,
                 rootURL: rootURL,
                 replacedFileCount: replacements.count,
-                replacedBytes: byteCount
+                replacedBytes: byteCount,
+                installedFiles: replacements
             )
         } catch {
             if safetyCaptured {
@@ -968,6 +993,20 @@ public actor ColdProcessRestorer {
         _ rollback: PreparedFileRollback?
     ) throws {
         guard let rollback else { return }
+        try ensureNoExternalWriters(
+            rollback.installedFiles,
+            allowedProcessIdentifier: 0
+        )
+        for file in rollback.installedFiles {
+            guard try fileIdentity(atPath: file.originalPath)
+                    == (file.device, file.inode),
+                  try sha256File(atPath: file.originalPath)
+                    == sha256(file.data) else {
+                throw ContinuumError.integrityFailure(
+                    "A cold-restore file changed after preparation. Continuum preserved the safety root instead of overwriting newer bytes."
+                )
+            }
+        }
         _ = try rollback.store.restoreCoherently(
             snapshotID: rollback.snapshotID
         )
@@ -1102,6 +1141,41 @@ public actor ColdProcessRestorer {
             throw ContinuumError.integrityFailure(
                 "A durable cold-file transaction journal could not be decoded."
             )
+        }
+    }
+
+    private static func ensureNoExternalWriters(
+        _ files: [LocalFileReplacement],
+        allowedProcessIdentifier: Int32
+    ) throws {
+        for file in files {
+            var conflictingProcessIdentifier: Int32 = 0
+            let status = file.originalPath.withCString {
+                continuum_find_writable_vnode_conflict(
+                    $0,
+                    allowedProcessIdentifier,
+                    &conflictingProcessIdentifier
+                )
+            }
+            switch status {
+            case CONTINUUM_STATUS_OK:
+                continue
+            case CONTINUUM_STATUS_FILE_WRITER_CONFLICT:
+                throw ContinuumError.restoreUnavailable(
+                    "Process \(conflictingProcessIdentifier) is writing \(file.originalPath). Continuum will not start a file transaction while another writer owns the vnode."
+                )
+            case CONTINUUM_STATUS_ACCESS_DENIED:
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not prove exclusive write ownership for \(file.originalPath)."
+                )
+            default:
+                let description = String(
+                    cString: continuum_status_string(status)
+                )
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not validate file writers for \(file.originalPath): \(description)."
+                )
+            }
         }
     }
 

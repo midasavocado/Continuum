@@ -5998,6 +5998,140 @@ continuum_status continuum_remote_process_group_copy_member_working_directory(
     memcpy(destination, paths.pvi_cdir.vip_path, length);
     return CONTINUUM_STATUS_OK;
 }
+continuum_status continuum_find_writable_vnode_conflict(
+    const char *path,
+    int32_t allowed_process_id,
+    int32_t *out_conflicting_process_id
+) {
+    if (path == NULL || path[0] != '/' || allowed_process_id < 0
+        || out_conflicting_process_id == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_conflicting_process_id = 0;
+    struct stat target;
+    memset(&target, 0, sizeof(target));
+    if (lstat(path, &target) != 0 || (target.st_mode & S_IFMT) != S_IFREG) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    int required_bytes = proc_listpidspath(
+        PROC_ALL_PIDS,
+        0,
+        path,
+        PROC_LISTPIDSPATH_EXCLUDE_EVTONLY,
+        NULL,
+        0
+    );
+    if (required_bytes < 0) {
+        return errno == EPERM
+            ? CONTINUUM_STATUS_ACCESS_DENIED
+            : CONTINUUM_STATUS_MACH_ERROR;
+    }
+    size_t capacity = (size_t)required_bytes + 128U * sizeof(pid_t);
+    if (capacity < sizeof(pid_t) || capacity > INT_MAX) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    pid_t *process_ids = calloc(1, capacity);
+    if (process_ids == NULL) {
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+    int returned_bytes = proc_listpidspath(
+        PROC_ALL_PIDS,
+        0,
+        path,
+        PROC_LISTPIDSPATH_EXCLUDE_EVTONLY,
+        process_ids,
+        (int)capacity
+    );
+    if (returned_bytes < 0
+        || returned_bytes % (int)sizeof(pid_t) != 0
+        || (size_t)returned_bytes > capacity) {
+        free(process_ids);
+        return errno == EPERM
+            ? CONTINUUM_STATUS_ACCESS_DENIED
+            : CONTINUUM_STATUS_MACH_ERROR;
+    }
+
+    size_t process_count = (size_t)returned_bytes / sizeof(pid_t);
+    for (size_t process_index = 0;
+         process_index < process_count;
+         process_index += 1) {
+        pid_t process_id = process_ids[process_index];
+        if (process_id <= 0 || process_id == getpid()
+            || process_id == allowed_process_id) {
+            continue;
+        }
+        int descriptor_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            NULL,
+            0
+        );
+        if (descriptor_bytes <= 0) {
+            if (kill(process_id, 0) == 0 || errno == EPERM) {
+                free(process_ids);
+                return CONTINUUM_STATUS_ACCESS_DENIED;
+            }
+            continue;
+        }
+        size_t descriptor_capacity = (size_t)descriptor_bytes
+            + 16U * sizeof(struct proc_fdinfo);
+        if (descriptor_capacity > INT_MAX) {
+            free(process_ids);
+            return CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        struct proc_fdinfo *descriptors = calloc(1, descriptor_capacity);
+        if (descriptors == NULL) {
+            free(process_ids);
+            return CONTINUUM_STATUS_OUT_OF_MEMORY;
+        }
+        int copied = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            descriptors,
+            (int)descriptor_capacity
+        );
+        if (copied < 0 || copied % (int)sizeof(*descriptors) != 0) {
+            free(descriptors);
+            free(process_ids);
+            return CONTINUUM_STATUS_ACCESS_DENIED;
+        }
+        size_t descriptor_count = (size_t)copied / sizeof(*descriptors);
+        for (size_t descriptor_index = 0;
+             descriptor_index < descriptor_count;
+             descriptor_index += 1) {
+            if (descriptors[descriptor_index].proc_fdtype != PROX_FDTYPE_VNODE) {
+                continue;
+            }
+            struct vnode_fdinfowithpath info;
+            memset(&info, 0, sizeof(info));
+            int bytes = proc_pidfdinfo(
+                process_id,
+                descriptors[descriptor_index].proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                &info,
+                sizeof(info)
+            );
+            if (bytes != (int)sizeof(info)) {
+                continue;
+            }
+            uint32_t flags = (uint32_t)info.pfi.fi_openflags;
+            if (info.pvip.vip_vi.vi_stat.vst_dev == target.st_dev
+                && info.pvip.vip_vi.vi_stat.vst_ino == target.st_ino
+                && (flags & O_ACCMODE) != O_RDONLY) {
+                *out_conflicting_process_id = process_id;
+                free(descriptors);
+                free(process_ids);
+                return CONTINUUM_STATUS_FILE_WRITER_CONFLICT;
+            }
+        }
+        free(descriptors);
+    }
+    free(process_ids);
+    return CONTINUUM_STATUS_OK;
+}
 
 continuum_status continuum_remote_process_group_copy_writable_vnodes(
     const continuum_remote_process_group_snapshot *snapshot,
@@ -6809,6 +6943,8 @@ const char *continuum_status_string(continuum_status status) {
             return "target process tree changed";
         case CONTINUUM_STATUS_SPAWN_FAILED:
             return "replacement process spawn failed";
+        case CONTINUUM_STATUS_FILE_WRITER_CONFLICT:
+            return "another process is writing the target file";
     }
     return "unknown status";
 }
