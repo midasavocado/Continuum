@@ -3594,8 +3594,11 @@ static continuum_status continuum_capture_process_snapshot_suspended(
                         address,
                         region_size
                     )));
-        const int eligible = eligible_memory
-            && (!snapshot->has_isolated_app_state || app_owned_state);
+        // A durable process image must retain writable globals, stacks, runtime
+        // bookkeeping, and allocations outside Continuum's optimization zone.
+        // The isolated zone remains useful for dirty-page attribution, but it
+        // must never narrow the truth of a cold checkpoint.
+        const int eligible = eligible_memory;
         if (eligible) {
             continuum_hash_vm_region(
                 &snapshot->info.vm_layout_hash,
