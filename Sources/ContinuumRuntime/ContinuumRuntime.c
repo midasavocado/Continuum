@@ -3532,7 +3532,7 @@ static continuum_status continuum_capture_process_snapshot_suspended(
     status = continuum_collect_named_malloc_zone_ranges(
         session->task,
         "ContinuumAppState",
-        MALLOC_PTR_IN_USE_RANGE_TYPE,
+        MALLOC_PTR_IN_USE_RANGE_TYPE | MALLOC_ADMIN_REGION_RANGE_TYPE,
         &app_state_ranges
     );
     if (status != CONTINUUM_STATUS_OK) {
