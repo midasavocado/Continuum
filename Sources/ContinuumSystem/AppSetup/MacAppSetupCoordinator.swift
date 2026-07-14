@@ -6,15 +6,20 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
     private let fileSystem: any AppSetupFileSystem
     private let probeService: any AppSetupProbing
     private let signer: any ManagedBundleSigning
+    private let bootstrapLibraryURL: URL?
     private let now: @Sendable () -> Date
 
-    public init(rootDirectory: URL? = nil) {
+    public init(
+        rootDirectory: URL? = nil,
+        bootstrapLibraryURL: URL? = nil
+    ) {
         self.rootProvider = FixedAppSetupRoot(
             rootDirectory: rootDirectory ?? Self.defaultRootDirectory()
         )
         self.fileSystem = LocalAppSetupFileSystem()
         self.probeService = MacAppSetupProbe()
         self.signer = MacManagedBundleSigner()
+        self.bootstrapLibraryURL = bootstrapLibraryURL
         self.now = { Date() }
     }
 
@@ -23,12 +28,14 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         fileSystem: any AppSetupFileSystem,
         probeService: any AppSetupProbing,
         signer: any ManagedBundleSigning,
+        bootstrapLibraryURL: URL? = nil,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.rootProvider = rootProvider
         self.fileSystem = fileSystem
         self.probeService = probeService
         self.signer = signer
+        self.bootstrapLibraryURL = bootstrapLibraryURL
         self.now = now
     }
 
@@ -119,6 +126,12 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
             }
 
             try transition(&record, to: .preparing(.instrumenting))
+            if let bootstrapLibraryURL {
+                try embedBootstrap(
+                    from: bootstrapLibraryURL,
+                    in: managedURL
+                )
+            }
             try writeMarker(for: record, to: markerURL(in: managedURL))
 
             try transition(&record, to: .preparing(.signing))
@@ -315,11 +328,13 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         let originalVerified = original.fingerprint == expectedSource
         let signatureValid = managed.isSigned && managed.isAdHocSigned && managed.signatureValid
         let attachEntitlementValid = managed.hasAttachEntitlement
+        let bootstrapValid = try validateManagedBootstrap(in: managedURL)
         let prepared = sourceUnchanged
             && originalVerified
             && markerIsValid
             && signatureValid
             && attachEntitlementValid
+            && bootstrapValid
 
         let detail: String
         if prepared {
@@ -331,6 +346,7 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
             if !markerIsValid { failures.append("managed instrumentation marker is missing or invalid") }
             if !signatureValid { failures.append("managed ad-hoc signature is invalid") }
             if !attachEntitlementValid { failures.append("get-task-allow is missing") }
+            if !bootstrapValid { failures.append("checkpoint runtime or its launch configuration is missing") }
             detail = failures.joined(separator: "; ")
         }
 
@@ -403,13 +419,97 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
     }
 
     private func writeAttachEntitlements(to url: URL) throws {
-        let entitlements = ["com.apple.security.get-task-allow": true]
+        let entitlements = [
+            "com.apple.security.get-task-allow": true,
+            "com.apple.security.cs.allow-dyld-environment-variables": true,
+            "com.apple.security.cs.disable-library-validation": true
+        ]
         let data = try PropertyListSerialization.data(
             fromPropertyList: entitlements,
             format: .xml,
             options: 0
         )
         try fileSystem.writeDataAtomically(data, to: url)
+    }
+
+    private func embedBootstrap(
+        from sourceURL: URL,
+        in managedBundleURL: URL
+    ) throws {
+        guard fileSystem.itemExists(at: sourceURL) else {
+            throw AppSetupError.validationFailed(
+                "Continuum's packaged checkpoint runtime is missing. Reinstall Continuum and try again."
+            )
+        }
+        let embeddedURL = bootstrapURL(in: managedBundleURL)
+        try fileSystem.createDirectory(at: embeddedURL.deletingLastPathComponent())
+        _ = try fileSystem.cloneOrCopyItem(at: sourceURL, to: embeddedURL)
+
+        let infoURL = managedBundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Info.plist", isDirectory: false)
+        let plistData = try fileSystem.readData(at: infoURL)
+        guard var plist = try PropertyListSerialization.propertyList(
+            from: plistData,
+            options: [],
+            format: nil
+        ) as? [String: Any] else {
+            throw AppSetupError.validationFailed(
+                "The managed app's Info.plist could not be updated."
+            )
+        }
+        var environment = plist["LSEnvironment"] as? [String: String] ?? [:]
+        environment["CONTINUUM_PRESERVE_ON_QUIT"] = "1"
+        var insertedLibraries = environment["DYLD_INSERT_LIBRARIES"]?
+            .split(separator: ":")
+            .map(String.init) ?? []
+        insertedLibraries.removeAll { $0 == Self.embeddedBootstrapToken }
+        insertedLibraries.append(Self.embeddedBootstrapToken)
+        environment["DYLD_INSERT_LIBRARIES"] = insertedLibraries.joined(separator: ":")
+        plist["LSEnvironment"] = environment
+        let updatedData = try PropertyListSerialization.data(
+            fromPropertyList: plist,
+            format: .binary,
+            options: 0
+        )
+        try fileSystem.writeDataAtomically(updatedData, to: infoURL)
+    }
+
+    private func validateManagedBootstrap(in managedBundleURL: URL) throws -> Bool {
+        guard let bootstrapLibraryURL else { return true }
+        let embeddedURL = bootstrapURL(in: managedBundleURL)
+        guard fileSystem.itemExists(at: bootstrapLibraryURL),
+              fileSystem.itemExists(at: embeddedURL),
+              try fileSystem.readData(at: bootstrapLibraryURL)
+                == fileSystem.readData(at: embeddedURL) else {
+            return false
+        }
+
+        let infoURL = managedBundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Info.plist", isDirectory: false)
+        guard let plist = try PropertyListSerialization.propertyList(
+            from: fileSystem.readData(at: infoURL),
+            options: [],
+            format: nil
+        ) as? [String: Any],
+              let environment = plist["LSEnvironment"] as? [String: String],
+              environment["CONTINUUM_PRESERVE_ON_QUIT"] == "1" else {
+            return false
+        }
+        let insertedLibraries = environment["DYLD_INSERT_LIBRARIES"]?
+            .split(separator: ":")
+            .map(String.init) ?? []
+        return insertedLibraries.filter {
+            $0 == Self.embeddedBootstrapToken
+        }.count == 1
+    }
+
+    private func bootstrapURL(in managedBundleURL: URL) -> URL {
+        managedBundleURL
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Frameworks", isDirectory: true)
+            .appendingPathComponent("libContinuumBootstrap.dylib", isDirectory: false)
     }
 
     private func markerURL(in managedBundleURL: URL) -> URL {
@@ -488,6 +588,9 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         decoder.dateDecodingStrategy = .iso8601
         return decoder
     }()
+
+    private static let embeddedBootstrapToken =
+        "@executable_path/../Frameworks/libContinuumBootstrap.dylib"
 }
 
 private struct ManagedSetupMarker: Codable {

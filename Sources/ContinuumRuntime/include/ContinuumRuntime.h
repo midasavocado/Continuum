@@ -790,6 +790,14 @@ continuum_status continuum_remote_process_group_live_status(
     const continuum_remote_process_group_snapshot *snapshot
 );
 
+/// Reports whether a live process loaded ContinuumBootstrap and created its
+/// isolated app-state malloc zone. The controller uses this as a fail-closed
+/// preflight before sending bootstrap-only safepoint signals.
+continuum_status continuum_remote_process_has_app_state_zone(
+    int32_t process_id,
+    uint8_t *out_has_app_state_zone
+);
+
 continuum_status continuum_remote_process_group_copy_member_info(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t index,

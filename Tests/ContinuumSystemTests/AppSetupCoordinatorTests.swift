@@ -30,6 +30,19 @@ struct AppSetupCoordinatorTests {
         #expect(!FileManager.default.fileExists(atPath: markerURL(in: originalURL).path))
         #expect(FileManager.default.fileExists(atPath: markerURL(in: managedURL).path))
         #expect(!FileManager.default.fileExists(atPath: markerURL(in: fixture.sourceURL).path))
+        let embeddedBootstrap = managedURL
+            .appendingPathComponent("Contents/Frameworks/libContinuumBootstrap.dylib")
+        #expect(try Data(contentsOf: embeddedBootstrap) == Data(contentsOf: fixture.bootstrapURL))
+        let managedInfo = try #require(
+            PropertyListSerialization.propertyList(
+                from: Data(contentsOf: managedURL.appendingPathComponent("Contents/Info.plist")),
+                options: [],
+                format: nil
+            ) as? [String: Any]
+        )
+        let environment = try #require(managedInfo["LSEnvironment"] as? [String: String])
+        #expect(environment["CONTINUUM_PRESERVE_ON_QUIT"] == "1")
+        #expect(environment["DYLD_INSERT_LIBRARIES"] == "@executable_path/../Frameworks/libContinuumBootstrap.dylib")
 
         let reloaded = fixture.coordinator()
         let persisted = try await reloaded.records()
@@ -215,6 +228,7 @@ private struct SetupFixture {
     let rootURL: URL
     let sourceURL: URL
     let sourceTokenURL: URL
+    let bootstrapURL: URL
     let app: AppIdentity
     let blockers: [AppSetupBlocker]
     let signer: any ManagedBundleSigning
@@ -247,11 +261,14 @@ private struct SetupFixture {
         try infoData.write(to: contentsURL.appendingPathComponent("Info.plist"), options: .atomic)
         let tokenURL = contentsURL.appendingPathComponent("fixture-token")
         try Data("version-one".utf8).write(to: tokenURL, options: .atomic)
+        let bootstrapURL = parentURL.appendingPathComponent("libContinuumBootstrap.dylib")
+        try Data("fixture-bootstrap".utf8).write(to: bootstrapURL, options: .atomic)
 
         self.parentURL = parentURL
         self.rootURL = parentURL.appendingPathComponent("ContinuumData", isDirectory: true)
         self.sourceURL = sourceURL
         self.sourceTokenURL = tokenURL
+        self.bootstrapURL = bootstrapURL
         self.app = AppIdentity(
             bundleIdentifier: "dev.continuum.generic-fixture",
             displayName: "Generic Fixture",
@@ -272,6 +289,7 @@ private struct SetupFixture {
             fileSystem: LocalAppSetupFileSystem(),
             probeService: FixtureProbe(sourceURL: sourceURL, blockers: blockers),
             signer: signer,
+            bootstrapLibraryURL: bootstrapURL,
             now: { Date(timeIntervalSince1970: 1_800_000_000) }
         )
     }

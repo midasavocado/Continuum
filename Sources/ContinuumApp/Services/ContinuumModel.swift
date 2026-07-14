@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import ContinuumCore
@@ -32,6 +33,7 @@ final class ContinuumModel {
     @ObservationIgnored private let coldProcessRestorer: ColdProcessRestorer
     @ObservationIgnored private let appSetupCoordinator: any AppSetupCoordinating
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let automaticallyPreparesCaptureTargets: Bool
 
     private(set) var snapshots: [SnapshotRecord] = []
     private(set) var branches: [BranchRecord] = []
@@ -75,6 +77,7 @@ final class ContinuumModel {
         checkpointCapturer: any CheckpointCapturing,
         coldProcessRestorer: ColdProcessRestorer,
         appSetupCoordinator: any AppSetupCoordinating,
+        automaticallyPreparesCaptureTargets: Bool = false,
         defaults: UserDefaults = .standard
     ) {
         self.repository = repository
@@ -83,6 +86,7 @@ final class ContinuumModel {
         self.checkpointCapturer = checkpointCapturer
         self.coldProcessRestorer = coldProcessRestorer
         self.appSetupCoordinator = appSetupCoordinator
+        self.automaticallyPreparesCaptureTargets = automaticallyPreparesCaptureTargets
         self.defaults = defaults
         self.isOnboardingComplete = defaults.bool(forKey: Self.onboardingDefaultsKey)
     }
@@ -176,13 +180,16 @@ final class ContinuumModel {
             }
             try await self.ensureIndexIsLoaded()
 
-            guard let frontmost = await self.inventory.frontmostApplication() else {
+            guard var frontmost = await self.inventory.frontmostApplication() else {
                 throw ContinuumError.noFrontmostApplication
             }
             if frontmost.app.bundleIdentifier == Bundle.main.bundleIdentifier {
                 throw ContinuumError.runtimeUnsupported(
                     "Continuum will not record its own control window. Switch to the app you want to inspect and press the Save Snapshot shortcut."
                 )
+            }
+            if self.automaticallyPreparesCaptureTargets {
+                frontmost = try await self.prepareTargetForOneStepCapture(frontmost)
             }
 
             var processes = await self.inventory.runningApplications()
@@ -212,6 +219,83 @@ final class ContinuumModel {
             self.selectedSnapshotID = savedSnapshot.id
             self.selectedSection = .snapshots
         }
+    }
+
+    private func prepareTargetForOneStepCapture(
+        _ target: ProcessDescriptor
+    ) async throws -> ProcessDescriptor {
+        let records = try await appSetupCoordinator.records()
+        if records.contains(where: { record in
+            guard case .prepared = record.state,
+                  let managedURL = record.managedBundleURL,
+                  let runningURL = target.app.bundleURL else {
+                return false
+            }
+            return managedURL.resolvingSymlinksInPath().standardizedFileURL
+                == runningURL.resolvingSymlinksInPath().standardizedFileURL
+        }) {
+            return target
+        }
+
+        let record = try await appSetupCoordinator.setup(target.app)
+        upsertSetupRecord(record)
+        if case .blocked = record.state {
+            throw ContinuumError.runtimeUnsupported(
+                "macOS protects this app's signing identity, so Continuum cannot safely prepare it for quit-and-restore."
+            )
+        }
+        guard case .prepared = record.state,
+              let managedURL = record.managedBundleURL else {
+            throw ContinuumError.runtimeUnsupported(
+                "Continuum could not finish preparing this app for quit-and-restore."
+            )
+        }
+
+        if let running = NSRunningApplication(
+            processIdentifier: target.processIdentifier
+        ), !running.isTerminated {
+            guard running.terminate() else {
+                throw ContinuumError.runtimeUnsupported(
+                    "Continuum could not close the original app before reopening its restorable copy."
+                )
+            }
+            for _ in 0..<200 where !running.isTerminated {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            guard running.isTerminated else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The app is waiting to finish quitting. Complete any save prompt, then press Save Snapshot again."
+                )
+            }
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.createsNewApplicationInstance = true
+        let embeddedBootstrap = managedURL
+            .appendingPathComponent("Contents/Frameworks/libContinuumBootstrap.dylib")
+        configuration.environment = [
+            "CONTINUUM_PRESERVE_ON_QUIT": "1",
+            "DYLD_INSERT_LIBRARIES": embeddedBootstrap.path
+        ]
+        let launched = try await NSWorkspace.shared.openApplication(
+            at: managedURL,
+            configuration: configuration
+        )
+
+        for _ in 0..<200 {
+            let processes = await inventory.runningApplications()
+            if let descriptor = processes.first(where: {
+                $0.processIdentifier == launched.processIdentifier
+                    && !$0.isTerminated
+            }) {
+                return descriptor
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw ContinuumError.runtimeUnsupported(
+            "The restorable app copy did not finish launching."
+        )
     }
 
     func beginRewind() async {

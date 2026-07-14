@@ -17,11 +17,16 @@ enum AppBootstrap {
             repository: repository,
             inventory: MacAppInventoryService(),
             permissionProvider: MacPermissionService(),
-            checkpointCapturer: HotProcessCheckpointService(),
+            checkpointCapturer: HotProcessCheckpointService(
+                usesInjectedSafepoints: true
+            ),
             coldProcessRestorer: ColdProcessRestorer(),
             appSetupCoordinator: MacAppSetupCoordinator(
-                rootDirectory: try? appSetupStoreURL()
-            )
+                rootDirectory: try? appSetupStoreURL(),
+                bootstrapLibraryURL: Bundle.main.privateFrameworksURL?
+                    .appendingPathComponent("libContinuumBootstrap.dylib")
+            ),
+            automaticallyPreparesCaptureTargets: true
         )
     }
 

@@ -14,6 +14,15 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertGreaterThan(info.thread_count, 0)
     }
 
+    func testBootstrapAppStateZoneIsDetectableBeforeSafepointSignal() {
+        var detected: UInt8 = 0
+        XCTAssertEqual(
+            continuum_remote_process_has_app_state_zone(getpid(), &detected),
+            CONTINUUM_STATUS_OK
+        )
+        XCTAssertEqual(detected, 1)
+    }
+
     func testBootstrapPreparesOneSuspendedOrdinaryPthread() {
         var report = continuum_bootstrap_pthread_report()
         XCTAssertEqual(

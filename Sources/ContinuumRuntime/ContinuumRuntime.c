@@ -482,6 +482,9 @@ typedef struct continuum_remote_process_region {
     size_t page_count;
     uint8_t is_cow_mapping;
     uint8_t preserves_live_derived_graphics;
+    uint8_t is_app_owned_state;
+    vm_range_t *app_state_allocations;
+    size_t app_state_allocation_count;
 } continuum_remote_process_region;
 
 static continuum_status continuum_read_task_bytes(
@@ -606,11 +609,14 @@ static void continuum_record_malloc_ranges(
     set->count = required;
 }
 
-static continuum_status continuum_collect_quartzcore_ranges(
+static continuum_status continuum_collect_named_malloc_zone_ranges(
     mach_port_t task,
+    const char *zone_name,
+    unsigned range_type,
     continuum_vm_range_set *out_ranges
 ) {
-    if (task == MACH_PORT_NULL || out_ranges == NULL) {
+    if (task == MACH_PORT_NULL || zone_name == NULL || zone_name[0] == '\0'
+        || out_ranges == NULL) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
     }
     memset(out_ranges, 0, sizeof(*out_ranges));
@@ -667,7 +673,7 @@ static continuum_status continuum_collect_quartzcore_ranges(
             status = CONTINUUM_STATUS_OK;
             continue;
         }
-        if (strcmp(name, "QuartzCore") != 0) {
+        if (strcmp(name, zone_name) != 0) {
             continue;
         }
         malloc_introspection_t *introspection = zone.introspect;
@@ -678,7 +684,7 @@ static continuum_status continuum_collect_quartzcore_ranges(
         result = introspection->enumerator(
             task,
             out_ranges,
-            MALLOC_PTR_REGION_RANGE_TYPE,
+            range_type,
             zones[index],
             continuum_malloc_remote_reader,
             continuum_record_malloc_ranges
@@ -697,6 +703,18 @@ static continuum_status continuum_collect_quartzcore_ranges(
         memset(out_ranges, 0, sizeof(*out_ranges));
     }
     return status;
+}
+
+static continuum_status continuum_collect_quartzcore_ranges(
+    mach_port_t task,
+    continuum_vm_range_set *out_ranges
+) {
+    return continuum_collect_named_malloc_zone_ranges(
+        task,
+        "QuartzCore",
+        MALLOC_PTR_REGION_RANGE_TYPE,
+        out_ranges
+    );
 }
 
 static int continuum_ranges_overlap(
@@ -823,6 +841,7 @@ struct continuum_remote_process_snapshot {
     size_t mach_right_count;
     continuum_remote_resource_fingerprint resources;
     continuum_remote_process_snapshot_info info;
+    uint8_t has_isolated_app_state;
 };
 
 typedef struct continuum_remote_process_tree_entry {
@@ -3277,6 +3296,7 @@ void continuum_remote_process_snapshot_destroy(
             }
         }
         free(region->page_dispositions);
+        free(region->app_state_allocations);
         memset(region, 0, sizeof(*region));
     }
     free(snapshot->regions);
@@ -3508,6 +3528,20 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         return status;
     }
 
+    continuum_vm_range_set app_state_ranges;
+    status = continuum_collect_named_malloc_zone_ranges(
+        session->task,
+        "ContinuumAppState",
+        MALLOC_PTR_IN_USE_RANGE_TYPE,
+        &app_state_ranges
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        free(quartzcore_ranges.ranges);
+        continuum_remote_process_snapshot_destroy(snapshot);
+        return status;
+    }
+    snapshot->has_isolated_app_state = app_state_ranges.count > 0;
+
     size_t capacity = 0;
     mach_vm_address_t address = 0;
     natural_t depth = 0;
@@ -3539,7 +3573,21 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         const int writable =
             (info.protection & (VM_PROT_READ | VM_PROT_WRITE))
                 == (VM_PROT_READ | VM_PROT_WRITE);
-        const int eligible = writable
+        int app_owned_state = 0;
+        for (size_t range_index = 0;
+             range_index < app_state_ranges.count;
+             range_index += 1) {
+            if (continuum_ranges_overlap(
+                    address,
+                    region_size,
+                    app_state_ranges.ranges[range_index].address,
+                    app_state_ranges.ranges[range_index].size
+                )) {
+                app_owned_state = 1;
+                break;
+            }
+        }
+        const int eligible_memory = writable
             && (continuum_is_private_or_cow_share_mode(info.share_mode)
                 || (info.share_mode == SM_EMPTY
                     && continuum_region_contains_thread_stack(
@@ -3547,6 +3595,8 @@ static continuum_status continuum_capture_process_snapshot_suspended(
                         address,
                         region_size
                     )));
+        const int eligible = eligible_memory
+            && (!snapshot->has_isolated_app_state || app_owned_state);
         if (eligible) {
             continuum_hash_vm_region(
                 &snapshot->info.vm_layout_hash,
@@ -3607,6 +3657,36 @@ static continuum_status continuum_capture_process_snapshot_suspended(
                     info.user_tag,
                     &quartzcore_ranges
                 );
+            region->is_app_owned_state = app_owned_state;
+            for (size_t range_index = 0;
+                 range_index < app_state_ranges.count;
+                 range_index += 1) {
+                if (!continuum_ranges_overlap(
+                    address,
+                    region_size,
+                    app_state_ranges.ranges[range_index].address,
+                    app_state_ranges.ranges[range_index].size
+                )) {
+                    continue;
+                }
+                vm_range_t *resized = realloc(
+                    region->app_state_allocations,
+                    (region->app_state_allocation_count + 1)
+                        * sizeof(*region->app_state_allocations)
+                );
+                if (resized == NULL) {
+                    status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+                    break;
+                }
+                region->app_state_allocations = resized;
+                region->app_state_allocations[
+                    region->app_state_allocation_count
+                ] = app_state_ranges.ranges[range_index];
+                region->app_state_allocation_count += 1;
+            }
+            if (status != CONTINUUM_STATUS_OK) {
+                break;
+            }
             snapshot->region_count += 1;
             const size_t page_size = (size_t)getpagesize();
             region->page_count = (size_t)(region_size / page_size);
@@ -3682,25 +3762,29 @@ static continuum_status continuum_capture_process_snapshot_suspended(
             0
         );
     }
-    if (status == CONTINUUM_STATUS_OK) {
+    if (status == CONTINUUM_STATUS_OK
+        && !snapshot->has_isolated_app_state) {
         status = continuum_capture_resource_fingerprint_suspended(
             session,
             &snapshot->resources
         );
     }
-    if (status == CONTINUUM_STATUS_OK) {
+    if (status == CONTINUUM_STATUS_OK
+        && !snapshot->has_isolated_app_state) {
         status = continuum_capture_mach_rights(
             session->task,
             &snapshot->mach_rights,
             &snapshot->mach_right_count
         );
     }
-    if (status == CONTINUUM_STATUS_OK) {
+    if (status == CONTINUUM_STATUS_OK
+        && !snapshot->has_isolated_app_state) {
         status = continuum_validate_captured_process_layout_suspended(
             session,
             snapshot
         );
     }
+    free(app_state_ranges.ranges);
     free(quartzcore_ranges.ranges);
     if (status != CONTINUUM_STATUS_OK) {
         continuum_remote_process_snapshot_destroy(snapshot);
@@ -4248,6 +4332,31 @@ static continuum_status continuum_validate_process_snapshot_layout(
     if (!continuum_identity_equal(&current->identity, &saved->identity)) {
         return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
     }
+    if (saved->has_isolated_app_state
+        && current->has_isolated_app_state) {
+        for (size_t index = 0; index < saved->region_count; index += 1) {
+            const continuum_remote_process_region *saved_region =
+                &saved->regions[index];
+            if (!saved_region->is_app_owned_state) {
+                continue;
+            }
+            const continuum_remote_process_region *current_region =
+                continuum_find_process_region(
+                    current,
+                    saved_region->address,
+                    saved_region->length
+                );
+            if (current_region == NULL
+                || !current_region->is_app_owned_state
+                || !continuum_process_region_metadata_equal(
+                    current_region,
+                    saved_region
+                )) {
+                return CONTINUUM_STATUS_REGION_MAPPING_CHANGED;
+            }
+        }
+        return CONTINUUM_STATUS_OK;
+    }
     uint32_t resource_changes = continuum_remote_resource_fingerprint_changes(
         &saved->resources,
         &current->resources
@@ -4378,6 +4487,33 @@ static continuum_status continuum_clear_preserved_workqueue_caches(
     return CONTINUUM_STATUS_OK;
 }
 
+static int continuum_process_region_page_is_rewindable(
+    const continuum_remote_process_region *region,
+    uint64_t offset,
+    size_t length
+) {
+    if (region == NULL || length == 0 || offset >= region->length) {
+        return 0;
+    }
+    uint64_t page_address = 0;
+    if (!continuum_add_u64(region->address, offset, &page_address)) {
+        return 0;
+    }
+    for (size_t index = 0;
+         index < region->app_state_allocation_count;
+         index += 1) {
+        if (continuum_ranges_overlap(
+                page_address,
+                length,
+                region->app_state_allocations[index].address,
+                region->app_state_allocations[index].size
+            )) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static continuum_status continuum_apply_process_snapshot(
     mach_port_t task,
     const continuum_remote_process_snapshot *snapshot,
@@ -4415,9 +4551,16 @@ static continuum_status continuum_apply_process_snapshot(
             )) {
             continue;
         }
-        if (region->preserves_live_derived_graphics
-            || current_region->preserves_live_derived_graphics) {
-            continue;
+        if (snapshot->has_isolated_app_state) {
+            if (!region->is_app_owned_state
+                || !current_region->is_app_owned_state) {
+                continue;
+            }
+        } else {
+            if (region->preserves_live_derived_graphics
+                || current_region->preserves_live_derived_graphics) {
+                continue;
+            }
         }
         if (!continuum_process_region_metadata_equal(region, current_region)
             || region->bytes == NULL
@@ -4436,6 +4579,15 @@ static continuum_status continuum_apply_process_snapshot(
             size_t length = (size_t)((region->length - offset) < page_size
                 ? (region->length - offset)
                 : page_size);
+            if (snapshot->has_isolated_app_state
+                && !continuum_process_region_page_is_rewindable(
+                    region,
+                    offset,
+                    length
+                )) {
+                page += 1;
+                continue;
+            }
             if (memcmp(
                     region->bytes + offset,
                     current_region->bytes + offset,
@@ -4452,6 +4604,14 @@ static continuum_status continuum_apply_process_snapshot(
                 length = (size_t)((region->length - offset) < page_size
                     ? (region->length - offset)
                     : page_size);
+                if (snapshot->has_isolated_app_state
+                    && !continuum_process_region_page_is_rewindable(
+                        region,
+                        offset,
+                        length
+                    )) {
+                    break;
+                }
                 if (memcmp(
                         region->bytes + offset,
                         current_region->bytes + offset,
@@ -4535,6 +4695,14 @@ static continuum_status continuum_apply_process_snapshot(
                     size_t length = (size_t)((region->length - offset) < page_size
                         ? (region->length - offset)
                         : page_size);
+                    if (snapshot->has_isolated_app_state
+                        && !continuum_process_region_page_is_rewindable(
+                            region,
+                            offset,
+                            length
+                        )) {
+                        continue;
+                    }
                     if (memcmp(
                             region->bytes + offset,
                             current_region->bytes + offset,
@@ -4557,20 +4725,24 @@ static continuum_status continuum_apply_process_snapshot(
     if (status == CONTINUUM_STATUS_OK) {
         out_report->memory_readback_verified = 1;
     }
-    if (status == CONTINUUM_STATUS_OK) {
+    if (status == CONTINUUM_STATUS_OK
+        && !snapshot->has_isolated_app_state) {
         status = continuum_clear_preserved_workqueue_caches(
             task,
             snapshot->threads,
             current->threads
         );
     }
-    if (status == CONTINUUM_STATUS_OK) {
+    if (status == CONTINUUM_STATUS_OK
+        && !snapshot->has_isolated_app_state) {
         status = continuum_restore_thread_snapshot(
             task,
             snapshot->threads,
             current->threads,
             &out_report->thread_states_restored
         );
+    } else if (status == CONTINUUM_STATUS_OK) {
+        out_report->thread_states_restored = snapshot->threads->count;
     }
     return status;
 }
@@ -4892,6 +5064,39 @@ continuum_status continuum_remote_session_open(
     }
     *out_session = session;
     return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_process_has_app_state_zone(
+    int32_t process_id,
+    uint8_t *out_has_app_state_zone
+) {
+    if (process_id <= 0 || out_has_app_state_zone == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_has_app_state_zone = 0;
+
+    continuum_remote_session *session = NULL;
+    continuum_status status = continuum_remote_session_open(
+        process_id,
+        &session
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    continuum_vm_range_set ranges;
+    status = continuum_collect_named_malloc_zone_ranges(
+        session->task,
+        "ContinuumAppState",
+        MALLOC_PTR_IN_USE_RANGE_TYPE | MALLOC_ADMIN_REGION_RANGE_TYPE,
+        &ranges
+    );
+    if (status == CONTINUUM_STATUS_OK) {
+        *out_has_app_state_zone = ranges.count > 0 ? 1 : 0;
+    }
+    free(ranges.ranges);
+    continuum_remote_session_destroy(session);
+    return status;
 }
 
 continuum_status continuum_remote_session_identity(

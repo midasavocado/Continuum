@@ -141,7 +141,11 @@ struct MacAppSetupProbe: AppSetupProbing {
 
         let flags = (information[kSecCodeInfoFlags] as? NSNumber)?.uint32Value ?? 0
         let entitlements = information[kSecCodeInfoEntitlementsDict] as? [String: Any] ?? [:]
-        let validityFlags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures)
+        let validityFlags = SecCSFlags(
+            rawValue: kSecCSStrictValidate
+                | kSecCSCheckAllArchitectures
+                | kSecCSCheckNestedCode
+        )
         let validity = SecStaticCodeCheckValidity(staticCode, validityFlags, nil) == errSecSuccess
         let signingIdentifier = information[kSecCodeInfoIdentifier] as? String
         let isAdHocSigned = flags & SignatureFlag.adHoc != 0

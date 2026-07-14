@@ -10,6 +10,7 @@ extern "C" {
 
 enum { CONTINUUM_BOOTSTRAP_SAFEPOINT_REGISTER = 28 };
 #define CONTINUUM_BOOTSTRAP_SAFEPOINT_MAGIC UINT64_C(0x434F4E5453414645)
+#define CONTINUUM_BOOTSTRAP_APP_STATE_ZONE_NAME "ContinuumAppState"
 
 /// Runs on AppKit's main queue until the controller sends the release signal.
 /// x28 carries a marker so an external capture can prove it stopped at this

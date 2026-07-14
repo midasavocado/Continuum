@@ -6,6 +6,10 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <malloc/malloc.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <signal.h>
@@ -26,6 +30,10 @@ static volatile sig_atomic_t continuum_safepoint_requested = 0;
 static volatile sig_atomic_t continuum_preservation_active = 0;
 static CFRunLoopObserverRef continuum_safepoint_observer = NULL;
 static void continuum_install_terminate_interposition(void);
+static malloc_zone_t *continuum_app_state_zone = NULL;
+static uintptr_t continuum_main_text_start = 0;
+static uintptr_t continuum_main_text_end = 0;
+static volatile int continuum_allocator_interposition_active = 0;
 
 #define CONTINUUM_INTERPOSE(replacement, replacee) \
     __attribute__((used)) static struct { \
@@ -36,6 +44,155 @@ static void continuum_install_terminate_interposition(void);
             (const void *)(uintptr_t)&replacement, \
             (const void *)(uintptr_t)&replacee \
         }
+
+static int continuum_address_is_in_main_text(uintptr_t address) {
+    return continuum_main_text_start != 0
+        && address >= continuum_main_text_start
+        && address < continuum_main_text_end;
+}
+
+static int continuum_allocation_is_app_owned(uintptr_t return_address) {
+#if __has_feature(ptrauth_calls)
+    return_address = (uintptr_t)ptrauth_strip(
+        (void *)return_address,
+        ptrauth_key_return_address
+    );
+#endif
+    return continuum_address_is_in_main_text(return_address);
+}
+
+static void *continuum_state_malloc(size_t size) {
+    malloc_zone_t *zone = malloc_default_zone();
+    uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
+    if (continuum_app_state_zone != NULL
+        && __sync_lock_test_and_set(
+            &continuum_allocator_interposition_active,
+            1
+        ) == 0) {
+        if (continuum_allocation_is_app_owned(return_address)) {
+            zone = continuum_app_state_zone;
+        }
+        __sync_lock_release(&continuum_allocator_interposition_active);
+    }
+    return malloc_zone_malloc(zone, size);
+}
+
+static void *continuum_state_calloc(size_t count, size_t size) {
+    malloc_zone_t *zone = malloc_default_zone();
+    uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
+    if (continuum_app_state_zone != NULL
+        && __sync_lock_test_and_set(
+            &continuum_allocator_interposition_active,
+            1
+        ) == 0) {
+        if (continuum_allocation_is_app_owned(return_address)) {
+            zone = continuum_app_state_zone;
+        }
+        __sync_lock_release(&continuum_allocator_interposition_active);
+    }
+    return malloc_zone_calloc(zone, count, size);
+}
+
+static void *continuum_state_typed_malloc(
+    size_t size,
+    malloc_type_id_t type_id
+) {
+    (void)type_id;
+    malloc_zone_t *zone = malloc_default_zone();
+    uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
+    if (continuum_app_state_zone != NULL
+        && __sync_lock_test_and_set(
+            &continuum_allocator_interposition_active,
+            1
+        ) == 0) {
+        if (continuum_allocation_is_app_owned(return_address)) {
+            zone = continuum_app_state_zone;
+        }
+        __sync_lock_release(&continuum_allocator_interposition_active);
+    }
+    return malloc_zone_malloc(zone, size);
+}
+
+static void *continuum_state_typed_calloc(
+    size_t count,
+    size_t size,
+    malloc_type_id_t type_id
+) {
+    (void)type_id;
+    malloc_zone_t *zone = malloc_default_zone();
+    uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
+    if (continuum_app_state_zone != NULL
+        && __sync_lock_test_and_set(
+            &continuum_allocator_interposition_active,
+            1
+        ) == 0) {
+        if (continuum_allocation_is_app_owned(return_address)) {
+            zone = continuum_app_state_zone;
+        }
+        __sync_lock_release(&continuum_allocator_interposition_active);
+    }
+    return malloc_zone_calloc(zone, count, size);
+}
+
+CONTINUUM_INTERPOSE(continuum_state_malloc, malloc);
+CONTINUUM_INTERPOSE(continuum_state_calloc, calloc);
+CONTINUUM_INTERPOSE(continuum_state_typed_malloc, malloc_type_malloc);
+CONTINUUM_INTERPOSE(continuum_state_typed_calloc, malloc_type_calloc);
+
+static void continuum_prepare_app_state_zone(void) {
+    const struct mach_header *header = NULL;
+    uint32_t image_count = _dyld_image_count();
+    for (uint32_t index = 0; index < image_count; index += 1) {
+        const struct mach_header *candidate = _dyld_get_image_header(index);
+        if (candidate != NULL && candidate->filetype == MH_EXECUTE) {
+            header = candidate;
+            break;
+        }
+    }
+    if (header == NULL || header->magic != MH_MAGIC_64) {
+        return;
+    }
+    const struct mach_header_64 *header64 =
+        (const struct mach_header_64 *)header;
+    const uint8_t *command_bytes = (const uint8_t *)(header64 + 1);
+    const uint8_t *command_end = command_bytes + header64->sizeofcmds;
+    const struct load_command *command =
+        (const struct load_command *)command_bytes;
+    for (uint32_t index = 0; index < header64->ncmds; index += 1) {
+        const uint8_t *next = (const uint8_t *)command + command->cmdsize;
+        if (command->cmdsize < sizeof(*command) || next > command_end) {
+            return;
+        }
+        if (command->cmd == LC_SEGMENT_64
+            && command->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            if (strncmp(segment->segname, SEG_TEXT, sizeof(segment->segname))
+                == 0
+                && segment->vmsize > 0
+                && (uintptr_t)header
+                    <= UINTPTR_MAX - segment->vmsize) {
+                continuum_main_text_start = (uintptr_t)header;
+                continuum_main_text_end =
+                    continuum_main_text_start + (uintptr_t)segment->vmsize;
+            }
+        }
+        command = (const struct load_command *)next;
+    }
+    if (continuum_main_text_start == 0) {
+        return;
+    }
+    continuum_app_state_zone = malloc_create_zone(0, 0);
+    if (continuum_app_state_zone != NULL) {
+        malloc_set_zone_name(
+            continuum_app_state_zone,
+            CONTINUUM_BOOTSTRAP_APP_STATE_ZONE_NAME
+        );
+        // Keep one allocation alive so the controller can safely prove that
+        // this process loaded the bootstrap before it sends safepoint signals.
+        (void)malloc_zone_malloc(continuum_app_state_zone, 1);
+    }
+}
 
 static int continuum_should_preserve_receive_right(
     ipc_space_t task,
@@ -115,7 +272,6 @@ CONTINUUM_INTERPOSE(
 
 __attribute__((visibility("default"), noinline))
 void continuum_bootstrap_safepoint_spin(void) {
-    continuum_safepoint_release = 0;
     while (!continuum_safepoint_release) {
 #if defined(__arm64__)
         const uint64_t marker = CONTINUUM_BOOTSTRAP_SAFEPOINT_MAGIC;
@@ -147,15 +303,15 @@ static void continuum_run_loop_safepoint(
     if (continuum_safepoint_requested) {
         continuum_preservation_active = 1;
         continuum_safepoint_requested = 0;
+        continuum_safepoint_release = 0;
         continuum_bootstrap_safepoint_spin();
     }
 }
 
-static __attribute__((noreturn)) void continuum_park_on_quit(void) {
+static void continuum_park_on_quit(void) {
+    continuum_safepoint_release = 0;
     (void)kill(getpid(), SIGSTOP);
-    for (;;) {
-        pause();
-    }
+    continuum_bootstrap_safepoint_spin();
 }
 
 static void continuum_preserving_application_terminate(
@@ -163,10 +319,15 @@ static void continuum_preserving_application_terminate(
     SEL command,
     id sender
 ) {
-    (void)application;
     (void)command;
     (void)sender;
+    SEL hide = sel_registerName("hide:");
+    ((void (*)(id, SEL, id))objc_msgSend)(application, hide, nil);
     continuum_park_on_quit();
+    SEL unhide = sel_registerName("unhide:");
+    ((void (*)(id, SEL, id))objc_msgSend)(application, unhide, nil);
+    SEL activate = sel_registerName("activateIgnoringOtherApps:");
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(application, activate, YES);
 }
 
 static void continuum_install_terminate_interposition(void) {
@@ -731,6 +892,7 @@ static void continuum_bootstrap_report_copy_address(void) {
 /// replace the disposable process image without executing app code.
 __attribute__((constructor))
 static void continuum_bootstrap_stop_before_main(void) {
+    continuum_prepare_app_state_zone();
     continuum_bootstrap_enable_safepoints();
     const char *requested = getenv("CONTINUUM_BOOTSTRAP_STOP");
     if (requested == NULL || strcmp(requested, "1") != 0) {

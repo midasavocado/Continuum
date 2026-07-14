@@ -56,13 +56,23 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         let snapshotID = UUID()
         var safepointRequested = false
         if usesInjectedSafepoints {
+            var hasAppStateZone: UInt8 = 0
+            let preflight = continuum_remote_process_has_app_state_zone(
+                rootProcessIdentifier,
+                &hasAppStateZone
+            )
+            guard preflight == CONTINUUM_STATUS_OK, hasAppStateZone != 0 else {
+                throw ContinuumError.runtimeUnsupported(
+                    "Continuum needs to prepare and reopen this app once before its first restorable snapshot."
+                )
+            }
             guard kill(rootProcessIdentifier, SIGUSR2) == 0 else {
                 throw ContinuumError.runtimeUnsupported(
                     "Continuum could not request the app's capture safepoint."
                 )
             }
             safepointRequested = true
-            usleep(100_000)
+            usleep(250_000)
         }
         defer {
             if safepointRequested {
@@ -242,8 +252,14 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             )
         }
         if usesInjectedSafepoints {
-            _ = kill(handle.rootProcessIdentifier, SIGCONT)
-            _ = kill(handle.rootProcessIdentifier, SIGUSR1)
+            // A parked Quit has both a job-control stop and the bootstrap
+            // spin. Queue the release first, then continue; repeat briefly to
+            // cover the race where the stop finishes after restore returns.
+            for _ in 0..<3 {
+                _ = kill(handle.rootProcessIdentifier, SIGUSR1)
+                _ = kill(handle.rootProcessIdentifier, SIGCONT)
+                usleep(10_000)
+            }
         }
         return .experimentalHot
     }
