@@ -16,6 +16,8 @@ struct ContinuumHarnessMain {
                 try await TransactionProof.run()
             case let .externalHotProof(target, cycles):
                 try await ExternalHotProof.run(targetPath: target, cycles: cycles)
+            case let .guiColdProof(target):
+                try await GUIColdProof.run(targetPath: target)
             case let .setupApp(target, root, checkOnly):
                 try await ManagedAppSetupCommand.run(
                     targetPath: target,
@@ -43,6 +45,7 @@ private enum HarnessCommand: Equatable {
     case memoryProof
     case transactionProof
     case externalHotProof(target: String, cycles: Int)
+    case guiColdProof(target: String)
     case setupApp(target: String, root: String?, checkOnly: Bool)
     case help
 
@@ -54,6 +57,8 @@ private enum HarnessCommand: Equatable {
       transaction-proof  Prove durable manual snapshots and rewind branching.
       external-hot-proof --target <path> [--cycles <n>]
                          Rewind the included cooperative proof target at least 100 times.
+      gui-cold-proof --target <path>
+                         Kill and cold-restore a real AppKit window into a new PID.
       setup-app --target <path> [--root <path>] [--check-only]
                          Run the same generic managed-copy setup used by the app.
       help               Show this help.
@@ -64,6 +69,9 @@ private enum HarnessCommand: Equatable {
 
         if name == "external-hot-proof" {
             return try parseExternalHotProof(arguments.dropFirst())
+        }
+        if name == "gui-cold-proof" {
+            return try parseGUIColdProof(arguments.dropFirst())
         }
         if name == "setup-app" {
             return try parseSetupApp(arguments.dropFirst())
@@ -80,6 +88,18 @@ private enum HarnessCommand: Equatable {
         case "help", "--help", "-h": .help
         default: throw HarnessFailure.usage("Unknown command: \(name)")
         }
+    }
+
+    private static func parseGUIColdProof(
+        _ arguments: ArraySlice<String>
+    ) throws -> Self {
+        let values = Array(arguments)
+        guard values.count == 2, values[0] == "--target" else {
+            throw HarnessFailure.usage(
+                "gui-cold-proof requires --target <path>"
+            )
+        }
+        return .guiColdProof(target: values[1])
     }
 
     private static func parseExternalHotProof(_ arguments: ArraySlice<String>) throws -> Self {

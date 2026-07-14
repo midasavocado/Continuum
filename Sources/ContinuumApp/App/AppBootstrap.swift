@@ -18,7 +18,9 @@ enum AppBootstrap {
             inventory: MacAppInventoryService(),
             permissionProvider: MacPermissionService(),
             checkpointCapturer: HotProcessCheckpointService(
-                usesInjectedSafepoints: true
+                usesInjectedSafepoints: true,
+                bootstrapLibraryURL: Bundle.main.privateFrameworksURL?
+                    .appendingPathComponent("libContinuumBootstrap.dylib")
             ),
             coldProcessRestorer: ColdProcessRestorer(),
             appSetupCoordinator: MacAppSetupCoordinator(

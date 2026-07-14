@@ -17,6 +17,13 @@ enum { CONTINUUM_BOOTSTRAP_SAFEPOINT_REGISTER = 28 };
 /// user-space continuation instead of inside a Mach syscall.
 void continuum_bootstrap_safepoint_spin(void);
 
+/// Allocates durable model memory from Continuum's isolated app-state zone.
+/// The general malloc interposer uses call-site ownership; this explicit entry
+/// is also useful to adapters whose language runtime hides the app call site.
+/// Cold GUI adapters must store pointer-free or self-relative data here; raw
+/// pointers into a fresh AppKit process are intentionally not reconstructed.
+void *continuum_bootstrap_allocate_app_state(size_t size);
+
 /// Copies one reconstruction chunk with ordinary in-process stores, then
 /// raises a debugger trap without returning. Continuum invokes this only while
 /// its disposable replacement is stopped before the app's first instruction.

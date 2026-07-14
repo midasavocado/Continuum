@@ -115,6 +115,8 @@ public struct DurableMemoryRegion: Codable, Hashable, Sendable {
     public let inheritance: Int32
     public let shareMode: UInt32
     public let userTag: UInt32
+    public let isAppOwnedState: Bool?
+    public let preservesLiveDerivedGraphics: Bool?
     public let chunks: [DurableChunkReference]
 
     public init(
@@ -125,6 +127,8 @@ public struct DurableMemoryRegion: Codable, Hashable, Sendable {
         inheritance: Int32,
         shareMode: UInt32,
         userTag: UInt32,
+        isAppOwnedState: Bool? = nil,
+        preservesLiveDerivedGraphics: Bool? = nil,
         chunks: [DurableChunkReference]
     ) {
         self.address = address
@@ -134,6 +138,8 @@ public struct DurableMemoryRegion: Codable, Hashable, Sendable {
         self.inheritance = inheritance
         self.shareMode = shareMode
         self.userTag = userTag
+        self.isAppOwnedState = isAppOwnedState
+        self.preservesLiveDerivedGraphics = preservesLiveDerivedGraphics
         self.chunks = chunks
     }
 }

@@ -15,6 +15,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
     private let maximumCapturedBytes: UInt64
     private let maximumRetainedSnapshots: Int
     private let usesInjectedSafepoints: Bool
+    private let bootstrapLibraryPath: String?
     private let fileCheckpointStore: APFSLocalFileCheckpointStore?
     private var handles: [SnapshotID: HotProcessSnapshotHandle] = [:]
     private var retentionOrder: [SnapshotID] = []
@@ -23,11 +24,16 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         maximumCapturedBytes: UInt64 = UInt64(ContinuumConstants.defaultHotMemoryBudgetBytes),
         maximumRetainedSnapshots: Int = 8,
         usesInjectedSafepoints: Bool = false,
+        bootstrapLibraryURL: URL? = nil,
         fileCheckpointRootURL: URL? = nil
     ) {
         self.maximumCapturedBytes = maximumCapturedBytes
         self.maximumRetainedSnapshots = max(maximumRetainedSnapshots, 2)
         self.usesInjectedSafepoints = usesInjectedSafepoints
+        self.bootstrapLibraryPath = bootstrapLibraryURL?.standardizedFileURL.path
+            ?? Bundle.main.privateFrameworksURL?
+                .appendingPathComponent("libContinuumBootstrap.dylib")
+                .standardizedFileURL.path
         if let fileCheckpointRootURL {
             // Hot file roots cannot outlive their in-memory task snapshots.
             // Clear leftovers from a prior Continuum process before arming.
@@ -56,12 +62,20 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         let snapshotID = UUID()
         var safepointRequested = false
         if usesInjectedSafepoints {
-            var hasAppStateZone: UInt8 = 0
-            let preflight = continuum_remote_process_has_app_state_zone(
-                rootProcessIdentifier,
-                &hasAppStateZone
-            )
-            guard preflight == CONTINUUM_STATUS_OK, hasAppStateZone != 0 else {
+            guard let bootstrapLibraryPath else {
+                throw ContinuumError.runtimeUnsupported(
+                    "Continuum's checkpoint bootstrap is missing."
+                )
+            }
+            var hasBootstrap: UInt8 = 0
+            let preflight = bootstrapLibraryPath.withCString {
+                continuum_remote_process_has_bootstrap(
+                    rootProcessIdentifier,
+                    $0,
+                    &hasBootstrap
+                )
+            }
+            guard preflight == CONTINUUM_STATUS_OK, hasBootstrap != 0 else {
                 throw ContinuumError.runtimeUnsupported(
                     "Continuum needs to prepare and reopen this app once before its first restorable snapshot."
                 )
@@ -378,6 +392,9 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     inheritance: region.inheritance,
                     shareMode: region.share_mode,
                     userTag: region.user_tag,
+                    isAppOwnedState: region.is_app_owned_state != 0,
+                    preservesLiveDerivedGraphics:
+                        region.preserves_live_derived_graphics != 0,
                     chunks: references
                 ))
             }

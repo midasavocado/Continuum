@@ -49,10 +49,17 @@ public struct ColdFileSafetyRestore: Hashable, Sendable {
 /// the verified replacement; unsupported resources remain certification
 /// boundaries.
 public actor ColdProcessRestorer {
+    private enum ResumeMethod: Sendable {
+        case entryStop
+        case rehydrateStop
+    }
+
     private struct PreparedReplacement: @unchecked Sendable {
         let processIdentifier: Int32
         let session: OpaquePointer
         let fileRollback: PreparedFileRollback?
+        let requiresSafepointRelease: Bool
+        let resumeMethod: ResumeMethod
     }
 
     private struct PreparedFileRollback: Sendable {
@@ -155,6 +162,18 @@ public actor ColdProcessRestorer {
               FileManager.default.fileExists(atPath: bootstrapLibraryPath) else {
             throw ContinuumError.restoreUnavailable(
                 "Continuum's pre-main restore bootstrap is missing."
+            )
+        }
+        if process.threads.contains(where: {
+            $0.isUserspaceSafepoint == true
+        }) {
+            return try await prepareRehydratedRootProcess(
+                process: process,
+                launch: launch,
+                snapshotID: snapshotID,
+                repository: repository,
+                bootstrapLibraryPath: bootstrapLibraryPath,
+                usesDeterministicAddressSpace: usesDeterministicAddressSpace
             )
         }
 
@@ -439,6 +458,9 @@ public actor ColdProcessRestorer {
         var deferredMaximumProtectionRegionCount = 0
 
         for region in process.regions.sorted(by: { $0.address < $1.address }) {
+            if region.preservesLiveDerivedGraphics == true {
+                continue
+            }
             if process.threads.contains(where: { thread in
                 guard thread.origin == .workqueue else { return false }
                 return (thread.stackRegionAddress == region.address
@@ -736,7 +758,11 @@ public actor ColdProcessRestorer {
         preparedReplacements[preparationID] = PreparedReplacement(
             processIdentifier: replacementProcessIdentifier,
             session: session,
-            fileRollback: fileRollback
+            fileRollback: fileRollback,
+            requiresSafepointRelease: reconstructedThreads.contains {
+                $0.isUserspaceSafepoint == true
+            },
+            resumeMethod: .entryStop
         )
         retained = true
         return ColdProcessPreparation(
@@ -754,6 +780,309 @@ public actor ColdProcessRestorer {
             reconstructedFileDescriptorCount: rootDescriptors.count,
             reconstructedFileCount: fileRollback?.replacedFileCount ?? 0,
             reconstructedFileBytes: fileRollback?.replacedBytes ?? 0
+        )
+    }
+
+    /// GUI processes cannot transplant AppKit, WindowServer, or GPU-owned
+    /// heaps into a new PID. Launch the app normally to rebuild those graphs,
+    /// stop at the bootstrap's first idle main-run-loop boundary, and replace
+    /// only pages owned by Continuum's isolated app-state zone.
+    private func prepareRehydratedRootProcess(
+        process: DurableProcessImage,
+        launch: DurableLaunchContract,
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository,
+        bootstrapLibraryPath: String,
+        usesDeterministicAddressSpace: Bool
+    ) async throws -> ColdProcessPreparation {
+        let appStateRegions = process.regions.filter {
+            $0.isAppOwnedState == true
+                && $0.preservesLiveDerivedGraphics != true
+        }
+        guard !appStateRegions.isEmpty else {
+            throw ContinuumError.restoreUnavailable(
+                "This GUI snapshot has no isolated app-owned RAM to transplant safely."
+            )
+        }
+
+        var environment = launch.environment.filter {
+            !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
+                && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_REHYDRATE_STOP=")
+                && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_PATH=")
+                && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD=")
+                && !$0.hasPrefix("CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=")
+                && !$0.hasPrefix("DYLD_INSERT_LIBRARIES=")
+                && (!usesDeterministicAddressSpace
+                    || (!$0.hasPrefix("DYLD_SHARED_REGION=")
+                        && !$0.hasPrefix("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=")
+                        && !$0.hasPrefix("MallocLargeCache=")))
+        }
+        var insertedLibraries = launch.environment.first(where: {
+            $0.hasPrefix("DYLD_INSERT_LIBRARIES=")
+        }).map {
+            String($0.dropFirst("DYLD_INSERT_LIBRARIES=".count))
+                .split(separator: ":")
+                .map(String.init)
+        } ?? []
+        let bootstrapName = URL(fileURLWithPath: bootstrapLibraryPath)
+            .lastPathComponent
+        insertedLibraries.removeAll {
+            URL(fileURLWithPath: $0).lastPathComponent == bootstrapName
+        }
+        insertedLibraries.append(bootstrapLibraryPath)
+        if usesDeterministicAddressSpace {
+            environment.append("DYLD_SHARED_REGION=private")
+            environment.append("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1")
+            environment.append("MallocLargeCache=0")
+        }
+        environment.append("CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=1")
+        environment.append("CONTINUUM_BOOTSTRAP_REHYDRATE_STOP=1")
+        environment.append(
+            "DYLD_INSERT_LIBRARIES=\(insertedLibraries.joined(separator: ":"))"
+        )
+
+        var replacementProcessIdentifier: Int32 = 0
+        let spawnStatus = Self.withCStringArray(launch.arguments) { arguments in
+            Self.withCStringArray(environment) { environmentEntries in
+                launch.executablePath.withCString { executable in
+                    launch.workingDirectory.withCString { directory in
+                        continuum_spawn_process(
+                            executable,
+                            arguments,
+                            environmentEntries,
+                            directory,
+                            usesDeterministicAddressSpace ? 1 : 0,
+                            &replacementProcessIdentifier
+                        )
+                    }
+                }
+            }
+        }
+        try requireRuntimeOK(
+            spawnStatus,
+            operation: "launch a GUI rehydration replacement"
+        )
+
+        var session: OpaquePointer?
+        var retained = false
+        defer {
+            if !retained {
+                _ = Self.killAndReap(replacementProcessIdentifier)
+                if let session {
+                    continuum_remote_session_destroy(session)
+                }
+            }
+        }
+        try requireRuntimeOK(
+            continuum_wait_for_process_stop(
+                replacementProcessIdentifier,
+                15_000
+            ),
+            operation: "reach the replacement app's idle rehydration gate"
+        )
+        try requireRuntimeOK(
+            continuum_remote_session_open(
+                replacementProcessIdentifier,
+                &session
+            ),
+            operation: "open the GUI replacement task"
+        )
+        guard let session else {
+            throw ContinuumError.restoreUnavailable(
+                "The GUI replacement did not expose a task session."
+            )
+        }
+        var hasBootstrap: UInt8 = 0
+        try requireRuntimeOK(
+            bootstrapLibraryPath.withCString {
+                continuum_remote_process_has_bootstrap(
+                    replacementProcessIdentifier,
+                    $0,
+                    &hasBootstrap
+                )
+            },
+            operation: "authenticate the GUI replacement bootstrap"
+        )
+        guard hasBootstrap != 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "The GUI replacement did not load Continuum's restore bootstrap."
+            )
+        }
+
+        var reconstructedRegionCount = 0
+        var reconstructedChunkCount = 0
+        var reconstructedBytes: UInt64 = 0
+        var deferredMaximumProtectionRegionCount = 0
+        for region in appStateRegions {
+            var runtimeRegion = continuum_remote_process_region_info()
+            runtimeRegion.address = region.address
+            runtimeRegion.length = region.length
+            runtimeRegion.protection = region.protection
+            runtimeRegion.maximum_protection = region.maximumProtection
+            runtimeRegion.inheritance = region.inheritance
+            runtimeRegion.share_mode = region.shareMode
+            runtimeRegion.user_tag = region.userTag
+            var matches: UInt8 = 0
+            try requireRuntimeOK(
+                continuum_remote_session_region_matches(
+                    session,
+                    &runtimeRegion,
+                    &matches
+                ),
+                operation: "validate the replacement app-state mapping"
+            )
+            guard matches != 0 else {
+                throw ContinuumError.restoreUnavailable(
+                    "The relaunched app did not recreate its tagged state mapping at the captured address."
+                )
+            }
+        }
+        for region in appStateRegions.sorted(by: { $0.address < $1.address }) {
+            var runtimeRegion = continuum_remote_process_region_info()
+            runtimeRegion.address = region.address
+            runtimeRegion.length = region.length
+            runtimeRegion.protection = region.protection
+            runtimeRegion.maximum_protection = region.maximumProtection
+            runtimeRegion.inheritance = region.inheritance
+            runtimeRegion.share_mode = region.shareMode
+            runtimeRegion.user_tag = region.userTag
+
+            var report = continuum_remote_restore_report()
+            try requireRuntimeOK(
+                continuum_remote_session_begin_reconstruct_region(
+                    session,
+                    &runtimeRegion,
+                    &report
+                ),
+                operation: reconstructionOperation(
+                    "prepare app-owned",
+                    region: region,
+                    report: report
+                )
+            )
+            var offset: UInt64 = 0
+            for chunk in region.chunks {
+                guard chunk.logicalBytes > 0,
+                      chunk.logicalBytes <= 1_024 * 1_024,
+                      offset <= region.length,
+                      chunk.logicalBytes <= region.length - offset else {
+                    throw ContinuumError.integrityFailure(
+                        "App-owned RAM chunks exceed their captured mapping."
+                    )
+                }
+                let logicalName = chunk.artifactName
+                    ?? Self.legacyMemoryArtifactName(
+                        processIdentifier: process.processIdentifier,
+                        address: region.address,
+                        offset: offset
+                    )
+                let artifact = try await repository.artifact(
+                    for: snapshotID,
+                    logicalName: logicalName
+                )
+                guard artifact.kind == .memoryPage,
+                      UInt64(artifact.data.count) == chunk.logicalBytes,
+                      Self.sha256(artifact.data) == chunk.hash else {
+                    throw ContinuumError.integrityFailure(
+                        "App-owned RAM chunk \(logicalName) failed validation."
+                    )
+                }
+                let writeStatus = artifact.data.withUnsafeBytes { bytes in
+                    continuum_remote_session_write_reconstructed_region(
+                        session,
+                        &runtimeRegion,
+                        offset,
+                        bytes.baseAddress,
+                        bytes.count,
+                        &report
+                    )
+                }
+                try requireRuntimeOK(
+                    writeStatus,
+                    operation: reconstructionOperation(
+                        "write app-owned",
+                        region: region,
+                        report: report
+                    )
+                )
+                let (nextOffset, offsetOverflow) = offset
+                    .addingReportingOverflow(chunk.logicalBytes)
+                let (nextChunkCount, chunkCountOverflow) =
+                    reconstructedChunkCount.addingReportingOverflow(1)
+                let (nextByteCount, byteCountOverflow) = reconstructedBytes
+                    .addingReportingOverflow(chunk.logicalBytes)
+                guard !offsetOverflow,
+                      !chunkCountOverflow,
+                      !byteCountOverflow else {
+                    throw ContinuumError.integrityFailure(
+                        "App-owned RAM accounting exceeds numeric limits."
+                    )
+                }
+                offset = nextOffset
+                reconstructedChunkCount = nextChunkCount
+                reconstructedBytes = nextByteCount
+            }
+            guard offset == region.length else {
+                throw ContinuumError.integrityFailure(
+                    "App-owned RAM mapping is incomplete."
+                )
+            }
+            try requireRuntimeOK(
+                continuum_remote_session_finish_reconstruct_region(
+                    session,
+                    &runtimeRegion,
+                    &report
+                ),
+                operation: reconstructionOperation(
+                    "protect app-owned",
+                    region: region,
+                    report: report
+                )
+            )
+            if report.max_protection_verified == 0 {
+                let (next, overflow) = deferredMaximumProtectionRegionCount
+                    .addingReportingOverflow(1)
+                guard !overflow else {
+                    throw ContinuumError.integrityFailure(
+                        "App-owned RAM protection accounting exceeds numeric limits."
+                    )
+                }
+                deferredMaximumProtectionRegionCount = next
+            }
+            let (nextRegionCount, regionCountOverflow) =
+                reconstructedRegionCount.addingReportingOverflow(1)
+            guard !regionCountOverflow else {
+                throw ContinuumError.integrityFailure(
+                    "App-owned RAM region accounting exceeds numeric limits."
+                )
+            }
+            reconstructedRegionCount = nextRegionCount
+        }
+
+        let preparationID = UUID()
+        preparedReplacements[preparationID] = PreparedReplacement(
+            processIdentifier: replacementProcessIdentifier,
+            session: session,
+            fileRollback: nil,
+            requiresSafepointRelease: false,
+            resumeMethod: .rehydrateStop
+        )
+        retained = true
+        return ColdProcessPreparation(
+            id: preparationID,
+            replacementProcessIdentifier: replacementProcessIdentifier,
+            capturedProcessIdentifier: process.processIdentifier,
+            reconstructedRegionCount: reconstructedRegionCount,
+            reconstructedChunkCount: reconstructedChunkCount,
+            reconstructedBytes: reconstructedBytes,
+            deferredMaximumProtectionRegionCount:
+                deferredMaximumProtectionRegionCount,
+            reconstructedThreadCount: 0,
+            reconstructedThreadStateBytes: 0,
+            replacementThreadIdentifier: 0,
+            reconstructedFileDescriptorCount: 0,
+            reconstructedFileCount: 0,
+            reconstructedFileBytes: 0
         )
     }
 
@@ -801,10 +1130,19 @@ public actor ColdProcessRestorer {
             )
         }
 
-        let releaseStatus = continuum_remote_session_release_entry_stopped_child(
-            replacement.session,
-            replacement.processIdentifier
-        )
+        let releaseStatus: continuum_status
+        switch replacement.resumeMethod {
+        case .entryStop:
+            releaseStatus =
+                continuum_remote_session_release_entry_stopped_child(
+                    replacement.session,
+                    replacement.processIdentifier
+                )
+        case .rehydrateStop:
+            releaseStatus = kill(replacement.processIdentifier, SIGCONT) == 0
+                ? CONTINUUM_STATUS_OK
+                : CONTINUUM_STATUS_RESUME_FAILED
+        }
         guard releaseStatus == CONTINUUM_STATUS_OK else {
             if let rollback = replacement.fileRollback,
                (try? Self.updateFileTransactionState(
@@ -825,6 +1163,15 @@ public actor ColdProcessRestorer {
             }
             throw ContinuumError.restoreUnavailable(
                 "Continuum could not release the reconstructed process: \(String(cString: continuum_status_string(releaseStatus)))."
+            )
+        }
+        if replacement.requiresSafepointRelease,
+           kill(replacement.processIdentifier, SIGUSR1) != 0 {
+            _ = Self.killAndReap(replacement.processIdentifier)
+            continuum_remote_session_destroy(replacement.session)
+            preparedReplacements.removeValue(forKey: preparationID)
+            throw ContinuumError.restoreUnavailable(
+                "Continuum reconstructed the app but could not release its main-thread restore gate."
             )
         }
 

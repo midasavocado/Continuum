@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <mach/mach.h>
+#include <mach/vm_statistics.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <malloc/malloc.h>
@@ -26,11 +27,14 @@
 static volatile sig_atomic_t continuum_safepoint_release = 0;
 static volatile sig_atomic_t continuum_safepoint_requested = 0;
 static volatile sig_atomic_t continuum_preservation_active = 0;
+static volatile sig_atomic_t continuum_rehydrate_stop_requested = 0;
+static volatile sig_atomic_t continuum_rehydrate_idle_boundaries = 0;
 static CFRunLoopObserverRef continuum_safepoint_observer = NULL;
 static malloc_zone_t *continuum_app_state_zone = NULL;
 static uintptr_t continuum_main_text_start = 0;
 static uintptr_t continuum_main_text_end = 0;
 static volatile int continuum_allocator_interposition_active = 0;
+static mach_vm_address_t continuum_app_state_mapping_cursor = 0;
 
 #define CONTINUUM_INTERPOSE(replacement, replacee) \
     __attribute__((used)) static struct { \
@@ -191,6 +195,73 @@ static void continuum_prepare_app_state_zone(void) {
     }
 }
 
+__attribute__((visibility("default")))
+void *continuum_bootstrap_allocate_app_state(size_t size) {
+    if (size == 0) {
+        return NULL;
+    }
+    size_t page_size = (size_t)getpagesize();
+    if (size > SIZE_MAX - (page_size - 1)) {
+        return NULL;
+    }
+    size_t length = (size + page_size - 1) & ~(page_size - 1);
+    static const mach_vm_address_t candidates[] = {
+        UINT64_C(0x0000000140000000),
+        UINT64_C(0x0000000150000000),
+        UINT64_C(0x0000000160000000),
+        UINT64_C(0x0000000170000000),
+    };
+    if (continuum_app_state_mapping_cursor == 0) {
+        for (size_t index = 0;
+             index < sizeof(candidates) / sizeof(candidates[0]);
+             index += 1) {
+            mach_vm_address_t candidate = candidates[index];
+            kern_return_t candidate_result = mach_vm_map(
+                mach_task_self(),
+                &candidate,
+                length,
+                0,
+                VM_FLAGS_FIXED
+                    | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1),
+                MEMORY_OBJECT_NULL,
+                0,
+                FALSE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_INHERIT_NONE
+            );
+            if (candidate_result == KERN_SUCCESS
+                && candidate == candidates[index]) {
+                continuum_app_state_mapping_cursor = candidate + length;
+                memset((void *)(uintptr_t)candidate, 0, length);
+                return (void *)(uintptr_t)candidate;
+            }
+        }
+        return NULL;
+    }
+    mach_vm_address_t address = continuum_app_state_mapping_cursor;
+    kern_return_t result = mach_vm_map(
+        mach_task_self(),
+        &address,
+        length,
+        0,
+        VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1),
+        MEMORY_OBJECT_NULL,
+        0,
+        FALSE,
+        VM_PROT_READ | VM_PROT_WRITE,
+        VM_PROT_READ | VM_PROT_WRITE,
+        VM_INHERIT_NONE
+    );
+    if (result != KERN_SUCCESS
+        || address != continuum_app_state_mapping_cursor) {
+        return NULL;
+    }
+    continuum_app_state_mapping_cursor += length;
+    memset((void *)(uintptr_t)address, 0, length);
+    return (void *)(uintptr_t)address;
+}
+
 static int continuum_should_preserve_receive_right(
     ipc_space_t task,
     mach_port_name_t name
@@ -297,6 +368,14 @@ static void continuum_run_loop_safepoint(
     (void)observer;
     (void)activity;
     (void)context;
+    if (continuum_rehydrate_stop_requested
+        && activity == kCFRunLoopBeforeWaiting) {
+        continuum_rehydrate_idle_boundaries += 1;
+        if (continuum_rehydrate_idle_boundaries >= 4) {
+            continuum_rehydrate_stop_requested = 0;
+            (void)kill(getpid(), SIGSTOP);
+        }
+    }
     if (continuum_safepoint_requested) {
         continuum_preservation_active = 1;
         continuum_safepoint_requested = 0;
@@ -853,6 +932,12 @@ __attribute__((constructor))
 static void continuum_bootstrap_stop_before_main(void) {
     continuum_prepare_app_state_zone();
     continuum_bootstrap_enable_safepoints();
+    const char *rehydrate = getenv("CONTINUUM_BOOTSTRAP_REHYDRATE_STOP");
+    if (rehydrate != NULL && strcmp(rehydrate, "1") == 0) {
+        continuum_rehydrate_stop_requested = 1;
+        continuum_rehydrate_idle_boundaries = 0;
+        unsetenv("CONTINUUM_BOOTSTRAP_REHYDRATE_STOP");
+    }
     const char *requested = getenv("CONTINUUM_BOOTSTRAP_STOP");
     if (requested == NULL || strcmp(requested, "1") != 0) {
         return;

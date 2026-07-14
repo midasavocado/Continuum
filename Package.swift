@@ -19,7 +19,8 @@ let package = Package(
         ),
         .executable(name: "Continuum", targets: ["ContinuumApp"]),
         .executable(name: "ContinuumHarness", targets: ["ContinuumHarness"]),
-        .executable(name: "ContinuumExternalTarget", targets: ["ContinuumExternalTarget"])
+        .executable(name: "ContinuumExternalTarget", targets: ["ContinuumExternalTarget"]),
+        .executable(name: "ContinuumGUIExternalTarget", targets: ["ContinuumGUIExternalTarget"])
     ],
     targets: [
         .target(name: "ContinuumCore"),
@@ -58,6 +59,10 @@ let package = Package(
             dependencies: ["ContinuumCore", "ContinuumStore", "ContinuumSystem", "ContinuumRuntime"]
         ),
         .executableTarget(name: "ContinuumExternalTarget"),
+        .executableTarget(
+            name: "ContinuumGUIExternalTarget",
+            linkerSettings: [.linkedFramework("AppKit")]
+        ),
         .testTarget(name: "ContinuumCoreTests", dependencies: ["ContinuumCore"]),
         .testTarget(name: "ContinuumStoreTests", dependencies: ["ContinuumCore", "ContinuumStore"]),
         .testTarget(name: "ContinuumSystemTests", dependencies: ["ContinuumCore", "ContinuumSystem"]),

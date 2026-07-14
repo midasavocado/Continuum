@@ -82,6 +82,23 @@ continuum_status continuum_spawn_process_suspended(
     int32_t *out_process_id
 );
 
+/// Launches a direct child normally. `disable_aslr` applies Continuum's
+/// deterministic address policy without stopping the child before main.
+continuum_status continuum_spawn_process(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int disable_aslr,
+    int32_t *out_process_id
+);
+
+/// Waits until a direct child enters a SIGSTOP gate without resuming it.
+continuum_status continuum_wait_for_process_stop(
+    int32_t process_id,
+    uint32_t timeout_milliseconds
+);
+
 /// The descriptor remains open in the child despite
 /// POSIX_SPAWN_CLOEXEC_DEFAULT. Continuum uses this for a private, unlinked
 /// bootstrap handshake instead of trusting a pathname that another process
@@ -346,6 +363,8 @@ typedef struct continuum_remote_process_region_info {
     int32_t inheritance;
     uint32_t share_mode;
     uint32_t user_tag;
+    uint8_t is_app_owned_state;
+    uint8_t preserves_live_derived_graphics;
 } continuum_remote_process_region_info;
 
 typedef enum continuum_remote_thread_origin {
@@ -494,6 +513,15 @@ continuum_status continuum_remote_session_identity(
 continuum_status continuum_remote_session_inspect_process_layout(
     continuum_remote_session *session,
     continuum_remote_process_layout_info *out_info
+);
+
+/// Validates one exact existing mapping without mutating it. Rehydration uses
+/// this narrower invariant for pointer-free tagged state instead of requiring
+/// unrelated lazily loaded AppKit images to be identical.
+continuum_status continuum_remote_session_region_matches(
+    continuum_remote_session *session,
+    const continuum_remote_process_region_info *region,
+    uint8_t *out_matches
 );
 
 /// Recreates one private writable mapping inside a replacement child that is
@@ -796,6 +824,15 @@ continuum_status continuum_remote_process_group_live_status(
 continuum_status continuum_remote_process_has_app_state_zone(
     int32_t process_id,
     uint8_t *out_has_app_state_zone
+);
+
+/// Authenticates that `library_path` is loaded in the target by comparing its
+/// canonical dyld image path and Mach-O UUID. Unlike malloc_get_all_zones,
+/// this remains valid when the target has a privately slid shared region.
+continuum_status continuum_remote_process_has_bootstrap(
+    int32_t process_id,
+    const char *library_path,
+    uint8_t *out_has_bootstrap
 );
 
 continuum_status continuum_remote_process_group_copy_member_info(
