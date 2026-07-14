@@ -29,6 +29,8 @@ static volatile sig_atomic_t continuum_safepoint_release = 0;
 static volatile sig_atomic_t continuum_safepoint_requested = 0;
 static volatile sig_atomic_t continuum_preservation_active = 0;
 static CFRunLoopObserverRef continuum_safepoint_observer = NULL;
+static Class continuum_hooked_application_class = Nil;
+static IMP continuum_original_application_terminate = NULL;
 static void continuum_install_terminate_interposition(void);
 static malloc_zone_t *continuum_app_state_zone = NULL;
 static uintptr_t continuum_main_text_start = 0;
@@ -300,6 +302,7 @@ static void continuum_run_loop_safepoint(
     (void)observer;
     (void)activity;
     (void)context;
+    continuum_install_terminate_interposition();
     if (continuum_safepoint_requested) {
         continuum_preservation_active = 1;
         continuum_safepoint_requested = 0;
@@ -319,8 +322,16 @@ static void continuum_preserving_application_terminate(
     SEL command,
     id sender
 ) {
-    (void)command;
-    (void)sender;
+    if (!continuum_preservation_active) {
+        if (continuum_original_application_terminate != NULL) {
+            ((void (*)(id, SEL, id))continuum_original_application_terminate)(
+                application,
+                command,
+                sender
+            );
+        }
+        return;
+    }
     SEL hide = sel_registerName("hide:");
     ((void (*)(id, SEL, id))objc_msgSend)(application, hide, nil);
     continuum_park_on_quit();
@@ -332,17 +343,42 @@ static void continuum_preserving_application_terminate(
 
 static void continuum_install_terminate_interposition(void) {
     Class application_class = objc_getClass("NSApplication");
+    SEL shared_application = sel_registerName("sharedApplication");
     SEL terminate = sel_registerName("terminate:");
     if (application_class == Nil) {
         return;
     }
-    Method method = class_getInstanceMethod(application_class, terminate);
-    if (method != NULL) {
+    id application = ((id (*)(id, SEL))objc_msgSend)(
+        (id)application_class,
+        shared_application
+    );
+    Class runtime_class = application == nil ? Nil : object_getClass(application);
+    if (runtime_class == Nil || runtime_class == continuum_hooked_application_class) {
+        return;
+    }
+    Method method = class_getInstanceMethod(runtime_class, terminate);
+    if (method == NULL) {
+        return;
+    }
+    continuum_original_application_terminate = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(
+        runtime_class,
+        terminate,
+        (IMP)continuum_preserving_application_terminate,
+        types
+    )) {
+        method = class_getInstanceMethod(runtime_class, terminate);
+        if (method == NULL) {
+            continuum_original_application_terminate = NULL;
+            return;
+        }
         method_setImplementation(
             method,
             (IMP)continuum_preserving_application_terminate
         );
     }
+    continuum_hooked_application_class = runtime_class;
 }
 
 static void continuum_bootstrap_enable_safepoints(void) {
@@ -375,8 +411,6 @@ static void continuum_bootstrap_enable_safepoints(void) {
             kCFRunLoopCommonModes
         );
     }
-
-    continuum_install_terminate_interposition();
 }
 
 __attribute__((visibility("default"), noinline, noreturn))

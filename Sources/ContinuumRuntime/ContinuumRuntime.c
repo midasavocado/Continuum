@@ -3524,8 +3524,8 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         &quartzcore_ranges
     );
     if (status != CONTINUUM_STATUS_OK) {
-        continuum_remote_process_snapshot_destroy(snapshot);
-        return status;
+        memset(&quartzcore_ranges, 0, sizeof(quartzcore_ranges));
+        status = CONTINUUM_STATUS_OK;
     }
 
     continuum_vm_range_set app_state_ranges;
@@ -3536,9 +3536,8 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         &app_state_ranges
     );
     if (status != CONTINUUM_STATUS_OK) {
-        free(quartzcore_ranges.ranges);
-        continuum_remote_process_snapshot_destroy(snapshot);
-        return status;
+        memset(&app_state_ranges, 0, sizeof(app_state_ranges));
+        status = CONTINUUM_STATUS_OK;
     }
     snapshot->has_isolated_app_state = app_state_ranges.count > 0;
 
