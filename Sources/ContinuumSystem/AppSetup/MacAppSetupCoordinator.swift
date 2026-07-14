@@ -459,7 +459,10 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
             )
         }
         var environment = plist["LSEnvironment"] as? [String: String] ?? [:]
-        environment["CONTINUUM_PRESERVE_ON_QUIT"] = "1"
+        environment["CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS"] = "1"
+        environment["CONTINUUM_DETERMINISTIC_ADDRESS_SPACE"] = "1"
+        environment["DYLD_SHARED_REGION"] = "private"
+        environment["MallocLargeCache"] = "0"
         var insertedLibraries = environment["DYLD_INSERT_LIBRARIES"]?
             .split(separator: ":")
             .map(String.init) ?? []
@@ -494,7 +497,10 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
             format: nil
         ) as? [String: Any],
               let environment = plist["LSEnvironment"] as? [String: String],
-              environment["CONTINUUM_PRESERVE_ON_QUIT"] == "1" else {
+              environment["CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS"] == "1",
+              environment["CONTINUUM_DETERMINISTIC_ADDRESS_SPACE"] == "1",
+              environment["DYLD_SHARED_REGION"] == "private",
+              environment["MallocLargeCache"] == "0" else {
             return false
         }
         let insertedLibraries = environment["DYLD_INSERT_LIBRARIES"]?

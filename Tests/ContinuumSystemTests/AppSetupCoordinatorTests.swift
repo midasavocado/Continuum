@@ -41,7 +41,10 @@ struct AppSetupCoordinatorTests {
             ) as? [String: Any]
         )
         let environment = try #require(managedInfo["LSEnvironment"] as? [String: String])
-        #expect(environment["CONTINUUM_PRESERVE_ON_QUIT"] == "1")
+        #expect(environment["CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS"] == "1")
+        #expect(environment["CONTINUUM_DETERMINISTIC_ADDRESS_SPACE"] == "1")
+        #expect(environment["DYLD_SHARED_REGION"] == "private")
+        #expect(environment["MallocLargeCache"] == "0")
         #expect(environment["DYLD_INSERT_LIBRARIES"] == "@executable_path/../Frameworks/libContinuumBootstrap.dylib")
 
         let reloaded = fixture.coordinator()

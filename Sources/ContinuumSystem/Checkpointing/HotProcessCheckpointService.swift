@@ -252,9 +252,8 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             )
         }
         if usesInjectedSafepoints {
-            // A parked Quit has both a job-control stop and the bootstrap
-            // spin. Queue the release first, then continue; repeat briefly to
-            // cover the race where the stop finishes after restore returns.
+            // Release a main-thread capture safepoint and any temporary
+            // job-control stop left by the controller.
             for _ in 0..<3 {
                 _ = kill(handle.rootProcessIdentifier, SIGUSR1)
                 _ = kill(handle.rootProcessIdentifier, SIGCONT)

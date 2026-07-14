@@ -225,7 +225,7 @@ final class ContinuumModel {
         _ target: ProcessDescriptor
     ) async throws -> ProcessDescriptor {
         let records = try await appSetupCoordinator.records()
-        if records.contains(where: { record in
+        if let currentRecord = records.first(where: { record in
             guard case .prepared = record.state,
                   let managedURL = record.managedBundleURL,
                   let runningURL = target.app.bundleURL else {
@@ -234,78 +234,77 @@ final class ContinuumModel {
             return managedURL.resolvingSymlinksInPath().standardizedFileURL
                 == runningURL.resolvingSymlinksInPath().standardizedFileURL
         }) {
-            return target
+            let revalidated = try await appSetupCoordinator.probe(
+                currentRecord.app
+            )
+            upsertSetupRecord(revalidated)
+            if case .prepared = revalidated.state {
+                return target
+            }
         }
 
-        if try armRunningTarget(target) {
-            return target
+        let record = try await appSetupCoordinator.setup(target.app)
+        upsertSetupRecord(record)
+        if case .blocked = record.state {
+            throw ContinuumError.runtimeUnsupported(
+                "macOS protects this app's signing identity, so Continuum cannot safely prepare it for durable restore."
+            )
+        }
+        guard case .prepared = record.state,
+              let managedURL = record.managedBundleURL else {
+            throw ContinuumError.runtimeUnsupported(
+                "Continuum could not finish preparing this app for durable restore."
+            )
         }
 
+        if let running = NSRunningApplication(
+            processIdentifier: target.processIdentifier
+        ), !running.isTerminated {
+            guard running.terminate() else {
+                throw ContinuumError.runtimeUnsupported(
+                    "Continuum could not close the original app before reopening its restorable copy."
+                )
+            }
+            for _ in 0..<200 where !running.isTerminated {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            guard running.isTerminated else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The app is waiting to finish quitting. Complete any save prompt, then press Save Snapshot again."
+                )
+            }
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.createsNewApplicationInstance = true
+        let embeddedBootstrap = managedURL
+            .appendingPathComponent("Contents/Frameworks/libContinuumBootstrap.dylib")
+        configuration.environment = [
+            "CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS": "1",
+            "CONTINUUM_DETERMINISTIC_ADDRESS_SPACE": "1",
+            "DYLD_SHARED_REGION": "private",
+            "MallocLargeCache": "0",
+            "DYLD_INSERT_LIBRARIES": embeddedBootstrap.path
+        ]
+        let launched = try await NSWorkspace.shared.openApplication(
+            at: managedURL,
+            configuration: configuration
+        )
+
+        for _ in 0..<200 {
+            let processes = await inventory.runningApplications()
+            if let descriptor = processes.first(where: {
+                $0.processIdentifier == launched.processIdentifier
+                    && !$0.isTerminated
+            }) {
+                return descriptor
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
         throw ContinuumError.runtimeUnsupported(
-            "Continuum could not arm this running app without closing it, so its current state was left untouched."
+            "The restorable app copy did not finish launching."
         )
-    }
-
-    private func armRunningTarget(_ target: ProcessDescriptor) throws -> Bool {
-        guard target.processIdentifier > 0,
-              let bootstrapURL = Bundle.main.privateFrameworksURL?
-                .appendingPathComponent("libContinuumBootstrap.dylib"),
-              FileManager.default.fileExists(atPath: bootstrapURL.path),
-              let fridaURL = Self.fridaExecutableURL() else {
-            return false
-        }
-
-        let encodedPath = try JSONSerialization.data(
-            withJSONObject: [bootstrapURL.path]
-        )
-        guard let pathArray = String(data: encodedPath, encoding: .utf8) else {
-            return false
-        }
-        let script = """
-        const path = \(pathArray)[0];
-        const setenvFn = new NativeFunction(
-          Module.getGlobalExportByName('setenv'), 'int',
-          ['pointer', 'pointer', 'int']);
-        const dlopenFn = new NativeFunction(
-          Module.getGlobalExportByName('dlopen'), 'pointer',
-          ['pointer', 'int']);
-        const dlerrorFn = new NativeFunction(
-          Module.getGlobalExportByName('dlerror'), 'pointer', []);
-        setenvFn(
-          Memory.allocUtf8String('CONTINUUM_PRESERVE_ON_QUIT'),
-          Memory.allocUtf8String('1'), 1);
-        const handle = dlopenFn(Memory.allocUtf8String(path), 2);
-        if (handle.isNull()) {
-          const error = dlerrorFn();
-          throw new Error(error.isNull() ? 'dlopen failed' : error.readUtf8String());
-        }
-        """
-
-        let process = Process()
-        process.executableURL = fridaURL
-        process.arguments = [
-            "-q",
-            "-p", String(target.processIdentifier),
-            "-e", script,
-            "--exit-on-error"
-        ]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        return process.terminationReason == .exit
-            && process.terminationStatus == 0
-    }
-
-    private static func fridaExecutableURL() -> URL? {
-        let candidates = [
-            "/Library/Frameworks/Python.framework/Versions/Current/bin/frida",
-            "/opt/homebrew/bin/frida",
-            "/usr/local/bin/frida"
-        ]
-        return candidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }).map(URL.init(fileURLWithPath:))
     }
 
     func beginRewind() async {
