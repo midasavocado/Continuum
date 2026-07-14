@@ -353,11 +353,22 @@ public actor ColdProcessRestorer {
         }
 
         guard !process.threads.contains(where: {
-            $0.origin == .workqueue || $0.origin == .unknown
+            $0.origin == nil || $0.origin == .unknown
         }) else {
             throw ContinuumError.restoreUnavailable(
-                "This snapshot contains a workqueue thread whose libdispatch identity cannot be reconstructed yet."
+                "This snapshot contains a thread whose origin cannot be reconstructed safely."
             )
+        }
+        guard !process.threads.contains(where: {
+            $0.origin == .workqueue
+                && $0.preservesKernelContinuation != true
+        }) else {
+            throw ContinuumError.restoreUnavailable(
+                "A workqueue thread was executing user code when this snapshot was taken."
+            )
+        }
+        let reconstructedThreads = process.threads.filter {
+            $0.origin != .workqueue
         }
         let savedPthreads = process.threads.filter { $0.origin == .pthread }
         guard !savedPthreads.isEmpty else {
@@ -428,6 +439,15 @@ public actor ColdProcessRestorer {
         var deferredMaximumProtectionRegionCount = 0
 
         for region in process.regions.sorted(by: { $0.address < $1.address }) {
+            if process.threads.contains(where: { thread in
+                guard thread.origin == .workqueue else { return false }
+                return (thread.stackRegionAddress == region.address
+                        && thread.stackRegionLength == region.length)
+                    || (thread.pthreadRegionAddress == region.address
+                        && thread.pthreadRegionLength == region.length)
+            }) {
+                continue
+            }
             if Self.regionIntersectsPreparedPthread(
                 region,
                 entries: pthreadPlanEntries
@@ -585,22 +605,22 @@ public actor ColdProcessRestorer {
             reconstructedRegionCount = nextRegionCount
         }
 
-        guard !process.threads.isEmpty else {
+        guard !reconstructedThreads.isEmpty else {
             throw ContinuumError.restoreUnavailable(
                 "The durable process image contains no captured threads."
             )
         }
         var threadInputs: [continuum_remote_thread_reconstruction_input] = []
-        threadInputs.reserveCapacity(process.threads.count)
+        threadInputs.reserveCapacity(reconstructedThreads.count)
         var threadStateAllocations: [UnsafeMutableRawPointer] = []
-        threadStateAllocations.reserveCapacity(process.threads.count * 2)
+        threadStateAllocations.reserveCapacity(reconstructedThreads.count * 2)
         defer {
             for pointer in threadStateAllocations {
                 pointer.deallocate()
             }
         }
         var threadStateBytes: UInt64 = 0
-        for thread in process.threads {
+        for thread in reconstructedThreads {
             let generalState = try await threadStateData(
                 thread.generalState,
                 fallbackName: "threads/\(process.processIdentifier)/\(thread.threadIdentifier)-general.bin",
@@ -694,12 +714,13 @@ public actor ColdProcessRestorer {
                 "Could not reconstruct captured thread \(threadReport.validation_thread_index): \(register) address 0x\(String(threadReport.validation_address, radix: 16)) failed validation (\(detail))."
             )
         }
-        let expectedRawThreadCount = process.threads.count - savedPthreads.count
+        let expectedRawThreadCount = reconstructedThreads.count
+            - savedPthreads.count
         let reportedStateBytes = threadReport.general_state_bytes
             .addingReportingOverflow(threadReport.vector_state_bytes)
         guard threadReport.all_states_verified != 0,
               threadReport.reconstructed_thread_count
-                == UInt64(process.threads.count),
+                == UInt64(reconstructedThreads.count),
               threadReport.created_raw_thread_count
                 == UInt64(expectedRawThreadCount),
               !reportedStateBytes.overflow,
@@ -726,7 +747,7 @@ public actor ColdProcessRestorer {
             reconstructedChunkCount: reconstructedChunkCount,
             reconstructedBytes: reconstructedBytes,
             deferredMaximumProtectionRegionCount: deferredMaximumProtectionRegionCount,
-            reconstructedThreadCount: process.threads.count,
+            reconstructedThreadCount: reconstructedThreads.count,
             reconstructedThreadStateBytes: threadStateBytes,
             replacementThreadIdentifier:
                 threadReport.primary_replacement_thread_identifier,

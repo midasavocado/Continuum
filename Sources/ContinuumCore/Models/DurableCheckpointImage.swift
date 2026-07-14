@@ -156,6 +156,8 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
     public let stackRegionLength: UInt64?
     public let pthreadRegionAddress: UInt64?
     public let pthreadRegionLength: UInt64?
+    public let isUserspaceSafepoint: Bool?
+    public let preservesKernelContinuation: Bool?
     public let generalStateFlavor: UInt32
     public let generalState: DurableChunkReference
     public let vectorStateFlavor: UInt32
@@ -172,6 +174,8 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
         stackRegionLength: UInt64? = nil,
         pthreadRegionAddress: UInt64? = nil,
         pthreadRegionLength: UInt64? = nil,
+        isUserspaceSafepoint: Bool? = nil,
+        preservesKernelContinuation: Bool? = nil,
         generalStateFlavor: UInt32,
         generalState: DurableChunkReference,
         vectorStateFlavor: UInt32,
@@ -187,6 +191,8 @@ public struct DurableThreadImage: Codable, Hashable, Sendable {
         self.stackRegionLength = stackRegionLength
         self.pthreadRegionAddress = pthreadRegionAddress
         self.pthreadRegionLength = pthreadRegionLength
+        self.isUserspaceSafepoint = isUserspaceSafepoint
+        self.preservesKernelContinuation = preservesKernelContinuation
         self.generalStateFlavor = generalStateFlavor
         self.generalState = generalState
         self.vectorStateFlavor = vectorStateFlavor

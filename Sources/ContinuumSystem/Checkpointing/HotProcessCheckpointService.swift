@@ -464,6 +464,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     stackRegionLength: stackRegion?.length,
                     pthreadRegionAddress: pthreadRegion?.address,
                     pthreadRegionLength: pthreadRegion?.length,
+                    isUserspaceSafepoint:
+                        thread.is_userspace_safepoint != 0,
+                    preservesKernelContinuation:
+                        thread.preserves_kernel_continuation != 0,
                     generalStateFlavor: thread.general_state_flavor,
                     generalState: DurableChunkReference(
                         hash: Self.sha256(general),

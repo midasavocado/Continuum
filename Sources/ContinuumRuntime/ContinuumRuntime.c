@@ -3275,6 +3275,58 @@ static int continuum_region_contains_thread_stack(
 #endif
 }
 
+static int continuum_region_contains_workqueue_runtime_state(
+    const continuum_remote_thread_snapshot *threads,
+    mach_vm_address_t address,
+    mach_vm_size_t length
+) {
+#if !defined(__arm64__)
+    (void)threads;
+    (void)address;
+    (void)length;
+    return 0;
+#else
+    uint64_t end = 0;
+    if (threads == NULL || length == 0
+        || !continuum_add_u64(address, length, &end)) {
+        return 0;
+    }
+    for (size_t index = 0; index < threads->count; index += 1) {
+        const continuum_remote_thread_entry *entry = &threads->entries[index];
+        if (entry->origin != CONTINUUM_REMOTE_THREAD_ORIGIN_WORKQUEUE) {
+            continue;
+        }
+        if (entry->pthread_object_address >= address
+            && entry->pthread_object_address < end) {
+            return 1;
+        }
+        if (entry->general_flavor == ARM_THREAD_STATE64
+            && entry->general_bytes != NULL
+            && entry->general_length == sizeof(arm_thread_state64_t)) {
+            arm_thread_state64_t state;
+            memcpy(&state, entry->general_bytes, sizeof(state));
+            uintptr_t stack_pointer = arm_thread_state64_get_sp(state);
+            if (stack_pointer > address && stack_pointer <= end) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+#endif
+}
+
+static int continuum_region_overlaps_shared_cache(
+    mach_vm_address_t address,
+    mach_vm_size_t length
+) {
+    return continuum_ranges_overlap(
+        address,
+        length,
+        SHARED_REGION_BASE,
+        SHARED_REGION_SIZE
+    );
+}
+
 void continuum_remote_process_snapshot_destroy(
     continuum_remote_process_snapshot *snapshot
 ) {
@@ -3388,6 +3440,12 @@ static continuum_status continuum_validate_captured_process_layout_suspended(
             (info.protection & (VM_PROT_READ | VM_PROT_WRITE))
                 == (VM_PROT_READ | VM_PROT_WRITE);
         const int eligible = writable
+            && !continuum_region_overlaps_shared_cache(address, region_size)
+            && !continuum_region_contains_workqueue_runtime_state(
+                snapshot->threads,
+                address,
+                region_size
+            )
             && (continuum_is_private_or_cow_share_mode(info.share_mode)
                 || (info.share_mode == SM_EMPTY
                     && continuum_region_contains_thread_stack(
@@ -3587,6 +3645,12 @@ static continuum_status continuum_capture_process_snapshot_suspended(
             }
         }
         const int eligible_memory = writable
+            && !continuum_region_overlaps_shared_cache(address, region_size)
+            && !continuum_region_contains_workqueue_runtime_state(
+                snapshot->threads,
+                address,
+                region_size
+            )
             && (continuum_is_private_or_cow_share_mode(info.share_mode)
                 || (info.share_mode == SM_EMPTY
                     && continuum_region_contains_thread_stack(
