@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import ContinuumCore
 
@@ -74,11 +75,22 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
                 if case .prepared = revalidated.state {
                     return revalidated
                 }
+                if case .stale = revalidated.state {
+                    try rollback(existing.id)
+                }
             case .preparing:
                 try recoverInterruptedSetups()
+            case .stale:
+                try rollback(existing.id)
             default:
                 break
             }
+        }
+
+        guard !isBundleRunning(at: sourceURL) else {
+            throw AppSetupError.operationFailed(
+                "\(app.displayName) is running. Continuum will never replace a live app bundle; quit it normally, then run setup once."
+            )
         }
 
         var record = try createProbeRecord(
@@ -94,6 +106,9 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         let originalURL = workspaceURL.appendingPathComponent("Original.app", isDirectory: true)
         let managedURL = workspaceURL.appendingPathComponent("Managed.app", isDirectory: true)
         let entitlementsURL = workspaceURL.appendingPathComponent("ManagedAttach.entitlements", isDirectory: false)
+        let displacedOriginalURL = record.sourceURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(".Continuum-\(record.id.uuidString)-Original.app", isDirectory: true)
 
         do {
             try transition(&record, to: .preparing(.creatingWorkspace))
@@ -146,6 +161,38 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
                 throw AppSetupError.validationFailed(result.validation.detail)
             }
 
+            try transition(&record, to: .preparing(.installingManaged))
+            try fileSystem.removeItemIfPresent(at: displacedOriginalURL)
+            record.displacedOriginalURL = displacedOriginalURL
+            try persist(record)
+            _ = try fileSystem.cloneOrCopyItem(at: managedURL, to: displacedOriginalURL)
+            let stagedManaged = try probeService.inspect(
+                bundleURL: displacedOriginalURL,
+                declaredIdentity: nil
+            )
+            guard stagedManaged.fingerprint == result.managedFingerprint,
+                  try markerMatches(record, at: markerURL(in: displacedOriginalURL)) else {
+                throw AppSetupError.validationFailed(
+                    "The launch-path staging copy did not match the validated managed app."
+                )
+            }
+            guard !isBundleRunning(at: record.sourceURL) else {
+                throw AppSetupError.operationFailed(
+                    "\(record.app.displayName) launched while Continuum was preparing it. No bundle was replaced; quit it normally and try again."
+                )
+            }
+
+            try fileSystem.exchangeItems(at: record.sourceURL, and: displacedOriginalURL)
+            record.managedInstalledAtSource = true
+            try persist(record)
+
+            let installedResult = try validatePreparedRecord(record)
+            record.managedFingerprint = installedResult.managedFingerprint
+            record.validation = installedResult.validation
+            guard installedResult.isPrepared else {
+                throw AppSetupError.validationFailed(installedResult.validation.detail)
+            }
+
             record.state = .prepared
             record.updatedAt = now()
             try persist(record)
@@ -153,12 +200,13 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         } catch {
             let originalError = error
             do {
-                record.state = .preparing(.rollingBack)
-                record.updatedAt = now()
-                try persist(record)
+                try restoreOriginalIfNeeded(&record)
+                try transition(&record, to: .preparing(.rollingBack))
                 try fileSystem.removeItemIfPresent(at: workspaceURL)
                 record.originalCloneURL = nil
                 record.managedBundleURL = nil
+                record.displacedOriginalURL = nil
+                record.managedInstalledAtSource = false
                 record.originalCopyMethod = nil
                 record.managedCopyMethod = nil
                 record.managedFingerprint = nil
@@ -193,12 +241,16 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
             return record
         }
 
-        guard currentSource.fingerprint == record.sourceFingerprint else {
+        let expectedInstalledFingerprint = record.managedFingerprint
+        let sourceMatchesExpected = record.managedInstalledAtSource == true
+            ? currentSource.fingerprint == expectedInstalledFingerprint
+            : currentSource.fingerprint == record.sourceFingerprint
+        guard sourceMatchesExpected else {
             record.state = .stale
             record.updatedAt = now()
             record.validation = staleValidation(
                 previous: record.validation,
-                detail: "The source app changed after this managed copy was prepared. Set it up again for the new version."
+                detail: "The app at its launch path changed after Continuum prepared it. Continuum will not overwrite that newer app."
             )
             try persist(record)
             return record
@@ -213,6 +265,19 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         record.validation = result.validation
         record.updatedAt = now()
         if result.isPrepared {
+            if record.managedInstalledAtSource != true {
+                record.state = .stale
+                record.validation = AppSetupValidation(
+                    sourceUnchanged: result.validation.sourceUnchanged,
+                    originalCloneVerified: result.validation.originalCloneVerified,
+                    instrumentationMarkerValid: result.validation.instrumentationMarkerValid,
+                    managedSignatureValid: result.validation.managedSignatureValid,
+                    managedAttachEntitlementValid: result.validation.managedAttachEntitlementValid,
+                    restoreCertificationPassed: false,
+                    checkedAt: now(),
+                    detail: "The managed copy is valid but the normal app launch is not armed yet. Run setup while the app is quit."
+                )
+            }
             try persist(record)
             return record
         }
@@ -220,6 +285,8 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         try fileSystem.removeItemIfPresent(at: workspaceURL(for: record.id))
         record.originalCloneURL = nil
         record.managedBundleURL = nil
+        record.displacedOriginalURL = nil
+        record.managedInstalledAtSource = false
         record.originalCopyMethod = nil
         record.managedCopyMethod = nil
         record.managedFingerprint = nil
@@ -231,13 +298,14 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
 
     public func rollback(_ setupID: AppSetupID) throws {
         var record = try record(withID: setupID)
-        record.state = .preparing(.rollingBack)
-        record.updatedAt = now()
-        try persist(record)
+        try restoreOriginalIfNeeded(&record)
+        try transition(&record, to: .preparing(.rollingBack))
 
         try fileSystem.removeItemIfPresent(at: workspaceURL(for: setupID))
         record.originalCloneURL = nil
         record.managedBundleURL = nil
+        record.displacedOriginalURL = nil
+        record.managedInstalledAtSource = false
         record.originalCopyMethod = nil
         record.managedCopyMethod = nil
         record.managedFingerprint = nil
@@ -250,14 +318,19 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         var journal = try loadJournal()
         for index in journal.indices {
             guard case .preparing = journal[index].state else { continue }
+            var record = journal[index]
+            try restoreOriginalIfNeeded(&record)
             try fileSystem.removeItemIfPresent(at: workspaceURL(for: journal[index].id))
-            journal[index].originalCloneURL = nil
-            journal[index].managedBundleURL = nil
-            journal[index].originalCopyMethod = nil
-            journal[index].managedCopyMethod = nil
-            journal[index].managedFingerprint = nil
-            journal[index].state = .rolledBack
-            journal[index].updatedAt = now()
+            record.originalCloneURL = nil
+            record.managedBundleURL = nil
+            record.displacedOriginalURL = nil
+            record.managedInstalledAtSource = false
+            record.originalCopyMethod = nil
+            record.managedCopyMethod = nil
+            record.managedFingerprint = nil
+            record.state = .rolledBack
+            record.updatedAt = now()
+            journal[index] = record
             try saveJournal(journal)
         }
     }
@@ -303,6 +376,38 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
             .standardizedFileURL
     }
 
+    private func isBundleRunning(at bundleURL: URL) -> Bool {
+        let estimatedCount = proc_listallpids(nil, 0)
+        guard estimatedCount > 0 else { return false }
+        var processIdentifiers = [Int32](
+            repeating: 0,
+            count: Int(estimatedCount) + 32
+        )
+        let byteCount = Int32(processIdentifiers.count * MemoryLayout<Int32>.stride)
+        let processCount = processIdentifiers.withUnsafeMutableBytes { buffer in
+            proc_listallpids(buffer.baseAddress, byteCount)
+        }
+        guard processCount > 0 else { return false }
+
+        let bundlePrefix = bundleURL.resolvingSymlinksInPath().standardizedFileURL.path + "/"
+        for processIdentifier in processIdentifiers.prefix(Int(processCount)) where processIdentifier > 0 {
+            var pathBuffer = [CChar](repeating: 0, count: 4 * Int(PATH_MAX))
+            let pathLength = proc_pidpath(
+                processIdentifier,
+                &pathBuffer,
+                UInt32(pathBuffer.count)
+            )
+            guard pathLength > 0 else { continue }
+            let bytes = pathBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+            let executablePath = URL(fileURLWithPath: String(decoding: bytes, as: UTF8.self))
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+            if executablePath.hasPrefix(bundlePrefix) { return true }
+        }
+        return false
+    }
+
     private func existingRecord(for sourceURL: URL) throws -> AppSetupRecord? {
         try loadJournal()
             .filter { $0.sourceURL.standardizedFileURL == sourceURL.standardizedFileURL }
@@ -324,26 +429,41 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
         let managed = try probeService.inspect(bundleURL: managedURL, declaredIdentity: nil)
         let markerIsValid = try markerMatches(record, at: markerURL(in: managedURL))
 
-        let sourceUnchanged = currentSource.fingerprint == expectedSource
+        let sourceUnchanged = record.managedInstalledAtSource == true
+            ? currentSource.fingerprint == managed.fingerprint
+            : currentSource.fingerprint == expectedSource
         let originalVerified = original.fingerprint == expectedSource
         let signatureValid = managed.isSigned && managed.isAdHocSigned && managed.signatureValid
         let attachEntitlementValid = managed.hasAttachEntitlement
         let bootstrapValid = try validateManagedBootstrap(in: managedURL)
+        let installedMarkerValid: Bool
+        if record.managedInstalledAtSource == true {
+            installedMarkerValid = try markerMatches(
+                record,
+                at: markerURL(in: record.sourceURL)
+            )
+        } else {
+            installedMarkerValid = true
+        }
         let prepared = sourceUnchanged
             && originalVerified
             && markerIsValid
+            && installedMarkerValid
             && signatureValid
             && attachEntitlementValid
             && bootstrapValid
 
         let detail: String
         if prepared {
-            detail = "The vendor source is unchanged. Original.app is verified, and Managed.app is ad-hoc signed with get-task-allow for the generic Mach controller. Functional rewind certification is still pending."
+            detail = record.managedInstalledAtSource == true
+                ? "The verified vendor original is preserved, and the normal launch path now uses Continuum's signed checkpoint runtime. Functional rewind certification is still checked when a snapshot is saved."
+                : "The vendor source is unchanged. Original.app is verified, and Managed.app is ad-hoc signed with get-task-allow for the generic Mach controller. Functional rewind certification is still pending."
         } else {
             var failures: [String] = []
             if !sourceUnchanged { failures.append("source changed") }
             if !originalVerified { failures.append("Original.app no longer matches the source") }
             if !markerIsValid { failures.append("managed instrumentation marker is missing or invalid") }
+            if !installedMarkerValid { failures.append("the normal launch path is not armed") }
             if !signatureValid { failures.append("managed ad-hoc signature is invalid") }
             if !attachEntitlementValid { failures.append("get-task-allow is missing") }
             if !bootstrapValid { failures.append("checkpoint runtime or its launch configuration is missing") }
@@ -382,6 +502,47 @@ public actor MacAppSetupCoordinator: AppSetupCoordinating {
     private func transition(_ record: inout AppSetupRecord, to state: AppSetupState) throws {
         record.state = state
         record.updatedAt = now()
+        try persist(record)
+    }
+
+    private func restoreOriginalIfNeeded(_ record: inout AppSetupRecord) throws {
+        guard let displacedOriginalURL = record.displacedOriginalURL else {
+            record.managedInstalledAtSource = false
+            return
+        }
+
+        let sourceIsManaged = (try? markerMatches(
+            record,
+            at: markerURL(in: record.sourceURL)
+        )) == true
+        if sourceIsManaged {
+            guard !isBundleRunning(at: record.sourceURL) else {
+                throw AppSetupError.operationFailed(
+                    "\(record.app.displayName) is running. Continuum will not restore its vendor bundle until that process exits normally."
+                )
+            }
+            guard fileSystem.itemExists(at: displacedOriginalURL) else {
+                throw AppSetupError.operationFailed(
+                    "The armed app is missing its preserved vendor bundle at \(displacedOriginalURL.path)."
+                )
+            }
+            try transition(&record, to: .preparing(.restoringOriginal))
+            try fileSystem.exchangeItems(at: record.sourceURL, and: displacedOriginalURL)
+            let restored = try probeService.inspect(
+                bundleURL: record.sourceURL,
+                declaredIdentity: record.app
+            )
+            guard restored.fingerprint == record.sourceFingerprint else {
+                try? fileSystem.exchangeItems(at: record.sourceURL, and: displacedOriginalURL)
+                throw AppSetupError.validationFailed(
+                    "The preserved vendor app did not match its verified setup fingerprint."
+                )
+            }
+        }
+
+        try fileSystem.removeItemIfPresent(at: displacedOriginalURL)
+        record.displacedOriginalURL = nil
+        record.managedInstalledAtSource = false
         try persist(record)
     }
 

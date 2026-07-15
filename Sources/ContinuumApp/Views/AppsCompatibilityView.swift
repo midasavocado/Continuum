@@ -87,7 +87,7 @@ struct AppsCompatibilityView: View {
                     ContentUnavailableView {
                         Label("Choose an app to check", systemImage: "arrow.counterclockwise.circle")
                     } description: {
-                        Text("Continuum never installs inside the app you select. It first checks whether the running app can safely participate in a future rewind.")
+                        Text("Choose an app to arm its normal Finder and Dock launch for snapshots. Continuum preserves the vendor original first.")
                     }
                     .frame(minWidth: 430, maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -105,10 +105,14 @@ struct AppsCompatibilityView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Choose what you want to rewind")
                         .font(.title2.weight(.semibold))
-                    Text("Continuum checks the app you choose. It does not install anything inside that app.")
+                    Text("Arm an eligible app once, then open it normally from Finder or the Dock.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if batchCandidateCount > 0 {
+                    Button("Arm Eligible Apps", action: onSetupEligibleApps)
+                        .disabled(isBatchSetupInProgress)
+                }
                 Button("Choose App…", action: chooseTarget)
                     .buttonStyle(.borderedProminent)
                     .disabled(isBatchSetupInProgress)
@@ -145,7 +149,7 @@ struct AppsCompatibilityView: View {
 
             HStack(spacing: 8) {
                 Label(
-                    "Advanced setup is optional and creates a separate Continuum-owned test copy. Your original app is never edited.",
+                    "Arming is reversible: Continuum preserves and verifies the vendor bundle before changing the normal launch path.",
                     systemImage: "shield.lefthalf.filled"
                 )
                 .font(.caption)
@@ -227,7 +231,7 @@ struct AppsCompatibilityView: View {
     private func chooseTarget() {
         let panel = NSOpenPanel()
         panel.title = "Choose an App to Check"
-        panel.message = "Choose a macOS app or runnable executable. Continuum will inspect it first and will never modify the app you select."
+        panel.message = "Choose a macOS app. Continuum checks it before offering a reversible armed installation."
         panel.prompt = "Choose App"
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
@@ -270,10 +274,10 @@ private struct AppSetupDetailView: View {
             "Remove Continuum setup for \(entry.app.displayName)?",
             isPresented: $isConfirmingRemoval
         ) {
-            Button("Remove Managed Copy", role: .destructive, action: onRemoveSetup)
+            Button("Restore Vendor App", role: .destructive, action: onRemoveSetup)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Continuum deletes its managed copy and original backup, then keeps a small removal receipt. The selected source app remains untouched.")
+            Text("Continuum atomically restores the verified vendor bundle to its normal launch path, then removes its managed copies.")
         }
     }
 
@@ -314,7 +318,7 @@ private struct AppSetupDetailView: View {
 
                     if entry.record?.state == .prepared {
                         Label(
-                            "This is a separate test copy in Continuum’s own storage—not an installation inside \(entry.app.displayName).",
+                            "The normal \(entry.app.displayName) launch is armed. Its verified vendor bundle is preserved for one-click rollback.",
                             systemImage: "checkmark.shield.fill"
                         )
                         .font(.caption)
@@ -353,19 +357,19 @@ private struct AppSetupDetailView: View {
                     .font(.headline)
                 factRow("Selected app", entry.sourceURL.path)
                 factRow("Running", isRunning ? "Yes" : "No")
-                factRow("Original app", "Never changed")
+                factRow("Vendor original", entry.record?.managedInstalledAtSource == true ? "Preserved for rollback" : "Currently installed")
                 factRow(
                     "Snapshot restore",
                     experimentalHotEnabled
-                        ? (isRunning ? "Available to try" : "Launch the app first")
+                        ? (isRunning ? "Checked when you save" : "Launch the app normally")
                         : "Runtime unavailable"
                 )
 
                 if let record = entry.record {
                     factRow("Last checked", record.updatedAt.formatted(date: .abbreviated, time: .shortened))
                     factRow(
-                        "Source unchanged",
-                        record.validation?.sourceUnchanged == true ? "Verified" : "Not yet verified"
+                        "Normal launch",
+                        record.managedInstalledAtSource == true ? "Armed" : "Not armed"
                     )
                     factRow(
                         "Attach entitlement",
@@ -383,7 +387,8 @@ private struct AppSetupDetailView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             factRow("Original backup", record.originalCloneURL?.path ?? "Not created")
                             factRow("Test copy", record.managedBundleURL?.path ?? "Not created")
-                            Text("These are Continuum-owned copies outside the selected app. Remove Setup deletes only these copies.")
+                            factRow("Displaced vendor app", record.displacedOriginalURL?.path ?? "Not installed")
+                            Text("Remove Setup swaps the verified vendor app back before deleting Continuum's copies.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -413,12 +418,12 @@ private struct AppSetupDetailView: View {
                         .buttonStyle(.borderedProminent)
 
                 case .discovered:
-                    DisclosureGroup("Advanced setup") {
+                    DisclosureGroup("Arm for snapshots") {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Optional. Continuum creates a separate test copy in its own storage. It never edits this app, and it does not make rewind work by itself.")
+                            Text("Quit this app first. Continuum preserves the vendor bundle, installs its validated runtime at the normal launch path, and restores the original automatically if any check fails.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Button("Prepare Separate Test Copy", action: onSetupManagedCopy)
+                            Button("Arm App", action: onSetupManagedCopy)
                         }
                         .frame(maxWidth: 360, alignment: .leading)
                     }
@@ -428,10 +433,22 @@ private struct AppSetupDetailView: View {
                         .controlSize(.small)
                     Text("Recovering setup…")
 
-                case .prepared, .stale:
-                    Button("Check Again", action: onRecheckSetup)
+                case .prepared:
+                    if entry.record?.managedInstalledAtSource == true {
+                        Button("Check Again", action: onRecheckSetup)
+                            .buttonStyle(.borderedProminent)
+                        Button("Restore Vendor App…", role: .destructive) {
+                            isConfirmingRemoval = true
+                        }
+                    } else {
+                        Button("Arm App", action: onSetupManagedCopy)
+                            .buttonStyle(.borderedProminent)
+                    }
+
+                case .stale:
+                    Button("Arm Updated App", action: onSetupManagedCopy)
                         .buttonStyle(.borderedProminent)
-                    Button("Remove Test Copy…", role: .destructive) {
+                    Button("Remove Setup…", role: .destructive) {
                         isConfirmingRemoval = true
                     }
 
@@ -447,7 +464,7 @@ private struct AppSetupDetailView: View {
             Spacer()
 
             if entry.status == .prepared {
-                Label("Separate test copy only", systemImage: "info.circle")
+                Label("Normal launch armed", systemImage: "checkmark.shield.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -458,9 +475,12 @@ private struct AppSetupDetailView: View {
     private var stateTitle: String {
         switch entry.record?.state {
         case nil: "Ready to check"
-        case .discovered: "Optional test copy is available"
+        case .discovered: "Ready to arm"
         case let .preparing(stage): stage.title
-        case .prepared: "Separate test copy ready"
+        case .prepared:
+            entry.record?.managedInstalledAtSource == true
+                ? "Normal app launch is armed"
+                : "Ready to arm"
         case .stale: "Setup needs to be refreshed"
         case .blocked: "Setup is protected"
         case .rolledBack: "Setup was safely removed"
@@ -473,17 +493,19 @@ private struct AppSetupDetailView: View {
         case nil:
             "Continuum has not changed anything. Check Setup performs a read-only compatibility probe."
         case .discovered:
-            "Compatibility check passed for the optional test-copy route. You do not need this to choose or inspect the app."
+            "Compatibility check passed. Quit the app, then arm it once so future normal launches can be snapshotted."
         case let .preparing(stage):
-            "Continuum is \(stage.progressDescription). The selected source remains untouched."
+            "Continuum is \(stage.progressDescription). Every destructive step has a verified rollback path."
         case .prepared:
-            "Continuum’s separate test copy passed its own checks. The selected app is untouched, and rewind stays disabled until restore certification passes."
+            entry.record?.managedInstalledAtSource == true
+                ? "Finder and Dock now launch the armed app. Snapshot restore is still certified against the live process every time you save."
+                : "The older managed copy passed validation but was never installed. Quit the app and arm its normal launch path."
         case .stale:
-            "The source app changed after setup. Recheck it before using the managed copy."
+            "The app changed after setup. Continuum will not overwrite the newer bundle."
         case .blocked:
             "Continuum stopped before making an unsafe copy. The blockers below come from the same generic setup probe used for every app."
         case .rolledBack:
-            "Continuum removed its managed artifacts without changing the selected source."
+            "Continuum restored the verified vendor app and removed its managed artifacts."
         case let .failed(detail):
             detail
         }
@@ -576,7 +598,10 @@ private struct AppSetupEntry: Identifiable {
     var status: AppSetupDisplayStatus {
         if let record {
             switch record.state {
-            case .prepared: return .prepared
+            case .prepared:
+                return record.managedInstalledAtSource == true
+                    ? .prepared
+                    : .needsAttention
             case .blocked: return .protected
             case .discovered, .preparing, .stale, .rolledBack, .failed:
                 return .needsAttention
@@ -594,9 +619,12 @@ private struct AppSetupEntry: Identifiable {
     var secondaryStatus: String {
         switch record?.state {
         case nil: status == .protected ? "Check protection" : "Not checked"
-        case .discovered: "Ready for managed setup"
+        case .discovered: "Ready to arm"
         case let .preparing(stage): stage.title
-        case .prepared: "Managed copy verified"
+        case .prepared:
+            record?.managedInstalledAtSource == true
+                ? "Normal launch armed"
+                : "Ready to arm"
         case .stale: "Source changed"
         case .blocked: "Setup blocked"
         case .rolledBack: "Setup removed"
@@ -607,8 +635,9 @@ private struct AppSetupEntry: Identifiable {
     var canJoinBatchSetup: Bool {
         guard status == .needsAttention else { return false }
         switch record?.state {
-        case nil, .discovered: return true
-        case .preparing, .prepared, .stale, .blocked, .rolledBack, .failed:
+        case nil, .discovered, .stale, .rolledBack, .failed: return true
+        case .prepared: return record?.managedInstalledAtSource != true
+        case .preparing, .blocked:
             return false
         }
     }
@@ -702,6 +731,8 @@ private extension AppSetupStage {
         case .instrumenting: "Preparing attach-enabled copy"
         case .signing: "Signing managed copy"
         case .validating: "Validating every artifact"
+        case .installingManaged: "Arming the normal app"
+        case .restoringOriginal: "Restoring the vendor app"
         case .rollingBack: "Rolling back safely"
         }
     }
@@ -715,6 +746,8 @@ private extension AppSetupStage {
         case .instrumenting: "adding only the managed attach entitlement"
         case .signing: "signing the managed app bundle"
         case .validating: "verifying the source, clones, marker, entitlements, and signature"
+        case .installingManaged: "atomically arming the app's normal launch path"
+        case .restoringOriginal: "atomically restoring the preserved vendor app"
         case .rollingBack: "removing partial managed artifacts"
         }
     }

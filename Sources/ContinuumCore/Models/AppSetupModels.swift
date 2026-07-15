@@ -14,6 +14,8 @@ public enum AppSetupStage: String, Codable, Sendable {
     case instrumenting
     case signing
     case validating
+    case installingManaged
+    case restoringOriginal
     case rollingBack
 }
 
@@ -157,6 +159,8 @@ public struct AppSetupRecord: Codable, Hashable, Identifiable, Sendable {
     public var state: AppSetupState
     public var originalCloneURL: URL?
     public var managedBundleURL: URL?
+    public var displacedOriginalURL: URL?
+    public var managedInstalledAtSource: Bool?
     public var originalCopyMethod: AppSetupCopyMethod?
     public var managedCopyMethod: AppSetupCopyMethod?
     public var managedFingerprint: AppFingerprint?
@@ -173,6 +177,8 @@ public struct AppSetupRecord: Codable, Hashable, Identifiable, Sendable {
         state: AppSetupState,
         originalCloneURL: URL? = nil,
         managedBundleURL: URL? = nil,
+        displacedOriginalURL: URL? = nil,
+        managedInstalledAtSource: Bool? = nil,
         originalCopyMethod: AppSetupCopyMethod? = nil,
         managedCopyMethod: AppSetupCopyMethod? = nil,
         managedFingerprint: AppFingerprint? = nil,
@@ -188,6 +194,8 @@ public struct AppSetupRecord: Codable, Hashable, Identifiable, Sendable {
         self.state = state
         self.originalCloneURL = originalCloneURL
         self.managedBundleURL = managedBundleURL
+        self.displacedOriginalURL = displacedOriginalURL
+        self.managedInstalledAtSource = managedInstalledAtSource
         self.originalCopyMethod = originalCopyMethod
         self.managedCopyMethod = managedCopyMethod
         self.managedFingerprint = managedFingerprint

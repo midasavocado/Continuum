@@ -22,7 +22,13 @@ enum ManagedAppSetupCommand {
             URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath)
                 .standardizedFileURL
         }
-        let coordinator = MacAppSetupCoordinator(rootDirectory: rootURL)
+        let bootstrapURL = ProcessInfo.processInfo.environment[
+            "CONTINUUM_BOOTSTRAP_LIBRARY_PATH"
+        ].map { URL(fileURLWithPath: $0).standardizedFileURL }
+        let coordinator = MacAppSetupCoordinator(
+            rootDirectory: rootURL,
+            bootstrapLibraryURL: bootstrapURL
+        )
         try await coordinator.recoverInterruptedSetups()
 
         let record = if checkOnly {
@@ -37,6 +43,7 @@ enum ManagedAppSetupCommand {
         if let managedBundleURL = record.managedBundleURL {
             print("  managed copy:          \(managedBundleURL.path)")
         }
+        print("  normal launch armed:   \(yesNo(record.managedInstalledAtSource == true))")
         if let validation = record.validation {
             print("  source unchanged:      \(yesNo(validation.sourceUnchanged))")
             print("  original verified:     \(yesNo(validation.originalCloneVerified))")
@@ -52,7 +59,7 @@ enum ManagedAppSetupCommand {
                 print("  next:                  rerun without --check-only to prepare it")
             }
         case .prepared:
-            print("  result:                managed target prepared for runtime certification")
+            print("  result:                normal app launch armed for runtime certification")
         case let .blocked(blockers):
             for blocker in blockers {
                 print("  blocked:               \(blocker.summary)")

@@ -10,7 +10,7 @@ Continuum requires macOS 15 or later. The cooperative signed proof works through
 
 - A native SwiftUI consumer shell with resumable onboarding, plain-language limits, real opt-in Accessibility and Screen Recording request actions, storage selection, and a self-contained rewind demo.
 - A broad inventory of running window owners and installed `.app` bundles, plus explicit selection of an app or executable anywhere on disk.
-- One generic managed-copy setup pipeline for eligible app bundles: probe, preserve a verified original, clone a separate managed copy, add only Continuum's marker, ad-hoc sign it with `get-task-allow`, validate every artifact, persist the result, and roll back partial failures.
+- One generic arming pipeline for eligible app bundles: probe, preserve a verified original, build and validate a managed copy, then atomically exchange it into the app's normal launch path. Rollback atomically restores the vendor bundle; setup never terminates or replaces a running process.
 - Exact blockers for Apple platform binaries, sandbox or identity-bound apps, App Store/DRM targets, restricted entitlements, unsupported nested code, malformed bundles, and standalone executables that cannot use the current bundle route.
 - A floating native snapshot picker opened by a configurable global shortcut, with arrow-key navigation, Return to restore, Escape to cancel, and clear Ready or Unavailable states.
 - Global `Control–Option–Command–S` hot-snapshot registration plus safe rewind-shortcut presets while Continuum is running.
@@ -25,7 +25,7 @@ Continuum requires macOS 15 or later. The cooperative signed proof works through
 - Snapshot metadata and UI language for per-app capture groups and process-only restore with current files left unchanged.
 - Command-line setup, memory, external-target, and transaction proofs, plus tests for models, storage, setup recovery, app inventory, permissions, hotkeys, and runtime primitives.
 
-The app deliberately distinguishes **Managed Copy Prepared** from rewind certification. Preparation makes an eligible copy attachable for the next runtime gate; it does not enable **Play from Here**.
+The app deliberately distinguishes **Normal Launch Armed** from rewind certification. Arming ensures the runtime is present before startup; each saved process still has to pass the cold-restore gate before Restore is enabled.
 
 ## What v0.3 does not implement
 
@@ -84,7 +84,7 @@ Run the real generic setup probe or setup transaction with:
 ./script/setup_app.sh "/path/to/Some App.app"
 ```
 
-The second command creates `Original.app` and `Managed.app` under Continuum's Application Support setup directory. It never edits the selected source. `PREPARED` means the copies, signature, marker, and attach entitlement passed validation; the command still prints `restore certified: no`.
+The second command requires the target app to be quit. It creates verified `Original.app` and `Managed.app` copies, then atomically installs the managed bundle at the app's existing Finder/Dock path while retaining the displaced vendor bundle. Rollback swaps the vendor bundle back before deleting setup data. `PREPARED` still means launch arming, not blanket restore certification.
 
 Run the signed cooperative external-memory proof with:
 
@@ -148,7 +148,7 @@ The first functional baseline is not cheap: depending on the app, it may be hund
 
 Real snapshots can contain extremely sensitive material: document text, window titles, paths, credentials in memory, personal messages, and screen content. Treat a Continuum store like an unlocked session of the captured app even when its chunks are encrypted.
 
-The v0.3 design keeps data local, does not install a privileged daemon, never changes SIP state, and never edits the selected vendor source. This development Mac is currently SIP-disabled by the user for task-port research. The opt-in setup route creates and re-signs a separate managed copy inside Continuum's private Application Support directory. Do not add broad capture, Full Disk Access, source-bundle mutation, or network synchronization without explicit scope UI, stable code signing, a threat review, tested rollback, and a clear deletion path.
+The v0.3 design keeps data local, does not install a privileged daemon, and never changes SIP state. This development Mac is currently SIP-disabled by the user for task-port research. The opt-in arming route preserves the vendor bundle, installs only a separately prepared and validated copy at the same launch path, and has a crash-tested atomic rollback. Apple, sandboxed, DRM, identity-bound, and unsupported nested-code apps remain blocked rather than having their signatures weakened silently.
 
 ## Uninstall the development build
 

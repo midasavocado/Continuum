@@ -5,7 +5,7 @@ import ContinuumCore
 
 @Suite("Generic managed-copy app setup")
 struct AppSetupCoordinatorTests {
-    @Test("Prepares one generic managed copy without modifying the vendor source")
+    @Test("Atomically arms the normal launch path while preserving the vendor original")
     func preparesManagedCopy() async throws {
         let fixture = try SetupFixture()
         defer { fixture.remove() }
@@ -21,6 +21,7 @@ struct AppSetupCoordinatorTests {
         #expect(record.validation?.managedSignatureValid == true)
         #expect(record.validation?.managedAttachEntitlementValid == true)
         #expect(record.validation?.restoreCertificationPassed == false)
+        #expect(record.managedInstalledAtSource == true)
         #expect(try Data(contentsOf: fixture.sourceTokenURL) == sourceTokenBefore)
 
         let originalURL = try #require(record.originalCloneURL)
@@ -29,7 +30,8 @@ struct AppSetupCoordinatorTests {
         #expect(FileManager.default.fileExists(atPath: managedURL.path))
         #expect(!FileManager.default.fileExists(atPath: markerURL(in: originalURL).path))
         #expect(FileManager.default.fileExists(atPath: markerURL(in: managedURL).path))
-        #expect(!FileManager.default.fileExists(atPath: markerURL(in: fixture.sourceURL).path))
+        #expect(FileManager.default.fileExists(atPath: markerURL(in: fixture.sourceURL).path))
+        #expect(FileManager.default.fileExists(atPath: try #require(record.displacedOriginalURL).path))
         let embeddedBootstrap = managedURL
             .appendingPathComponent("Contents/Frameworks/libContinuumBootstrap.dylib")
         #expect(try Data(contentsOf: embeddedBootstrap) == Data(contentsOf: fixture.bootstrapURL))
@@ -98,6 +100,33 @@ struct AppSetupCoordinatorTests {
         #expect(FileManager.default.fileExists(atPath: workspaceURL.path))
     }
 
+    @Test("A vendor update replaces the old armed backup without orphaning it")
+    func vendorUpdateRearmsCurrentVersion() async throws {
+        let fixture = try SetupFixture()
+        defer { fixture.remove() }
+        let coordinator = fixture.coordinator()
+        let first = try await coordinator.setup(fixture.app)
+        let preservedOriginal = try #require(first.originalCloneURL)
+
+        try FileManager.default.removeItem(at: fixture.sourceURL)
+        try FileManager.default.copyItem(at: preservedOriginal, to: fixture.sourceURL)
+        try Data("version-two".utf8).write(to: fixture.sourceTokenURL, options: .atomic)
+
+        let updated = try await coordinator.setup(fixture.app)
+        let hiddenBackups = try FileManager.default.contentsOfDirectory(
+            at: fixture.parentURL,
+            includingPropertiesForKeys: nil
+        ).filter {
+            $0.lastPathComponent.hasPrefix(".Continuum-")
+                && $0.lastPathComponent.hasSuffix("-Original.app")
+        }
+
+        #expect(updated.managedInstalledAtSource == true)
+        #expect(updated.sourceFingerprint == FixtureProbe.fingerprint(token: "version-two"))
+        #expect(FileManager.default.fileExists(atPath: markerURL(in: fixture.sourceURL).path))
+        #expect(hiddenBackups.count == 1)
+    }
+
     @Test("Repeated probe and setup reuse one durable record and workspace")
     func repeatedSetupIsIdempotent() async throws {
         let fixture = try SetupFixture()
@@ -134,6 +163,8 @@ struct AppSetupCoordinatorTests {
         #expect(!FileManager.default.fileExists(atPath: workspaceURL.path))
         #expect(FileManager.default.fileExists(atPath: unrelatedURL.path))
         #expect(FileManager.default.fileExists(atPath: fixture.sourceURL.path))
+        #expect(!FileManager.default.fileExists(atPath: markerURL(in: fixture.sourceURL).path))
+        #expect(try Data(contentsOf: fixture.sourceTokenURL) == Data("version-one".utf8))
         #expect(try await coordinator.records().first?.state == .rolledBack)
     }
 
@@ -168,6 +199,31 @@ struct AppSetupCoordinatorTests {
 
         #expect(!FileManager.default.fileExists(atPath: workspaceURL.path))
         #expect(FileManager.default.fileExists(atPath: fixture.sourceURL.path))
+        #expect(try await coordinator.records().first?.state == .rolledBack)
+    }
+
+    @Test("Interrupted armed installation restores the vendor launch path")
+    func recoversInterruptedInstalledBundle() async throws {
+        let fixture = try SetupFixture()
+        defer { fixture.remove() }
+        let prepared = try await fixture.coordinator().setup(fixture.app)
+        #expect(FileManager.default.fileExists(atPath: markerURL(in: fixture.sourceURL).path))
+
+        var interrupted = prepared
+        interrupted.state = .preparing(.installingManaged)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode([interrupted]).write(
+            to: fixture.rootURL.appendingPathComponent("SetupJournal.json"),
+            options: .atomic
+        )
+
+        let coordinator = fixture.coordinator()
+        try await coordinator.recoverInterruptedSetups()
+
+        #expect(!FileManager.default.fileExists(atPath: markerURL(in: fixture.sourceURL).path))
+        #expect(try Data(contentsOf: fixture.sourceTokenURL) == Data("version-one".utf8))
         #expect(try await coordinator.records().first?.state == .rolledBack)
     }
 

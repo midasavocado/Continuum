@@ -37,6 +37,25 @@ struct LocalAppSetupFileSystem: AppSetupFileSystem {
         return .fileCopy
     }
 
+    func exchangeItems(at firstURL: URL, and secondURL: URL) throws {
+        let status: Int32 = firstURL.withUnsafeFileSystemRepresentation { firstPath in
+            secondURL.withUnsafeFileSystemRepresentation { secondPath in
+                guard let firstPath, let secondPath else { return Int32(-1) }
+                return renameatx_np(
+                    AT_FDCWD,
+                    firstPath,
+                    AT_FDCWD,
+                    secondPath,
+                    UInt32(RENAME_SWAP)
+                )
+            }
+        }
+        guard status == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try synchronizeDirectory(at: firstURL.deletingLastPathComponent())
+    }
+
     func readData(at url: URL) throws -> Data {
         try Data(contentsOf: url, options: [.mappedIfSafe])
     }

@@ -574,15 +574,34 @@ final class ContinuumModel {
         }
 
         var failures: [String] = []
+        let liveProcesses = await inventory.runningApplications()
+        runningProcesses = liveProcesses
         for app in installedApps.sorted(by: Self.appSort) {
+            if app.bundleIdentifier == Bundle.main.bundleIdentifier {
+                continue
+            }
+            let sourcePath = Self.sourceKey(for: app)
+            let isRunning = liveProcesses.contains { process in
+                guard !process.isTerminated else { return false }
+                let identifiersMatch = app.bundleIdentifier != nil
+                    && process.app.bundleIdentifier == app.bundleIdentifier
+                return identifiersMatch
+                    || Self.sourceKey(for: process.app) == sourcePath
+            }
+            if isRunning {
+                continue
+            }
+
             let key = Self.sourceKey(for: app)
             var record = setupRecord(for: app)
 
             if let record {
                 switch record.state {
-                case .prepared, .blocked, .preparing, .stale, .failed, .rolledBack:
+                case .prepared where record.managedInstalledAtSource == true:
                     continue
-                case .discovered:
+                case .blocked, .preparing:
+                    continue
+                case .prepared, .discovered, .stale, .failed, .rolledBack:
                     break
                 }
             } else {
@@ -598,7 +617,7 @@ final class ContinuumModel {
                 }
             }
 
-            guard let record, case .discovered = record.state else {
+            guard record != nil else {
                 setupOperations[key] = nil
                 continue
             }

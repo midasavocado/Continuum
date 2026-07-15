@@ -20,6 +20,7 @@ protocol AppSetupFileSystem: Sendable {
     func createDirectory(at url: URL) throws
     func removeItemIfPresent(at url: URL) throws
     func cloneOrCopyItem(at sourceURL: URL, to destinationURL: URL) throws -> AppSetupCopyMethod
+    func exchangeItems(at firstURL: URL, and secondURL: URL) throws
     func readData(at url: URL) throws -> Data
     func writeDataAtomically(_ data: Data, to url: URL) throws
 }
