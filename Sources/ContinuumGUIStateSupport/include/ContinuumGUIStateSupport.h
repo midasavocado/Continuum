@@ -26,6 +26,16 @@ continuum_gui_state *continuum_gui_state_create_on_worker(
     uint64_t counter
 );
 
+/// Creates one app-defined Objective-C model object through the ordinary
+/// allocation path and retains it for the lifetime of the proof process.
+uintptr_t continuum_gui_object_state_create(
+    uint64_t magic,
+    uint64_t counter
+);
+uint64_t continuum_gui_object_state_magic(void);
+uint64_t continuum_gui_object_state_counter(void);
+void continuum_gui_object_state_add(uint64_t amount);
+
 #ifdef __cplusplus
 }
 #endif

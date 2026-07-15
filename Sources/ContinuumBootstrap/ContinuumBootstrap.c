@@ -10,6 +10,8 @@
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <malloc/malloc.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -33,7 +35,14 @@ static CFRunLoopObserverRef continuum_safepoint_observer = NULL;
 static malloc_zone_t *continuum_app_state_zone = NULL;
 static uintptr_t continuum_main_text_start = 0;
 static uintptr_t continuum_main_text_end = 0;
+static char continuum_main_image_path[PATH_MAX];
 static volatile int continuum_allocator_interposition_active = 0;
+static volatile int continuum_objc_interposition_active = 0;
+
+extern id objc_alloc(Class cls);
+extern id objc_allocWithZone(Class cls);
+extern id objc_alloc_init(Class cls);
+extern id objc_opt_new(Class cls);
 
 enum {
     CONTINUUM_APP_STATE_ALLOCATION_LIMIT = 16384,
@@ -529,10 +538,187 @@ static void *continuum_state_typed_calloc(
         : result;
 }
 
+static int continuum_class_method_matches_root(
+    Class cls,
+    Class root,
+    const char *selector_name
+) {
+    if (cls == Nil || root == Nil || selector_name == NULL) {
+        return 0;
+    }
+    SEL selector = sel_registerName(selector_name);
+    Method method = class_getClassMethod(cls, selector);
+    Method root_method = class_getClassMethod(root, selector);
+    return method != NULL && root_method != NULL
+        && method_getImplementation(method)
+            == method_getImplementation(root_method);
+}
+
+static int continuum_ivar_is_scalar(Ivar ivar) {
+    const char *encoding = ivar == NULL ? NULL : ivar_getTypeEncoding(ivar);
+    if (encoding == NULL || encoding[0] == '\0') {
+        return 0;
+    }
+    switch (encoding[0]) {
+    case 'c':
+    case 'C':
+    case 's':
+    case 'S':
+    case 'i':
+    case 'I':
+    case 'l':
+    case 'L':
+    case 'q':
+    case 'Q':
+    case 'f':
+    case 'd':
+    case 'B':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int continuum_class_has_only_scalar_ivars(Class cls, Class root) {
+    if (cls == Nil || root == Nil || cls == root) {
+        return 0;
+    }
+    int saw_declared_state = 0;
+    for (Class current = cls;
+         current != Nil && current != root;
+         current = class_getSuperclass(current)) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(current, &count);
+        if (count > 0 && ivars == NULL) {
+            return 0;
+        }
+        for (unsigned int index = 0; index < count; index += 1) {
+            if (!continuum_ivar_is_scalar(ivars[index])) {
+                free(ivars);
+                return 0;
+            }
+            saw_declared_state = 1;
+        }
+        free(ivars);
+    }
+    return saw_declared_state;
+}
+
+static int continuum_class_uses_standard_allocation(Class cls) {
+    if (cls == Nil || continuum_main_image_path[0] == '\0') {
+        return 0;
+    }
+    const char *image_path = class_getImageName(cls);
+    Class root = objc_getClass("NSObject");
+    return image_path != NULL
+        && strcmp(image_path, continuum_main_image_path) == 0
+        && continuum_class_method_matches_root(cls, root, "alloc")
+        && continuum_class_method_matches_root(cls, root, "allocWithZone:")
+        && continuum_class_has_only_scalar_ivars(cls, root);
+}
+
+static id continuum_construct_app_object(Class cls) {
+    if (continuum_app_state_zone == NULL
+        || __sync_lock_test_and_set(
+            &continuum_objc_interposition_active,
+            1
+        ) != 0) {
+        return nil;
+    }
+    if (!continuum_class_uses_standard_allocation(cls)) {
+        __sync_lock_release(&continuum_objc_interposition_active);
+        return nil;
+    }
+    const size_t size = class_getInstanceSize(cls);
+    if (size == 0) {
+        __sync_lock_release(&continuum_objc_interposition_active);
+        return nil;
+    }
+    void *bytes = malloc_zone_calloc(continuum_app_state_zone, 1, size);
+    if (bytes == NULL) {
+        __sync_lock_release(&continuum_objc_interposition_active);
+        return nil;
+    }
+    id object = objc_constructInstance(cls, bytes);
+    if (object == nil) {
+        malloc_zone_free(continuum_app_state_zone, bytes);
+    }
+    __sync_lock_release(&continuum_objc_interposition_active);
+    return object;
+}
+
+static id continuum_send_class_message(Class cls, const char *selector_name) {
+    if (cls == Nil || selector_name == NULL) {
+        return nil;
+    }
+    return ((id (*)(id, SEL))(void *)objc_msgSend)(
+        (id)cls,
+        sel_registerName(selector_name)
+    );
+}
+
+static id continuum_state_objc_alloc(Class cls) {
+    id object = continuum_construct_app_object(cls);
+    if (object != nil) {
+        return object;
+    }
+    return continuum_send_class_message(cls, "alloc");
+}
+
+static id continuum_state_objc_alloc_with_zone(Class cls) {
+    id object = continuum_construct_app_object(cls);
+    if (object != nil) {
+        return object;
+    }
+    if (cls == Nil) {
+        return nil;
+    }
+    return ((id (*)(id, SEL, void *))(void *)objc_msgSend)(
+        (id)cls,
+        sel_registerName("allocWithZone:"),
+        NULL
+    );
+}
+
+static id continuum_send_init(id object) {
+    if (object == nil) {
+        return nil;
+    }
+    return ((id (*)(id, SEL))(void *)objc_msgSend)(
+        object,
+        sel_registerName("init")
+    );
+}
+
+static id continuum_state_objc_alloc_init(Class cls) {
+    id object = continuum_construct_app_object(cls);
+    if (object != nil) {
+        return continuum_send_init(object);
+    }
+    return continuum_send_init(
+        continuum_send_class_message(cls, "alloc")
+    );
+}
+
+static id continuum_state_objc_opt_new(Class cls) {
+    Class root = objc_getClass("NSObject");
+    if (continuum_class_method_matches_root(cls, root, "new")) {
+        id object = continuum_construct_app_object(cls);
+        if (object != nil) {
+            return continuum_send_init(object);
+        }
+    }
+    return continuum_send_class_message(cls, "new");
+}
+
 CONTINUUM_INTERPOSE(continuum_state_malloc, malloc);
 CONTINUUM_INTERPOSE(continuum_state_calloc, calloc);
 CONTINUUM_INTERPOSE(continuum_state_typed_malloc, malloc_type_malloc);
 CONTINUUM_INTERPOSE(continuum_state_typed_calloc, malloc_type_calloc);
+CONTINUUM_INTERPOSE(continuum_state_objc_alloc, objc_alloc);
+CONTINUUM_INTERPOSE(continuum_state_objc_alloc_with_zone, objc_allocWithZone);
+CONTINUUM_INTERPOSE(continuum_state_objc_alloc_init, objc_alloc_init);
+CONTINUUM_INTERPOSE(continuum_state_objc_opt_new, objc_opt_new);
 
 static void continuum_prepare_app_state_zone(void) {
     const struct mach_header *header = NULL;
@@ -541,6 +727,14 @@ static void continuum_prepare_app_state_zone(void) {
         const struct mach_header *candidate = _dyld_get_image_header(index);
         if (candidate != NULL && candidate->filetype == MH_EXECUTE) {
             header = candidate;
+            const char *image_path = _dyld_get_image_name(index);
+            if (image_path != NULL) {
+                (void)strlcpy(
+                    continuum_main_image_path,
+                    image_path,
+                    sizeof(continuum_main_image_path)
+                );
+            }
             break;
         }
     }

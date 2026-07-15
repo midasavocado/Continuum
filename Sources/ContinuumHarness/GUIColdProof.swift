@@ -70,9 +70,15 @@ enum GUIColdProof {
             counter: 700,
             at: observationURL
         )
+        let objectReady = try await waitForObservation(
+            event: "object-ready",
+            processIdentifier: originalPID,
+            counter: 800,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "111 / 500 / 700"
+            titleSuffix: "111 / 500 / 700 / 800"
         )
 
         guard kill(originalPID, SIGWINCH) == 0 else {
@@ -96,9 +102,15 @@ enum GUIColdProof {
             counter: 707,
             at: observationURL
         )
+        let objectSaved = try await waitForObservation(
+            event: "object-mutated",
+            processIdentifier: originalPID,
+            counter: 805,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "222 / 510 / 707"
+            titleSuffix: "222 / 510 / 707 / 805"
         )
 
         let service = HotProcessCheckpointService(
@@ -150,9 +162,15 @@ enum GUIColdProof {
             counter: 714,
             at: observationURL
         )
+        _ = try await waitForObservation(
+            event: "object-mutated",
+            processIdentifier: originalPID,
+            counter: 810,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "333 / 520 / 714"
+            titleSuffix: "333 / 520 / 714 / 810"
         )
 
         // Build and validate the stopped replacement before destroying the
@@ -207,9 +225,15 @@ enum GUIColdProof {
             counter: 700,
             at: observationURL
         )
+        let replacementObjectReady = try await waitForObservation(
+            event: "object-ready",
+            processIdentifier: replacementPID,
+            counter: 800,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: replacementPID,
-            titleSuffix: "222 / 510 / 707"
+            titleSuffix: "222 / 510 / 707 / 805"
         )
 
         guard kill(replacementPID, SIGWINCH) == 0 else {
@@ -235,9 +259,15 @@ enum GUIColdProof {
             counter: 714,
             at: observationURL
         )
+        let objectMutated = try await waitForObservation(
+            event: "object-mutated",
+            processIdentifier: replacementPID,
+            counter: 810,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: replacementPID,
-            titleSuffix: "333 / 520 / 714"
+            titleSuffix: "333 / 520 / 714 / 810"
         )
         guard ready.address == saved.address,
               saved.address == mutated.address,
@@ -247,6 +277,9 @@ enum GUIColdProof {
               workerReady.address == workerSaved.address,
               workerSaved.address == replacementWorkerReady.address,
               replacementWorkerReady.address == workerMutated.address,
+              objectReady.address == objectSaved.address,
+              objectSaved.address == replacementObjectReady.address,
+              replacementObjectReady.address == objectMutated.address,
               ready.counter == 111,
               saved.counter == 222,
               mutated.counter == 333,
@@ -256,6 +289,9 @@ enum GUIColdProof {
               workerReady.counter == 700,
               workerSaved.counter == 707,
               workerMutated.counter == 714,
+              objectReady.counter == 800,
+              objectSaved.counter == 805,
+              objectMutated.counter == 810,
               commit.retainedFileCount == 0,
               commit.retainedFileBytes == 0 else {
             throw GUIColdProofError.failure(
@@ -274,6 +310,7 @@ enum GUIColdProof {
         print("  restored RAM:    0x\(String(saved.address, radix: 16)) = 222")
         print("  late-run-loop RAM: 0x\(String(lateSaved.address, radix: 16)) = 510")
         print("  worker-thread RAM: 0x\(String(workerSaved.address, radix: 16)) = 707")
+        print("  Objective-C RAM: 0x\(String(objectSaved.address, radix: 16)) = 805")
         print("  divergent future: 333 discarded with the original PID")
         print("  live mutation:   333 after restore")
         print("  WindowServer:    new functional window owned by replacement")

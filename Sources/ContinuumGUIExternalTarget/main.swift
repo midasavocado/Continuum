@@ -6,6 +6,7 @@ import Foundation
 private let stateMagic: UInt64 = 0x434F4E5447554953
 private let lateStateMagic: UInt64 = 0x434F4E544C415445
 private let workerStateMagic: UInt64 = 0x434F4E54574F524B
+private let objectStateMagic: UInt64 = 0x434F4E544F424A43
 private nonisolated(unsafe) var mutationRequested: sig_atomic_t = 0
 
 private func requestMutation(_ signalNumber: Int32) {
@@ -18,6 +19,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state: UnsafeMutablePointer<continuum_gui_state>
     private var lateState: UnsafeMutablePointer<continuum_gui_state>?
     private var workerState: UnsafeMutablePointer<continuum_gui_state>?
+    private var objectStateAddress: UInt = 0
     private var lateStateObserver: CFRunLoopObserver?
     private var window: NSWindow?
     private var label: NSTextField?
@@ -85,7 +87,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var title: String {
-        "Continuum GUI Proof — \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0) / \(workerState?.pointee.counter ?? 0)"
+        "Continuum GUI Proof — \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0) / \(workerState?.pointee.counter ?? 0) / \(continuum_gui_object_state_counter())"
     }
 
     private func createPostIdleState() {
@@ -99,10 +101,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         ) else {
             fatalError("could not allocate worker GUI proof state")
         }
+        let objectAddress = continuum_gui_object_state_create(
+            objectStateMagic,
+            800
+        )
+        guard objectAddress != 0 else {
+            fatalError("could not allocate Objective-C GUI proof state")
+        }
         lateState = allocation
         workerState = workerAllocation
+        objectStateAddress = objectAddress
         writeObservation(event: "late-ready", state: allocation)
         writeObservation(event: "worker-ready", state: workerAllocation)
+        writeObjectObservation(event: "object-ready")
         refreshDerivedUI()
     }
 
@@ -119,6 +130,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 workerState.pointee.counter += 7
                 writeObservation(event: "worker-mutated", state: workerState)
             }
+            continuum_gui_object_state_add(5)
+            writeObjectObservation(event: "object-mutated")
         }
         refreshDerivedUI()
     }
@@ -136,20 +149,45 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             writeObservation(event: "invalid-worker-memory")
             return
         }
+        guard objectStateAddress == 0
+                || continuum_gui_object_state_magic() == objectStateMagic else {
+            writeObjectObservation(event: "invalid-object-memory")
+            return
+        }
         window?.title = title
-        label?.stringValue = "Saved RAM: \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0) / \(workerState?.pointee.counter ?? 0)"
+        label?.stringValue = "Saved RAM: \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0) / \(workerState?.pointee.counter ?? 0) / \(continuum_gui_object_state_counter())"
     }
 
     private func writeObservation(
         event: String,
         state observedState: UnsafeMutablePointer<continuum_gui_state>? = nil
     ) {
+        let observedState = observedState ?? state
+        let address = UInt(bitPattern: observedState)
+        writeObservation(
+            event: event,
+            address: address,
+            counter: observedState.pointee.counter
+        )
+    }
+
+    private func writeObjectObservation(event: String) {
+        writeObservation(
+            event: event,
+            address: objectStateAddress,
+            counter: continuum_gui_object_state_counter()
+        )
+    }
+
+    private func writeObservation(
+        event: String,
+        address: UInt,
+        counter: UInt64
+    ) {
         guard let path = ProcessInfo.processInfo.environment[
             "CONTINUUM_GUI_PROOF_OBSERVATION_PATH"
         ] else { return }
-        let observedState = observedState ?? state
-        let address = UInt(bitPattern: observedState)
-        let line = "\(event) \(getpid()) \(address) \(observedState.pointee.counter)\n"
+        let line = "\(event) \(getpid()) \(address) \(counter)\n"
         guard let bytes = line.data(using: .utf8) else { return }
         if !FileManager.default.fileExists(atPath: path) {
             FileManager.default.createFile(atPath: path, contents: nil)
