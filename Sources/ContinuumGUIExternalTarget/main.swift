@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 
 private let stateMagic: UInt64 = 0x434F4E5447554953
+private let lateStateMagic: UInt64 = 0x434F4E544C415445
 private nonisolated(unsafe) var mutationRequested: sig_atomic_t = 0
 
 private func requestMutation(_ signalNumber: Int32) {
@@ -14,6 +15,8 @@ private func requestMutation(_ signalNumber: Int32) {
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state: UnsafeMutablePointer<continuum_gui_state>
+    private var lateState: UnsafeMutablePointer<continuum_gui_state>?
+    private var lateStateObserver: CFRunLoopObserver?
     private var window: NSWindow?
     private var label: NSTextField?
     private var timer: Timer?
@@ -55,6 +58,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             userInfo: nil,
             repeats: true
         )
+        lateStateObserver = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault,
+            CFRunLoopActivity.beforeWaiting.rawValue,
+            false,
+            CFIndex.max
+        ) { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                self?.createLateState()
+            }
+        }
+        if let lateStateObserver {
+            CFRunLoopAddObserver(
+                CFRunLoopGetMain(),
+                lateStateObserver,
+                .commonModes
+            )
+        }
         writeObservation(event: "ready")
     }
 
@@ -63,7 +83,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var title: String {
-        "Continuum GUI Proof — \(state.pointee.counter)"
+        "Continuum GUI Proof — \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0)"
+    }
+
+    private func createLateState() {
+        guard lateState == nil else { return }
+        guard let allocation = continuum_gui_state_create(lateStateMagic, 500) else {
+            fatalError("could not allocate late GUI proof state")
+        }
+        lateState = allocation
+        writeObservation(event: "late-ready", state: allocation)
+        refreshDerivedUI()
     }
 
     @objc private func timerFired() {
@@ -71,6 +101,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             mutationRequested = 0
             state.pointee.counter += 111
             writeObservation(event: "mutated")
+            if let lateState {
+                lateState.pointee.counter += 10
+                writeObservation(event: "late-mutated", state: lateState)
+            }
         }
         refreshDerivedUI()
     }
@@ -80,16 +114,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             writeObservation(event: "invalid-memory")
             return
         }
+        if let lateState, lateState.pointee.magic != lateStateMagic {
+            writeObservation(event: "invalid-late-memory")
+            return
+        }
         window?.title = title
-        label?.stringValue = "Saved RAM: \(state.pointee.counter)"
+        label?.stringValue = "Saved RAM: \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0)"
     }
 
-    private func writeObservation(event: String) {
+    private func writeObservation(
+        event: String,
+        state observedState: UnsafeMutablePointer<continuum_gui_state>? = nil
+    ) {
         guard let path = ProcessInfo.processInfo.environment[
             "CONTINUUM_GUI_PROOF_OBSERVATION_PATH"
         ] else { return }
-        let address = UInt(bitPattern: state)
-        let line = "\(event) \(getpid()) \(address) \(state.pointee.counter)\n"
+        let observedState = observedState ?? state
+        let address = UInt(bitPattern: observedState)
+        let line = "\(event) \(getpid()) \(address) \(observedState.pointee.counter)\n"
         guard let bytes = line.data(using: .utf8) else { return }
         if !FileManager.default.fileExists(atPath: path) {
             FileManager.default.createFile(atPath: path, contents: nil)

@@ -1207,6 +1207,33 @@ static int continuum_region_is_app_state(
     return 0;
 }
 
+static int continuum_region_is_app_state_metadata(
+    mach_vm_address_t address,
+    mach_vm_size_t size,
+    uint32_t user_tag
+) {
+    static const mach_vm_address_t arena_bases[] = {
+        UINT64_C(0x0000000140000000),
+        UINT64_C(0x0000000150000000),
+        UINT64_C(0x0000000160000000),
+        UINT64_C(0x0000000170000000),
+    };
+    if (user_tag != VM_MEMORY_APPLICATION_SPECIFIC_2
+        || size != UINT64_C(0x00100000)) {
+        return 0;
+    }
+    for (size_t index = 0;
+         index < sizeof(arena_bases) / sizeof(arena_bases[0]);
+         index += 1) {
+        if (address == arena_bases[index]
+                + UINT64_C(0x10000000)
+                - UINT64_C(0x00100000)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void continuum_hash_vm_region(
     uint64_t *hash,
     mach_vm_address_t address,
@@ -3729,11 +3756,17 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         const int writable =
             (info.protection & (VM_PROT_READ | VM_PROT_WRITE))
                 == (VM_PROT_READ | VM_PROT_WRITE);
-        const int app_owned_state = continuum_region_is_app_state(
+        const int app_payload_state = continuum_region_is_app_state(
             address,
             region_size,
             info.user_tag
         );
+        const int app_owned_state = app_payload_state
+            || continuum_region_is_app_state_metadata(
+                address,
+                region_size,
+                info.user_tag
+            );
         const int eligible_memory = writable
             && !continuum_region_overlaps_shared_cache(address, region_size)
             && !continuum_region_contains_workqueue_runtime_state(
@@ -3832,7 +3865,9 @@ static continuum_status continuum_capture_process_snapshot_suspended(
                     .size = region_size,
                 };
                 region->app_state_allocation_count += 1;
-                snapshot->has_isolated_app_state = 1;
+                if (app_payload_state) {
+                    snapshot->has_isolated_app_state = 1;
+                }
             }
             if (status != CONTINUUM_STATUS_OK) {
                 break;
@@ -5544,6 +5579,68 @@ continuum_status continuum_remote_session_region_matches(
             && info.inheritance == region->inheritance
             && info.share_mode == region->share_mode
             && info.user_tag == region->user_tag;
+    }
+    continuum_status resume_status = continuum_resume_session(
+        session,
+        did_suspend
+    );
+    return status == CONTINUUM_STATUS_OK ? resume_status : status;
+}
+
+continuum_status continuum_remote_session_range_is_unmapped(
+    continuum_remote_session *session,
+    uint64_t address,
+    uint64_t length,
+    uint8_t *out_is_unmapped
+) {
+    if (session == NULL || address == 0 || length == 0
+        || out_is_unmapped == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_is_unmapped = 0;
+    uint64_t requested_end = 0;
+    if (!continuum_add_u64(address, length, &requested_end)) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    continuum_status status = continuum_validate_session_identity(session);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+    int did_suspend = 0;
+    status = continuum_suspend_session(session, &did_suspend);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+
+    mach_vm_address_t mapping_address = address;
+    mach_vm_size_t mapping_length = 0;
+    vm_region_submap_info_data_64_t info;
+    natural_t depth = 0;
+    kern_return_t result;
+    for (;;) {
+        memset(&info, 0, sizeof(info));
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        result = mach_vm_region_recurse(
+            session->task,
+            &mapping_address,
+            &mapping_length,
+            &depth,
+            (vm_region_recurse_info_t)&info,
+            &count
+        );
+        if (result != KERN_SUCCESS || !info.is_submap) {
+            break;
+        }
+        depth += 1;
+    }
+    if (result == KERN_INVALID_ADDRESS
+        || (result == KERN_SUCCESS && mapping_address >= requested_end)) {
+        *out_is_unmapped = 1;
+        status = CONTINUUM_STATUS_OK;
+    } else {
+        status = result == KERN_SUCCESS
+            ? CONTINUUM_STATUS_OK
+            : CONTINUUM_STATUS_MACH_ERROR;
     }
     continuum_status resume_status = continuum_resume_session(
         session,

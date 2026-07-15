@@ -58,9 +58,15 @@ enum GUIColdProof {
             processIdentifier: originalPID,
             at: observationURL
         )
+        let lateReady = try await waitForObservation(
+            event: "late-ready",
+            processIdentifier: originalPID,
+            counter: 500,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "111"
+            titleSuffix: "111 / 500"
         )
 
         guard kill(originalPID, SIGWINCH) == 0 else {
@@ -72,9 +78,15 @@ enum GUIColdProof {
             counter: 222,
             at: observationURL
         )
+        let lateSaved = try await waitForObservation(
+            event: "late-mutated",
+            processIdentifier: originalPID,
+            counter: 510,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "222"
+            titleSuffix: "222 / 510"
         )
 
         let service = HotProcessCheckpointService(
@@ -114,9 +126,15 @@ enum GUIColdProof {
             counter: 333,
             at: observationURL
         )
+        _ = try await waitForObservation(
+            event: "late-mutated",
+            processIdentifier: originalPID,
+            counter: 520,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "333"
+            titleSuffix: "333 / 520"
         )
 
         // Build and validate the stopped replacement before destroying the
@@ -159,9 +177,15 @@ enum GUIColdProof {
                 "cold restore did not create a live replacement PID"
             )
         }
+        let replacementLateReady = try await waitForObservation(
+            event: "late-ready",
+            processIdentifier: replacementPID,
+            counter: 500,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: replacementPID,
-            titleSuffix: "222"
+            titleSuffix: "222 / 510"
         )
 
         guard kill(replacementPID, SIGWINCH) == 0 else {
@@ -175,15 +199,27 @@ enum GUIColdProof {
             counter: 333,
             at: observationURL
         )
+        let lateMutated = try await waitForObservation(
+            event: "late-mutated",
+            processIdentifier: replacementPID,
+            counter: 520,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: replacementPID,
-            titleSuffix: "333"
+            titleSuffix: "333 / 520"
         )
         guard ready.address == saved.address,
               saved.address == mutated.address,
+              lateReady.address == lateSaved.address,
+              lateSaved.address == replacementLateReady.address,
+              replacementLateReady.address == lateMutated.address,
               ready.counter == 111,
               saved.counter == 222,
               mutated.counter == 333,
+              lateReady.counter == 500,
+              lateSaved.counter == 510,
+              lateMutated.counter == 520,
               commit.retainedFileCount == 0,
               commit.retainedFileBytes == 0 else {
             throw GUIColdProofError.failure(
@@ -200,6 +236,7 @@ enum GUIColdProof {
         print("  replacement PID: \(replacementPID)")
         print("  preflight:       replacement validated before original exit")
         print("  restored RAM:    0x\(String(saved.address, radix: 16)) = 222")
+        print("  late-run-loop RAM: 0x\(String(lateSaved.address, radix: 16)) = 510")
         print("  divergent future: 333 discarded with the original PID")
         print("  live mutation:   333 after restore")
         print("  WindowServer:    new functional window owned by replacement")

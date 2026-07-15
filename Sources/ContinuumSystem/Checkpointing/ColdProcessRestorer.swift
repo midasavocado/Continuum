@@ -49,6 +49,9 @@ public struct ColdFileSafetyRestore: Hashable, Sendable {
 /// the verified replacement; unsupported resources remain certification
 /// boundaries.
 public actor ColdProcessRestorer {
+    private static let appStatePayloadUserTag: UInt32 = 240
+    private static let appStateMetadataUserTag: UInt32 = 241
+
     private enum ResumeMethod: Sendable {
         case entryStop
         case rehydrateStop
@@ -804,6 +807,20 @@ public actor ColdProcessRestorer {
                 "This GUI snapshot has no isolated app-owned RAM to transplant safely."
             )
         }
+        guard appStateRegions.contains(where: {
+            $0.userTag == Self.appStatePayloadUserTag
+        }) else {
+            throw ContinuumError.restoreUnavailable(
+                "This GUI snapshot has no isolated app-owned RAM payload."
+            )
+        }
+        guard appStateRegions.filter({
+            $0.userTag == Self.appStateMetadataUserTag
+        }).count == 1 else {
+            throw ContinuumError.restoreUnavailable(
+                "This snapshot predates Continuum's durable allocator metadata. Save a new snapshot before quitting the app."
+            )
+        }
 
         var environment = launch.environment.filter {
             !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
@@ -913,7 +930,10 @@ public actor ColdProcessRestorer {
         var reconstructedChunkCount = 0
         var reconstructedBytes: UInt64 = 0
         var deferredMaximumProtectionRegionCount = 0
-        for region in appStateRegions {
+        let orderedAppStateRegions = appStateRegions.sorted {
+            $0.address < $1.address
+        }
+        for region in orderedAppStateRegions {
             var runtimeRegion = continuum_remote_process_region_info()
             runtimeRegion.address = region.address
             runtimeRegion.length = region.length
@@ -922,6 +942,7 @@ public actor ColdProcessRestorer {
             runtimeRegion.inheritance = region.inheritance
             runtimeRegion.share_mode = region.shareMode
             runtimeRegion.user_tag = region.userTag
+
             var matches: UInt8 = 0
             try requireRuntimeOK(
                 continuum_remote_session_region_matches(
@@ -929,15 +950,27 @@ public actor ColdProcessRestorer {
                     &runtimeRegion,
                     &matches
                 ),
-                operation: "validate the replacement app-state mapping"
+                operation: "validate an app-owned replacement mapping"
             )
-            guard matches != 0 else {
-                throw ContinuumError.restoreUnavailable(
-                    "The relaunched app did not recreate its tagged state mapping at the captured address."
+            if matches == 0 {
+                var isUnmapped: UInt8 = 0
+                try requireRuntimeOK(
+                    continuum_remote_session_range_is_unmapped(
+                        session,
+                        region.address,
+                        region.length,
+                        &isUnmapped
+                    ),
+                    operation: "validate an app-owned replacement address range"
                 )
+                guard isUnmapped != 0 else {
+                    throw ContinuumError.restoreUnavailable(
+                        "The replacement process is using a saved app-state address for an incompatible mapping."
+                    )
+                }
             }
         }
-        for region in appStateRegions.sorted(by: { $0.address < $1.address }) {
+        for region in orderedAppStateRegions {
             var runtimeRegion = continuum_remote_process_region_info()
             runtimeRegion.address = region.address
             runtimeRegion.length = region.length

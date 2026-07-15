@@ -34,11 +34,15 @@ static malloc_zone_t *continuum_app_state_zone = NULL;
 static uintptr_t continuum_main_text_start = 0;
 static uintptr_t continuum_main_text_end = 0;
 static volatile int continuum_allocator_interposition_active = 0;
-static volatile int continuum_app_state_capture_window_open = 1;
 
 enum {
     CONTINUUM_APP_STATE_ALLOCATION_LIMIT = 16384,
 };
+
+#define CONTINUUM_APP_STATE_ARENA_SIZE UINT64_C(0x10000000)
+#define CONTINUUM_APP_STATE_METADATA_SIZE UINT64_C(0x00100000)
+#define CONTINUUM_APP_STATE_METADATA_MAGIC UINT64_C(0x434F4E544D455441)
+#define CONTINUUM_APP_STATE_METADATA_VERSION UINT32_C(1)
 
 typedef struct continuum_app_state_allocation {
     mach_vm_address_t address;
@@ -47,12 +51,25 @@ typedef struct continuum_app_state_allocation {
     uint8_t active;
 } continuum_app_state_allocation;
 
-static continuum_app_state_allocation continuum_app_state_allocations[
-    CONTINUUM_APP_STATE_ALLOCATION_LIMIT
-];
-static size_t continuum_app_state_allocation_count = 0;
-static mach_vm_address_t continuum_app_state_mapping_cursor = 0;
-static mach_vm_address_t continuum_app_state_mapping_limit = 0;
+typedef struct continuum_app_state_metadata {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t reserved;
+    mach_vm_address_t arena_base;
+    mach_vm_address_t mapping_cursor;
+    mach_vm_address_t mapping_limit;
+    uint64_t allocation_count;
+    continuum_app_state_allocation allocations[
+        CONTINUUM_APP_STATE_ALLOCATION_LIMIT
+    ];
+} continuum_app_state_metadata;
+
+_Static_assert(
+    sizeof(continuum_app_state_metadata) <= CONTINUUM_APP_STATE_METADATA_SIZE,
+    "app-state allocator metadata exceeds its fixed mapping"
+);
+
+static continuum_app_state_metadata *continuum_app_state_metadata_header = NULL;
 static pthread_mutex_t continuum_app_state_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const mach_vm_address_t continuum_app_state_candidates[] = {
@@ -61,6 +78,35 @@ static const mach_vm_address_t continuum_app_state_candidates[] = {
     UINT64_C(0x0000000160000000),
     UINT64_C(0x0000000170000000),
 };
+
+static int continuum_app_state_metadata_is_valid(void) {
+    const continuum_app_state_metadata *metadata =
+        continuum_app_state_metadata_header;
+    if (metadata == NULL
+        || metadata->magic != CONTINUUM_APP_STATE_METADATA_MAGIC
+        || metadata->version != CONTINUUM_APP_STATE_METADATA_VERSION
+        || metadata->allocation_count > CONTINUUM_APP_STATE_ALLOCATION_LIMIT) {
+        return 0;
+    }
+    const mach_vm_address_t page_size = (mach_vm_address_t)getpagesize();
+    for (size_t index = 0;
+         index < sizeof(continuum_app_state_candidates)
+            / sizeof(continuum_app_state_candidates[0]);
+         index += 1) {
+        const mach_vm_address_t base = continuum_app_state_candidates[index];
+        const mach_vm_address_t metadata_address =
+            base + CONTINUUM_APP_STATE_ARENA_SIZE
+                - CONTINUUM_APP_STATE_METADATA_SIZE;
+        const mach_vm_address_t mapping_limit = metadata_address - page_size;
+        if (metadata->arena_base == base
+            && metadata->mapping_limit == mapping_limit
+            && metadata->mapping_cursor >= base
+            && metadata->mapping_cursor <= mapping_limit) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 static size_t continuum_app_state_size(
     malloc_zone_t *zone,
@@ -72,11 +118,15 @@ static size_t continuum_app_state_size(
     }
     size_t result = 0;
     pthread_mutex_lock(&continuum_app_state_lock);
+    if (!continuum_app_state_metadata_is_valid()) {
+        pthread_mutex_unlock(&continuum_app_state_lock);
+        return 0;
+    }
     for (size_t index = 0;
-         index < continuum_app_state_allocation_count;
+         index < continuum_app_state_metadata_header->allocation_count;
          index += 1) {
         const continuum_app_state_allocation *allocation =
-            &continuum_app_state_allocations[index];
+            &continuum_app_state_metadata_header->allocations[index];
         if (allocation->active
             && allocation->address == (mach_vm_address_t)(uintptr_t)pointer) {
             result = allocation->requested_size;
@@ -113,21 +163,27 @@ static void *continuum_app_state_memalign(
         : (mach_vm_size_t)page_size;
 
     pthread_mutex_lock(&continuum_app_state_lock);
-    if (continuum_app_state_allocation_count
-            >= CONTINUUM_APP_STATE_ALLOCATION_LIMIT) {
-        pthread_mutex_unlock(&continuum_app_state_lock);
-        return NULL;
-    }
-
-    if (continuum_app_state_mapping_cursor == 0) {
+    mach_vm_address_t allocation_address = 0;
+    if (continuum_app_state_metadata_header == NULL) {
         for (size_t index = 0;
              index < sizeof(continuum_app_state_candidates)
                 / sizeof(continuum_app_state_candidates[0]);
              index += 1) {
-            mach_vm_address_t candidate = continuum_app_state_candidates[index];
-            if ((candidate & (effective_alignment - 1)) != 0) {
+            const mach_vm_address_t arena_base =
+                continuum_app_state_candidates[index];
+            if ((arena_base & (effective_alignment - 1)) != 0) {
                 continue;
             }
+            const mach_vm_address_t metadata_address =
+                arena_base + CONTINUUM_APP_STATE_ARENA_SIZE
+                    - CONTINUUM_APP_STATE_METADATA_SIZE;
+            const mach_vm_address_t mapping_limit =
+                metadata_address - (mach_vm_address_t)page_size;
+            if (mapping_length > mapping_limit - arena_base) {
+                continue;
+            }
+
+            mach_vm_address_t candidate = arena_base;
             kern_return_t result = mach_vm_map(
                 mach_task_self(),
                 &candidate,
@@ -142,25 +198,73 @@ static void *continuum_app_state_memalign(
                 VM_PROT_READ | VM_PROT_WRITE,
                 VM_INHERIT_NONE
             );
-            if (result == KERN_SUCCESS
-                && candidate == continuum_app_state_candidates[index]) {
-                continuum_app_state_mapping_cursor = candidate;
-                continuum_app_state_mapping_limit = candidate
-                    + UINT64_C(0x10000000);
-                break;
+            if (result != KERN_SUCCESS || candidate != arena_base) {
+                continue;
             }
+
+            mach_vm_address_t metadata_candidate = metadata_address;
+            result = mach_vm_map(
+                mach_task_self(),
+                &metadata_candidate,
+                CONTINUUM_APP_STATE_METADATA_SIZE,
+                0,
+                VM_FLAGS_FIXED
+                    | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_2),
+                MEMORY_OBJECT_NULL,
+                0,
+                FALSE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_INHERIT_NONE
+            );
+            if (result != KERN_SUCCESS
+                || metadata_candidate != metadata_address) {
+                (void)mach_vm_deallocate(
+                    mach_task_self(),
+                    arena_base,
+                    mapping_length
+                );
+                continue;
+            }
+
+            continuum_app_state_metadata_header =
+                (continuum_app_state_metadata *)(uintptr_t)metadata_address;
+            memset(
+                continuum_app_state_metadata_header,
+                0,
+                sizeof(*continuum_app_state_metadata_header)
+            );
+            continuum_app_state_metadata_header->magic =
+                CONTINUUM_APP_STATE_METADATA_MAGIC;
+            continuum_app_state_metadata_header->version =
+                CONTINUUM_APP_STATE_METADATA_VERSION;
+            continuum_app_state_metadata_header->arena_base = arena_base;
+            continuum_app_state_metadata_header->mapping_cursor = arena_base;
+            continuum_app_state_metadata_header->mapping_limit = mapping_limit;
+            allocation_address = arena_base;
+            break;
         }
-        if (continuum_app_state_mapping_cursor == 0) {
+        if (continuum_app_state_metadata_header == NULL) {
             pthread_mutex_unlock(&continuum_app_state_lock);
             return NULL;
         }
     } else {
+        if (!continuum_app_state_metadata_is_valid()
+            || continuum_app_state_metadata_header->allocation_count
+                >= CONTINUUM_APP_STATE_ALLOCATION_LIMIT) {
+            pthread_mutex_unlock(&continuum_app_state_lock);
+            return NULL;
+        }
+        const mach_vm_address_t mapping_cursor =
+            continuum_app_state_metadata_header->mapping_cursor;
+        const mach_vm_address_t mapping_limit =
+            continuum_app_state_metadata_header->mapping_limit;
         const mach_vm_address_t aligned =
-            (continuum_app_state_mapping_cursor + effective_alignment - 1)
+            (mapping_cursor + effective_alignment - 1)
                 & ~(effective_alignment - 1);
-        if (aligned < continuum_app_state_mapping_cursor
-            || aligned >= continuum_app_state_mapping_limit
-            || mapping_length > continuum_app_state_mapping_limit - aligned) {
+        if (aligned < mapping_cursor
+            || aligned >= mapping_limit
+            || mapping_length > mapping_limit - aligned) {
             pthread_mutex_unlock(&continuum_app_state_lock);
             return NULL;
         }
@@ -182,24 +286,26 @@ static void *continuum_app_state_memalign(
             pthread_mutex_unlock(&continuum_app_state_lock);
             return NULL;
         }
-        continuum_app_state_mapping_cursor = candidate;
+        allocation_address = candidate;
     }
 
     continuum_app_state_allocation *allocation =
-        &continuum_app_state_allocations[
-            continuum_app_state_allocation_count
+        &continuum_app_state_metadata_header->allocations[
+            continuum_app_state_metadata_header->allocation_count
         ];
-    allocation->address = continuum_app_state_mapping_cursor;
+    allocation->address = allocation_address;
     allocation->mapping_length = mapping_length;
     allocation->requested_size = requested_size;
     allocation->active = 1;
-    continuum_app_state_allocation_count += 1;
+    continuum_app_state_metadata_header->allocation_count += 1;
     const mach_vm_address_t allocation_end =
-        continuum_app_state_mapping_cursor + mapping_length;
-    continuum_app_state_mapping_cursor =
-        allocation_end <= continuum_app_state_mapping_limit - page_size
+        allocation_address + mapping_length;
+    continuum_app_state_metadata_header->mapping_cursor =
+        allocation_end
+                <= continuum_app_state_metadata_header->mapping_limit
+                    - page_size
             ? allocation_end + page_size
-            : continuum_app_state_mapping_limit;
+            : continuum_app_state_metadata_header->mapping_limit;
     void *result = (void *)(uintptr_t)allocation->address;
     pthread_mutex_unlock(&continuum_app_state_lock);
     return result;
@@ -230,11 +336,15 @@ static void continuum_app_state_free(malloc_zone_t *zone, void *pointer) {
         return;
     }
     pthread_mutex_lock(&continuum_app_state_lock);
+    if (!continuum_app_state_metadata_is_valid()) {
+        pthread_mutex_unlock(&continuum_app_state_lock);
+        return;
+    }
     for (size_t index = 0;
-         index < continuum_app_state_allocation_count;
+         index < continuum_app_state_metadata_header->allocation_count;
          index += 1) {
         continuum_app_state_allocation *allocation =
-            &continuum_app_state_allocations[index];
+            &continuum_app_state_metadata_header->allocations[index];
         if (!allocation->active
             || allocation->address != (mach_vm_address_t)(uintptr_t)pointer) {
             continue;
@@ -334,8 +444,7 @@ static void *continuum_state_malloc(size_t size) {
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_capture_window_open
-        && pthread_main_np() != 0
+    if (pthread_main_np() != 0
         && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
@@ -356,8 +465,7 @@ static void *continuum_state_calloc(size_t count, size_t size) {
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_capture_window_open
-        && pthread_main_np() != 0
+    if (pthread_main_np() != 0
         && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
@@ -382,8 +490,7 @@ static void *continuum_state_typed_malloc(
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_capture_window_open
-        && pthread_main_np() != 0
+    if (pthread_main_np() != 0
         && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
@@ -409,8 +516,7 @@ static void *continuum_state_typed_calloc(
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_capture_window_open
-        && pthread_main_np() != 0
+    if (pthread_main_np() != 0
         && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
@@ -611,9 +717,6 @@ static void continuum_run_loop_safepoint(
 ) {
     (void)observer;
     (void)context;
-    if (activity == kCFRunLoopBeforeWaiting) {
-        continuum_app_state_capture_window_open = 0;
-    }
     if (continuum_rehydrate_stop_requested
         && activity == kCFRunLoopBeforeWaiting) {
         continuum_rehydrate_idle_boundaries += 1;

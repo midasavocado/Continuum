@@ -524,6 +524,16 @@ continuum_status continuum_remote_session_region_matches(
     uint8_t *out_matches
 );
 
+/// Reports whether an exact address range is entirely unmapped in a stopped
+/// replacement. GUI rehydration uses this to distinguish a safe sparse-arena
+/// hole from an incompatible live mapping before reconstruction.
+continuum_status continuum_remote_session_range_is_unmapped(
+    continuum_remote_session *session,
+    uint64_t address,
+    uint64_t length,
+    uint8_t *out_is_unmapped
+);
+
 /// Recreates one private writable mapping inside a replacement child that is
 /// still stopped before main. The child is disposable; failures never touch
 /// the original process or any unrelated task.
