@@ -19,6 +19,13 @@ continuum_gui_state *continuum_gui_state_create(
     uint64_t counter
 );
 
+/// Performs the same ordinary allocation from a temporary worker thread and
+/// returns only after that worker has exited.
+continuum_gui_state *continuum_gui_state_create_on_worker(
+    uint64_t magic,
+    uint64_t counter
+);
+
 #ifdef __cplusplus
 }
 #endif

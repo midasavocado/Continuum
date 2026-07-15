@@ -5,6 +5,7 @@ import Foundation
 
 private let stateMagic: UInt64 = 0x434F4E5447554953
 private let lateStateMagic: UInt64 = 0x434F4E544C415445
+private let workerStateMagic: UInt64 = 0x434F4E54574F524B
 private nonisolated(unsafe) var mutationRequested: sig_atomic_t = 0
 
 private func requestMutation(_ signalNumber: Int32) {
@@ -16,6 +17,7 @@ private func requestMutation(_ signalNumber: Int32) {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state: UnsafeMutablePointer<continuum_gui_state>
     private var lateState: UnsafeMutablePointer<continuum_gui_state>?
+    private var workerState: UnsafeMutablePointer<continuum_gui_state>?
     private var lateStateObserver: CFRunLoopObserver?
     private var window: NSWindow?
     private var label: NSTextField?
@@ -65,7 +67,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             CFIndex.max
         ) { [weak self] _, _ in
             MainActor.assumeIsolated {
-                self?.createLateState()
+                self?.createPostIdleState()
             }
         }
         if let lateStateObserver {
@@ -83,16 +85,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var title: String {
-        "Continuum GUI Proof — \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0)"
+        "Continuum GUI Proof — \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0) / \(workerState?.pointee.counter ?? 0)"
     }
 
-    private func createLateState() {
+    private func createPostIdleState() {
         guard lateState == nil else { return }
         guard let allocation = continuum_gui_state_create(lateStateMagic, 500) else {
             fatalError("could not allocate late GUI proof state")
         }
+        guard let workerAllocation = continuum_gui_state_create_on_worker(
+            workerStateMagic,
+            700
+        ) else {
+            fatalError("could not allocate worker GUI proof state")
+        }
         lateState = allocation
+        workerState = workerAllocation
         writeObservation(event: "late-ready", state: allocation)
+        writeObservation(event: "worker-ready", state: workerAllocation)
         refreshDerivedUI()
     }
 
@@ -104,6 +114,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             if let lateState {
                 lateState.pointee.counter += 10
                 writeObservation(event: "late-mutated", state: lateState)
+            }
+            if let workerState {
+                workerState.pointee.counter += 7
+                writeObservation(event: "worker-mutated", state: workerState)
             }
         }
         refreshDerivedUI()
@@ -118,8 +132,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             writeObservation(event: "invalid-late-memory")
             return
         }
+        if let workerState, workerState.pointee.magic != workerStateMagic {
+            writeObservation(event: "invalid-worker-memory")
+            return
+        }
         window?.title = title
-        label?.stringValue = "Saved RAM: \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0)"
+        label?.stringValue = "Saved RAM: \(state.pointee.counter) / \(lateState?.pointee.counter ?? 0) / \(workerState?.pointee.counter ?? 0)"
     }
 
     private func writeObservation(

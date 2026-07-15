@@ -64,9 +64,15 @@ enum GUIColdProof {
             counter: 500,
             at: observationURL
         )
+        let workerReady = try await waitForObservation(
+            event: "worker-ready",
+            processIdentifier: originalPID,
+            counter: 700,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "111 / 500"
+            titleSuffix: "111 / 500 / 700"
         )
 
         guard kill(originalPID, SIGWINCH) == 0 else {
@@ -84,9 +90,15 @@ enum GUIColdProof {
             counter: 510,
             at: observationURL
         )
+        let workerSaved = try await waitForObservation(
+            event: "worker-mutated",
+            processIdentifier: originalPID,
+            counter: 707,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "222 / 510"
+            titleSuffix: "222 / 510 / 707"
         )
 
         let service = HotProcessCheckpointService(
@@ -132,9 +144,15 @@ enum GUIColdProof {
             counter: 520,
             at: observationURL
         )
+        _ = try await waitForObservation(
+            event: "worker-mutated",
+            processIdentifier: originalPID,
+            counter: 714,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: originalPID,
-            titleSuffix: "333 / 520"
+            titleSuffix: "333 / 520 / 714"
         )
 
         // Build and validate the stopped replacement before destroying the
@@ -183,9 +201,15 @@ enum GUIColdProof {
             counter: 500,
             at: observationURL
         )
+        let replacementWorkerReady = try await waitForObservation(
+            event: "worker-ready",
+            processIdentifier: replacementPID,
+            counter: 700,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: replacementPID,
-            titleSuffix: "222 / 510"
+            titleSuffix: "222 / 510 / 707"
         )
 
         guard kill(replacementPID, SIGWINCH) == 0 else {
@@ -205,21 +229,33 @@ enum GUIColdProof {
             counter: 520,
             at: observationURL
         )
+        let workerMutated = try await waitForObservation(
+            event: "worker-mutated",
+            processIdentifier: replacementPID,
+            counter: 714,
+            at: observationURL
+        )
         try await waitForWindow(
             processIdentifier: replacementPID,
-            titleSuffix: "333 / 520"
+            titleSuffix: "333 / 520 / 714"
         )
         guard ready.address == saved.address,
               saved.address == mutated.address,
               lateReady.address == lateSaved.address,
               lateSaved.address == replacementLateReady.address,
               replacementLateReady.address == lateMutated.address,
+              workerReady.address == workerSaved.address,
+              workerSaved.address == replacementWorkerReady.address,
+              replacementWorkerReady.address == workerMutated.address,
               ready.counter == 111,
               saved.counter == 222,
               mutated.counter == 333,
               lateReady.counter == 500,
               lateSaved.counter == 510,
               lateMutated.counter == 520,
+              workerReady.counter == 700,
+              workerSaved.counter == 707,
+              workerMutated.counter == 714,
               commit.retainedFileCount == 0,
               commit.retainedFileBytes == 0 else {
             throw GUIColdProofError.failure(
@@ -237,6 +273,7 @@ enum GUIColdProof {
         print("  preflight:       replacement validated before original exit")
         print("  restored RAM:    0x\(String(saved.address, radix: 16)) = 222")
         print("  late-run-loop RAM: 0x\(String(lateSaved.address, radix: 16)) = 510")
+        print("  worker-thread RAM: 0x\(String(workerSaved.address, radix: 16)) = 707")
         print("  divergent future: 333 discarded with the original PID")
         print("  live mutation:   333 after restore")
         print("  WindowServer:    new functional window owned by replacement")

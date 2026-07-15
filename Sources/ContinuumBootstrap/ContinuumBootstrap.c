@@ -444,8 +444,7 @@ static void *continuum_state_malloc(size_t size) {
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (pthread_main_np() != 0
-        && continuum_app_state_zone != NULL
+    if (continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
@@ -465,8 +464,7 @@ static void *continuum_state_calloc(size_t count, size_t size) {
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (pthread_main_np() != 0
-        && continuum_app_state_zone != NULL
+    if (continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
@@ -490,8 +488,7 @@ static void *continuum_state_typed_malloc(
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (pthread_main_np() != 0
-        && continuum_app_state_zone != NULL
+    if (continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
@@ -516,8 +513,7 @@ static void *continuum_state_typed_calloc(
     malloc_zone_t *default_zone = malloc_default_zone();
     malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (pthread_main_np() != 0
-        && continuum_app_state_zone != NULL
+    if (continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
