@@ -29,7 +29,7 @@ struct ContinuumMenuBarView: View {
 
         if let frontmostAppName {
             Text("Frontmost: \(shortTitle(frontmostAppName))")
-            Text(model.canCaptureFunctionalState ? "Ready to save a hot state" : "No certified rewind engine yet")
+            Text(model.canCaptureFunctionalState ? "Save checks this app automatically" : "Restore engine unavailable")
         } else {
             Text("Waiting for a frontmost app")
         }

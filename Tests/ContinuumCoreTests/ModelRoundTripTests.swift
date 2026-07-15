@@ -318,7 +318,8 @@ final class ModelRoundTripTests: XCTestCase {
             externalEffects: [effect],
             resourceCoverage: ResourceDomain.allCases.map {
                 ResourceCoverage(domain: $0, mode: .restored, detail: "fixture")
-            }
+            },
+            coldRestoreCertified: true
         )
     }
 

@@ -183,6 +183,10 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
     /// Per-domain restoration evidence. Nil decodes legacy snapshots without
     /// implying coverage that was never recorded.
     public var resourceCoverage: [ResourceCoverage]?
+    /// True only when durable export found real, tagged app-state payload that
+    /// a fresh process recreated at the same addresses. Nil keeps legacy
+    /// snapshots fail-closed after their live process disappears.
+    public var coldRestoreCertified: Bool?
 
     public init(
         id: SnapshotID = UUID(),
@@ -202,7 +206,8 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         externalEffects: [ExternalEffect] = [],
         localFileCoverage: LocalFileCoverage? = .unavailable,
         allowsKeepingCurrentFiles: Bool? = false,
-        resourceCoverage: [ResourceCoverage]? = nil
+        resourceCoverage: [ResourceCoverage]? = nil,
+        coldRestoreCertified: Bool? = false
     ) {
         self.id = id
         self.name = name
@@ -222,6 +227,7 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
         self.localFileCoverage = localFileCoverage
         self.allowsKeepingCurrentFiles = allowsKeepingCurrentFiles
         self.resourceCoverage = resourceCoverage
+        self.coldRestoreCertified = coldRestoreCertified
     }
 
     public var effectiveLocalFileCoverage: LocalFileCoverage {
@@ -230,6 +236,10 @@ public struct SnapshotRecord: Codable, Hashable, Identifiable, Sendable {
 
     public var isKeepingCurrentFilesCertified: Bool {
         allowsKeepingCurrentFiles ?? false
+    }
+
+    public var isColdRestoreCertified: Bool {
+        coldRestoreCertified ?? false
     }
 
     public var hasCompleteResourceCoverage: Bool {

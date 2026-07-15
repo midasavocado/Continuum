@@ -59,8 +59,13 @@ let package = Package(
             dependencies: ["ContinuumCore", "ContinuumStore", "ContinuumSystem", "ContinuumRuntime"]
         ),
         .executableTarget(name: "ContinuumExternalTarget"),
+        .target(
+            name: "ContinuumGUIStateSupport",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "ContinuumGUIExternalTarget",
+            dependencies: ["ContinuumGUIStateSupport"],
             linkerSettings: [.linkedFramework("AppKit")]
         ),
         .testTarget(name: "ContinuumCoreTests", dependencies: ["ContinuumCore"]),

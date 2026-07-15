@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Observation
 import ContinuumCore
@@ -335,14 +336,19 @@ final class ContinuumModel {
             }
 
             self.rewindPhase = .restoring(snapshotID)
-            if snapshot.availability == .replayRequired {
+            if snapshot.isColdRestoreCertified {
                 let preparation = try await self.coldProcessRestorer
                     .prepareRootProcess(
                         from: snapshotID,
                         repository: self.repository
                     )
+                let commit: ColdProcessCommit
                 do {
-                    _ = try await self.coldProcessRestorer.commit(
+                    try await self.closeRunningInstances(
+                        of: snapshot.app,
+                        excluding: preparation.replacementProcessIdentifier
+                    )
+                    commit = try await self.coldProcessRestorer.commit(
                         preparation.id
                     )
                 } catch {
@@ -351,13 +357,26 @@ final class ContinuumModel {
                     )
                     throw error
                 }
+                try await self.activateRestoredApplication(
+                    processIdentifier: commit.processIdentifier,
+                    appName: snapshot.app.displayName
+                )
                 self.onlineWarning = snapshot.externalEffects.isEmpty
                     ? nil
                     : snapshot.externalEffects
                 self.selectedSnapshotID = snapshotID
                 self.rewindPhase = .completed(snapshotID)
                 try await self.refreshIndex()
+                self.runningProcesses = await self.inventory
+                    .runningApplications()
+                    .sorted(by: Self.processSort)
                 return
+            }
+
+            if snapshot.availability == .replayRequired {
+                throw ContinuumError.restoreUnavailable(
+                    "This snapshot was not certified for a fresh-process restore."
+                )
             }
 
             let artifacts = try await self.repository.artifacts(for: snapshotID)
@@ -382,6 +401,86 @@ final class ContinuumModel {
             self.rewindPhase = .completed(snapshotID)
             try await self.refreshIndex()
         }
+    }
+
+    private func closeRunningInstances(
+        of app: AppIdentity,
+        excluding excludedProcessIdentifier: Int32
+    ) async throws {
+        var excludedProcessIdentifiers: Set<Int32> = [excludedProcessIdentifier]
+        if let processTreeProvider = inventory as? any ProcessTreeProviding {
+            excludedProcessIdentifiers.formUnion(
+                await processTreeProvider.processIdentifiers(
+                    inTreeRootedAt: excludedProcessIdentifier
+                )
+            )
+        }
+        let candidates = await inventory.runningApplications().filter {
+            !$0.isTerminated
+                && !excludedProcessIdentifiers.contains($0.processIdentifier)
+                && Self.representsSameApplication($0.app, app)
+        }
+        for candidate in candidates {
+            guard let running = NSRunningApplication(
+                processIdentifier: candidate.processIdentifier
+            ), !running.isTerminated else {
+                continue
+            }
+            _ = running.terminate()
+        }
+
+        for _ in 0..<40 {
+            if candidates.allSatisfy({ candidate in
+                NSRunningApplication(
+                    processIdentifier: candidate.processIdentifier
+                )?.isTerminated != false
+            }) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        for candidate in candidates {
+            if let running = NSRunningApplication(
+                processIdentifier: candidate.processIdentifier
+            ), !running.isTerminated {
+                _ = running.forceTerminate()
+            }
+        }
+        for _ in 0..<100 {
+            if candidates.allSatisfy({ candidate in
+                NSRunningApplication(
+                    processIdentifier: candidate.processIdentifier
+                )?.isTerminated != false
+            }) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw ContinuumError.restoreUnavailable(
+            "Continuum could not close the current \(app.displayName) process before restoring its snapshot."
+        )
+    }
+
+    private func activateRestoredApplication(
+        processIdentifier: Int32,
+        appName: String
+    ) async throws {
+        for _ in 0..<100 {
+            if let application = NSRunningApplication(
+                processIdentifier: processIdentifier
+            ), !application.isTerminated {
+                _ = application.activate(options: [.activateAllWindows])
+                return
+            }
+            if kill(processIdentifier, 0) != 0, errno == ESRCH {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw ContinuumError.restoreUnavailable(
+            "Continuum rebuilt \(appName), but the restored app exited before its window became ready."
+        )
     }
 
     func commitRewind(target targetSnapshotID: SnapshotID) async {
@@ -1241,6 +1340,18 @@ final class ContinuumModel {
 
     private static func sourceKey(for app: AppIdentity) -> String {
         (app.bundleURL ?? app.executableURL).standardizedFileURL.path
+    }
+
+    private static func representsSameApplication(
+        _ lhs: AppIdentity,
+        _ rhs: AppIdentity
+    ) -> Bool {
+        if let lhsBundleIdentifier = lhs.bundleIdentifier,
+           let rhsBundleIdentifier = rhs.bundleIdentifier {
+            return lhsBundleIdentifier == rhsBundleIdentifier
+        }
+        return lhs.executableURL.resolvingSymlinksInPath().standardizedFileURL
+            == rhs.executableURL.resolvingSymlinksInPath().standardizedFileURL
     }
 
     private static func mergingApplications(_ applications: [AppIdentity]) -> [AppIdentity] {

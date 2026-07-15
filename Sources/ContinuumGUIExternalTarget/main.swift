@@ -1,4 +1,5 @@
 import AppKit
+import ContinuumGUIStateSupport
 import Darwin
 import Foundation
 
@@ -10,32 +11,18 @@ private func requestMutation(_ signalNumber: Int32) {
     mutationRequested = 1
 }
 
-private struct GUIState {
-    var magic: UInt64
-    var counter: UInt64
-}
-
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let state: UnsafeMutablePointer<GUIState>
+    private let state: UnsafeMutablePointer<continuum_gui_state>
     private var window: NSWindow?
     private var label: NSTextField?
     private var timer: Timer?
 
     override init() {
-        typealias AllocateState = @convention(c) (Int) -> UnsafeMutableRawPointer?
-        let processHandle = dlopen(nil, RTLD_NOW)
-        let symbol = processHandle.flatMap {
-            dlsym($0, "continuum_bootstrap_allocate_app_state")
-        }
-        let allocate = symbol.map {
-            unsafeBitCast($0, to: AllocateState.self)
-        }
-        guard let allocation = allocate?(MemoryLayout<GUIState>.stride) else {
+        guard let allocation = continuum_gui_state_create(stateMagic, 111) else {
             fatalError("could not allocate GUI proof state")
         }
-        state = allocation.bindMemory(to: GUIState.self, capacity: 1)
-        state.initialize(to: GUIState(magic: stateMagic, counter: 111))
+        state = allocation
         super.init()
     }
 

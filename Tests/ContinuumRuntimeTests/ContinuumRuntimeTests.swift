@@ -14,13 +14,30 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertGreaterThan(info.thread_count, 0)
     }
 
-    func testBootstrapAppStateZoneIsDetectableBeforeSafepointSignal() {
+    func testBootstrapReportsOnlyRealAppStateBeforeSafepointSignal() {
         var detected: UInt8 = 0
         XCTAssertEqual(
             continuum_remote_process_has_app_state_zone(getpid(), &detected),
             CONTINUUM_STATUS_OK
         )
+        XCTAssertEqual(detected, 0)
+
+        guard let allocation = continuum_bootstrap_allocate_app_state(16) else {
+            return XCTFail("Bootstrap did not allocate tagged app state")
+        }
+        allocation.storeBytes(of: UInt64(0xC01DCAFE), as: UInt64.self)
+        XCTAssertEqual(
+            continuum_remote_process_has_app_state_zone(getpid(), &detected),
+            CONTINUUM_STATUS_OK
+        )
         XCTAssertEqual(detected, 1)
+
+        free(allocation)
+        XCTAssertEqual(
+            continuum_remote_process_has_app_state_zone(getpid(), &detected),
+            CONTINUUM_STATUS_OK
+        )
+        XCTAssertEqual(detected, 0)
     }
 
     func testBootstrapPreparesOneSuspendedOrdinaryPthread() {

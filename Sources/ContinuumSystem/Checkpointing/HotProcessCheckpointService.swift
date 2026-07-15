@@ -182,6 +182,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 allowsKeepingCurrentFiles: true,
                 resourceCoverage: Self.experimentalResourceCoverage(
                     writableVnodeCount: writableVnodes.count
+                ),
+                coldRestoreCertified: coldRestoreCertified(
+                    in: rawSnapshot,
+                    rootProcessIdentifier: rootProcessIdentifier
                 )
             )
 
@@ -284,12 +288,16 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             return snapshot.availability
         }
         guard let handle = handles[snapshot.id] else {
-            return .replayRequired
+            return snapshot.isColdRestoreCertified
+                ? .replayRequired
+                : .unavailable
         }
         guard continuum_remote_process_group_live_status(handle.pointer)
                 == CONTINUUM_STATUS_OK else {
             expire(snapshot.id)
-            return .replayRequired
+            return snapshot.isColdRestoreCertified
+                ? .replayRequired
+                : .unavailable
         }
         return .experimentalHot
     }
@@ -297,6 +305,45 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
     private func expire(_ snapshotID: SnapshotID) {
         handles.removeValue(forKey: snapshotID)
         retentionOrder.removeAll { $0 == snapshotID }
+    }
+
+    private func coldRestoreCertified(
+        in snapshot: OpaquePointer,
+        rootProcessIdentifier: Int32
+    ) -> Bool {
+        for memberIndex in 0..<continuum_remote_process_group_member_count(snapshot) {
+            var member = continuum_remote_process_group_member_info()
+            guard continuum_remote_process_group_copy_member_info(
+                snapshot,
+                memberIndex,
+                &member
+            ) == CONTINUUM_STATUS_OK else {
+                return false
+            }
+            guard member.process_id == rootProcessIdentifier else { continue }
+            let regionCount = continuum_remote_process_group_member_region_count(
+                snapshot,
+                memberIndex
+            )
+            for regionIndex in 0..<regionCount {
+                var region = continuum_remote_process_region_info()
+                guard continuum_remote_process_group_copy_member_region_info(
+                    snapshot,
+                    memberIndex,
+                    regionIndex,
+                    &region
+                ) == CONTINUUM_STATUS_OK else {
+                    return false
+                }
+                if region.length > 0,
+                   region.is_app_owned_state != 0,
+                   region.preserves_live_derived_graphics == 0 {
+                    return true
+                }
+            }
+            return false
+        }
+        return false
     }
 
     private func retain(_ handle: HotProcessSnapshotHandle, for snapshotID: SnapshotID) {
@@ -580,7 +627,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             checkpointID: checkpoint.id,
             createdAt: checkpoint.capturedAt,
             architecture: "arm64",
-            operatingSystemBuild: ProcessInfo.processInfo.operatingSystemVersionString,
+            operatingSystemBuild: try currentOperatingSystemBuild(),
             pageSize: UInt64(getpagesize()),
             rootProcessIdentifier: checkpoint.processIdentifiers.first ?? 0,
             app: app,

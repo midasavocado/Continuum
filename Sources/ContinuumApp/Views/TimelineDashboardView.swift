@@ -59,7 +59,7 @@ struct TimelineDashboardView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Snapshot → Restore")
                     .font(.largeTitle.weight(.semibold))
-                Text("Save the frontmost app, then restore that snapshot whenever you need it.")
+                Text("Save the frontmost app. Restore closes its current process and opens the saved RAM state in a new one.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -92,11 +92,11 @@ struct TimelineDashboardView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(canCaptureFunctionalState
-                         ? (frontmostApp == nil ? "Waiting for an app" : "Ready for \(frontmostApp?.displayName ?? "the frontmost app")")
+                         ? (frontmostApp == nil ? "Waiting for an app" : "Frontmost: \(frontmostApp?.displayName ?? "the frontmost app")")
                          : "Rewind engine not available")
                         .font(.headline)
                     Text(canCaptureFunctionalState
-                         ? "Snapshots capture the running app and restore it to the saved moment."
+                         ? "Continuum checks restore support when you save. It never labels an unsupported capture as restorable."
                          : "This build cannot create a restorable state yet, so saving and rewinding are unavailable instead of pretending.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -105,9 +105,9 @@ struct TimelineDashboardView: View {
                 Spacer()
 
                 StatusBadge(
-                    title: canCaptureFunctionalState ? (frontmostApp == nil ? "Idle" : "Ready") : "Not ready",
-                    systemImage: canCaptureFunctionalState ? (frontmostApp == nil ? "pause.circle.fill" : "checkmark.circle.fill") : "lock.circle.fill",
-                    tint: canCaptureFunctionalState ? (frontmostApp == nil ? Color.secondary : Color.green) : Color.secondary
+                    title: canCaptureFunctionalState ? (frontmostApp == nil ? "Idle" : "Checked on save") : "Not ready",
+                    systemImage: canCaptureFunctionalState ? (frontmostApp == nil ? "pause.circle.fill" : "checkmark.shield.fill") : "lock.circle.fill",
+                    tint: canCaptureFunctionalState ? (frontmostApp == nil ? Color.secondary : Color.blue) : Color.secondary
                 )
             }
         }

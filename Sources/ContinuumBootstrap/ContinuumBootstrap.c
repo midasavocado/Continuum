@@ -34,7 +34,275 @@ static malloc_zone_t *continuum_app_state_zone = NULL;
 static uintptr_t continuum_main_text_start = 0;
 static uintptr_t continuum_main_text_end = 0;
 static volatile int continuum_allocator_interposition_active = 0;
+static volatile int continuum_app_state_capture_window_open = 1;
+
+enum {
+    CONTINUUM_APP_STATE_ALLOCATION_LIMIT = 16384,
+};
+
+typedef struct continuum_app_state_allocation {
+    mach_vm_address_t address;
+    mach_vm_size_t mapping_length;
+    size_t requested_size;
+    uint8_t active;
+} continuum_app_state_allocation;
+
+static continuum_app_state_allocation continuum_app_state_allocations[
+    CONTINUUM_APP_STATE_ALLOCATION_LIMIT
+];
+static size_t continuum_app_state_allocation_count = 0;
 static mach_vm_address_t continuum_app_state_mapping_cursor = 0;
+static mach_vm_address_t continuum_app_state_mapping_limit = 0;
+static pthread_mutex_t continuum_app_state_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const mach_vm_address_t continuum_app_state_candidates[] = {
+    UINT64_C(0x0000000140000000),
+    UINT64_C(0x0000000150000000),
+    UINT64_C(0x0000000160000000),
+    UINT64_C(0x0000000170000000),
+};
+
+static size_t continuum_app_state_size(
+    malloc_zone_t *zone,
+    const void *pointer
+) {
+    (void)zone;
+    if (pointer == NULL) {
+        return 0;
+    }
+    size_t result = 0;
+    pthread_mutex_lock(&continuum_app_state_lock);
+    for (size_t index = 0;
+         index < continuum_app_state_allocation_count;
+         index += 1) {
+        const continuum_app_state_allocation *allocation =
+            &continuum_app_state_allocations[index];
+        if (allocation->active
+            && allocation->address == (mach_vm_address_t)(uintptr_t)pointer) {
+            result = allocation->requested_size;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&continuum_app_state_lock);
+    return result;
+}
+
+static void *continuum_app_state_memalign(
+    malloc_zone_t *zone,
+    size_t alignment,
+    size_t size
+) {
+    (void)zone;
+    if (alignment < sizeof(void *)
+        || (alignment & (alignment - 1)) != 0) {
+        return NULL;
+    }
+    const size_t requested_size = size == 0 ? 1 : size;
+    const size_t page_size = (size_t)getpagesize();
+    if (requested_size > SIZE_MAX - (page_size - 1)) {
+        return NULL;
+    }
+    const mach_vm_size_t mapping_length =
+        (mach_vm_size_t)((requested_size + page_size - 1)
+            & ~(page_size - 1));
+    if (mapping_length > UINT64_C(0x10000000)) {
+        return NULL;
+    }
+    const mach_vm_size_t effective_alignment = alignment > page_size
+        ? (mach_vm_size_t)alignment
+        : (mach_vm_size_t)page_size;
+
+    pthread_mutex_lock(&continuum_app_state_lock);
+    if (continuum_app_state_allocation_count
+            >= CONTINUUM_APP_STATE_ALLOCATION_LIMIT) {
+        pthread_mutex_unlock(&continuum_app_state_lock);
+        return NULL;
+    }
+
+    if (continuum_app_state_mapping_cursor == 0) {
+        for (size_t index = 0;
+             index < sizeof(continuum_app_state_candidates)
+                / sizeof(continuum_app_state_candidates[0]);
+             index += 1) {
+            mach_vm_address_t candidate = continuum_app_state_candidates[index];
+            if ((candidate & (effective_alignment - 1)) != 0) {
+                continue;
+            }
+            kern_return_t result = mach_vm_map(
+                mach_task_self(),
+                &candidate,
+                mapping_length,
+                0,
+                VM_FLAGS_FIXED
+                    | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1),
+                MEMORY_OBJECT_NULL,
+                0,
+                FALSE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_INHERIT_NONE
+            );
+            if (result == KERN_SUCCESS
+                && candidate == continuum_app_state_candidates[index]) {
+                continuum_app_state_mapping_cursor = candidate;
+                continuum_app_state_mapping_limit = candidate
+                    + UINT64_C(0x10000000);
+                break;
+            }
+        }
+        if (continuum_app_state_mapping_cursor == 0) {
+            pthread_mutex_unlock(&continuum_app_state_lock);
+            return NULL;
+        }
+    } else {
+        const mach_vm_address_t aligned =
+            (continuum_app_state_mapping_cursor + effective_alignment - 1)
+                & ~(effective_alignment - 1);
+        if (aligned < continuum_app_state_mapping_cursor
+            || aligned >= continuum_app_state_mapping_limit
+            || mapping_length > continuum_app_state_mapping_limit - aligned) {
+            pthread_mutex_unlock(&continuum_app_state_lock);
+            return NULL;
+        }
+        mach_vm_address_t candidate = aligned;
+        kern_return_t result = mach_vm_map(
+            mach_task_self(),
+            &candidate,
+            mapping_length,
+            0,
+            VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1),
+            MEMORY_OBJECT_NULL,
+            0,
+            FALSE,
+            VM_PROT_READ | VM_PROT_WRITE,
+            VM_PROT_READ | VM_PROT_WRITE,
+            VM_INHERIT_NONE
+        );
+        if (result != KERN_SUCCESS || candidate != aligned) {
+            pthread_mutex_unlock(&continuum_app_state_lock);
+            return NULL;
+        }
+        continuum_app_state_mapping_cursor = candidate;
+    }
+
+    continuum_app_state_allocation *allocation =
+        &continuum_app_state_allocations[
+            continuum_app_state_allocation_count
+        ];
+    allocation->address = continuum_app_state_mapping_cursor;
+    allocation->mapping_length = mapping_length;
+    allocation->requested_size = requested_size;
+    allocation->active = 1;
+    continuum_app_state_allocation_count += 1;
+    const mach_vm_address_t allocation_end =
+        continuum_app_state_mapping_cursor + mapping_length;
+    continuum_app_state_mapping_cursor =
+        allocation_end <= continuum_app_state_mapping_limit - page_size
+            ? allocation_end + page_size
+            : continuum_app_state_mapping_limit;
+    void *result = (void *)(uintptr_t)allocation->address;
+    pthread_mutex_unlock(&continuum_app_state_lock);
+    return result;
+}
+
+static void *continuum_app_state_malloc(malloc_zone_t *zone, size_t size) {
+    return continuum_app_state_memalign(zone, sizeof(max_align_t), size);
+}
+
+static void *continuum_app_state_calloc(
+    malloc_zone_t *zone,
+    size_t count,
+    size_t size
+) {
+    if (count != 0 && size > SIZE_MAX / count) {
+        return NULL;
+    }
+    return continuum_app_state_malloc(zone, count * size);
+}
+
+static void *continuum_app_state_valloc(malloc_zone_t *zone, size_t size) {
+    return continuum_app_state_memalign(zone, (size_t)getpagesize(), size);
+}
+
+static void continuum_app_state_free(malloc_zone_t *zone, void *pointer) {
+    (void)zone;
+    if (pointer == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&continuum_app_state_lock);
+    for (size_t index = 0;
+         index < continuum_app_state_allocation_count;
+         index += 1) {
+        continuum_app_state_allocation *allocation =
+            &continuum_app_state_allocations[index];
+        if (!allocation->active
+            || allocation->address != (mach_vm_address_t)(uintptr_t)pointer) {
+            continue;
+        }
+        allocation->active = 0;
+        (void)mach_vm_deallocate(
+            mach_task_self(),
+            allocation->address,
+            allocation->mapping_length
+        );
+        break;
+    }
+    pthread_mutex_unlock(&continuum_app_state_lock);
+}
+
+static void *continuum_app_state_realloc(
+    malloc_zone_t *zone,
+    void *pointer,
+    size_t size
+) {
+    if (pointer == NULL) {
+        return continuum_app_state_malloc(zone, size);
+    }
+    if (size == 0) {
+        continuum_app_state_free(zone, pointer);
+        return NULL;
+    }
+    const size_t old_size = continuum_app_state_size(zone, pointer);
+    if (old_size == 0) {
+        return NULL;
+    }
+    void *replacement = continuum_app_state_malloc(zone, size);
+    if (replacement == NULL) {
+        return NULL;
+    }
+    memcpy(replacement, pointer, old_size < size ? old_size : size);
+    continuum_app_state_free(zone, pointer);
+    return replacement;
+}
+
+static void continuum_app_state_destroy(malloc_zone_t *zone) {
+    (void)zone;
+}
+
+static void continuum_app_state_free_definite_size(
+    malloc_zone_t *zone,
+    void *pointer,
+    size_t size
+) {
+    (void)size;
+    continuum_app_state_free(zone, pointer);
+}
+
+static size_t continuum_app_state_pressure_relief(
+    malloc_zone_t *zone,
+    size_t goal
+) {
+    (void)zone;
+    (void)goal;
+    return 0;
+}
+
+static boolean_t continuum_app_state_claimed_address(
+    malloc_zone_t *zone,
+    void *pointer
+) {
+    return continuum_app_state_size(zone, pointer) > 0;
+}
 
 #define CONTINUUM_INTERPOSE(replacement, replacee) \
     __attribute__((used)) static struct { \
@@ -63,9 +331,12 @@ static int continuum_allocation_is_app_owned(uintptr_t return_address) {
 }
 
 static void *continuum_state_malloc(size_t size) {
-    malloc_zone_t *zone = malloc_default_zone();
+    malloc_zone_t *default_zone = malloc_default_zone();
+    malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_zone != NULL
+    if (continuum_app_state_capture_window_open
+        && pthread_main_np() != 0
+        && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
@@ -75,13 +346,19 @@ static void *continuum_state_malloc(size_t size) {
         }
         __sync_lock_release(&continuum_allocator_interposition_active);
     }
-    return malloc_zone_malloc(zone, size);
+    void *result = malloc_zone_malloc(zone, size);
+    return result == NULL && zone == continuum_app_state_zone
+        ? malloc_zone_malloc(default_zone, size)
+        : result;
 }
 
 static void *continuum_state_calloc(size_t count, size_t size) {
-    malloc_zone_t *zone = malloc_default_zone();
+    malloc_zone_t *default_zone = malloc_default_zone();
+    malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_zone != NULL
+    if (continuum_app_state_capture_window_open
+        && pthread_main_np() != 0
+        && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
@@ -91,7 +368,10 @@ static void *continuum_state_calloc(size_t count, size_t size) {
         }
         __sync_lock_release(&continuum_allocator_interposition_active);
     }
-    return malloc_zone_calloc(zone, count, size);
+    void *result = malloc_zone_calloc(zone, count, size);
+    return result == NULL && zone == continuum_app_state_zone
+        ? malloc_zone_calloc(default_zone, count, size)
+        : result;
 }
 
 static void *continuum_state_typed_malloc(
@@ -99,9 +379,12 @@ static void *continuum_state_typed_malloc(
     malloc_type_id_t type_id
 ) {
     (void)type_id;
-    malloc_zone_t *zone = malloc_default_zone();
+    malloc_zone_t *default_zone = malloc_default_zone();
+    malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_zone != NULL
+    if (continuum_app_state_capture_window_open
+        && pthread_main_np() != 0
+        && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
@@ -111,7 +394,10 @@ static void *continuum_state_typed_malloc(
         }
         __sync_lock_release(&continuum_allocator_interposition_active);
     }
-    return malloc_zone_malloc(zone, size);
+    void *result = malloc_zone_malloc(zone, size);
+    return result == NULL && zone == continuum_app_state_zone
+        ? malloc_zone_malloc(default_zone, size)
+        : result;
 }
 
 static void *continuum_state_typed_calloc(
@@ -120,9 +406,12 @@ static void *continuum_state_typed_calloc(
     malloc_type_id_t type_id
 ) {
     (void)type_id;
-    malloc_zone_t *zone = malloc_default_zone();
+    malloc_zone_t *default_zone = malloc_default_zone();
+    malloc_zone_t *zone = default_zone;
     uintptr_t return_address = (uintptr_t)__builtin_return_address(0);
-    if (continuum_app_state_zone != NULL
+    if (continuum_app_state_capture_window_open
+        && pthread_main_np() != 0
+        && continuum_app_state_zone != NULL
         && __sync_lock_test_and_set(
             &continuum_allocator_interposition_active,
             1
@@ -132,7 +421,10 @@ static void *continuum_state_typed_calloc(
         }
         __sync_lock_release(&continuum_allocator_interposition_active);
     }
-    return malloc_zone_calloc(zone, count, size);
+    void *result = malloc_zone_calloc(zone, count, size);
+    return result == NULL && zone == continuum_app_state_zone
+        ? malloc_zone_calloc(default_zone, count, size)
+        : result;
 }
 
 CONTINUUM_INTERPOSE(continuum_state_malloc, malloc);
@@ -189,77 +481,29 @@ static void continuum_prepare_app_state_zone(void) {
             continuum_app_state_zone,
             CONTINUUM_BOOTSTRAP_APP_STATE_ZONE_NAME
         );
-        // Keep one allocation alive so the controller can safely prove that
-        // this process loaded the bootstrap before it sends safepoint signals.
-        (void)malloc_zone_malloc(continuum_app_state_zone, 1);
+        continuum_app_state_zone->size = continuum_app_state_size;
+        continuum_app_state_zone->malloc = continuum_app_state_malloc;
+        continuum_app_state_zone->calloc = continuum_app_state_calloc;
+        continuum_app_state_zone->valloc = continuum_app_state_valloc;
+        continuum_app_state_zone->free = continuum_app_state_free;
+        continuum_app_state_zone->realloc = continuum_app_state_realloc;
+        continuum_app_state_zone->destroy = continuum_app_state_destroy;
+        continuum_app_state_zone->memalign = continuum_app_state_memalign;
+        continuum_app_state_zone->free_definite_size =
+            continuum_app_state_free_definite_size;
+        continuum_app_state_zone->pressure_relief =
+            continuum_app_state_pressure_relief;
+        continuum_app_state_zone->claimed_address =
+            continuum_app_state_claimed_address;
+        continuum_app_state_zone->version = 10;
     }
 }
 
 __attribute__((visibility("default")))
 void *continuum_bootstrap_allocate_app_state(size_t size) {
-    if (size == 0) {
-        return NULL;
-    }
-    size_t page_size = (size_t)getpagesize();
-    if (size > SIZE_MAX - (page_size - 1)) {
-        return NULL;
-    }
-    size_t length = (size + page_size - 1) & ~(page_size - 1);
-    static const mach_vm_address_t candidates[] = {
-        UINT64_C(0x0000000140000000),
-        UINT64_C(0x0000000150000000),
-        UINT64_C(0x0000000160000000),
-        UINT64_C(0x0000000170000000),
-    };
-    if (continuum_app_state_mapping_cursor == 0) {
-        for (size_t index = 0;
-             index < sizeof(candidates) / sizeof(candidates[0]);
-             index += 1) {
-            mach_vm_address_t candidate = candidates[index];
-            kern_return_t candidate_result = mach_vm_map(
-                mach_task_self(),
-                &candidate,
-                length,
-                0,
-                VM_FLAGS_FIXED
-                    | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1),
-                MEMORY_OBJECT_NULL,
-                0,
-                FALSE,
-                VM_PROT_READ | VM_PROT_WRITE,
-                VM_PROT_READ | VM_PROT_WRITE,
-                VM_INHERIT_NONE
-            );
-            if (candidate_result == KERN_SUCCESS
-                && candidate == candidates[index]) {
-                continuum_app_state_mapping_cursor = candidate + length;
-                memset((void *)(uintptr_t)candidate, 0, length);
-                return (void *)(uintptr_t)candidate;
-            }
-        }
-        return NULL;
-    }
-    mach_vm_address_t address = continuum_app_state_mapping_cursor;
-    kern_return_t result = mach_vm_map(
-        mach_task_self(),
-        &address,
-        length,
-        0,
-        VM_FLAGS_FIXED | VM_MAKE_TAG(VM_MEMORY_APPLICATION_SPECIFIC_1),
-        MEMORY_OBJECT_NULL,
-        0,
-        FALSE,
-        VM_PROT_READ | VM_PROT_WRITE,
-        VM_PROT_READ | VM_PROT_WRITE,
-        VM_INHERIT_NONE
-    );
-    if (result != KERN_SUCCESS
-        || address != continuum_app_state_mapping_cursor) {
-        return NULL;
-    }
-    continuum_app_state_mapping_cursor += length;
-    memset((void *)(uintptr_t)address, 0, length);
-    return (void *)(uintptr_t)address;
+    return continuum_app_state_zone == NULL
+        ? NULL
+        : malloc_zone_malloc(continuum_app_state_zone, size);
 }
 
 static int continuum_should_preserve_receive_right(
@@ -366,8 +610,10 @@ static void continuum_run_loop_safepoint(
     void *context
 ) {
     (void)observer;
-    (void)activity;
     (void)context;
+    if (activity == kCFRunLoopBeforeWaiting) {
+        continuum_app_state_capture_window_open = 0;
+    }
     if (continuum_rehydrate_stop_requested
         && activity == kCFRunLoopBeforeWaiting) {
         continuum_rehydrate_idle_boundaries += 1;

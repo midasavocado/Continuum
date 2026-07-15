@@ -2,7 +2,7 @@
 
 Continuum is a native macOS research prototype for safe, branching app snapshots: save a moment, preserve the current future before rewinding, and never label a screenshot as restorable state.
 
-> **Current status: v0.3 research build.** Continuum connects its consumer app to the live process-group checkpoint runtime. It discovers a root process and descendant helper tree, identity-pins and suspends every task, copies every readable+writable private/COW mapping plus ARM64 register state, and restores helpers-first with an all-member safety cut and rollback. In that same suspended cut it inventories open writable regular files and creates APFS copy-on-write clones; restore writes their captured bytes back through the existing vnode so live descriptors keep their identity. The signed shipping-adapter proof rewinds both root and helper, restores both processes' open-file bytes, tolerates additive Mach/XPC rights while identity-validating all saved rights, then completes 100 additional arena cycles. Its current two-process snapshot is roughly 200–1,050 ms and restore roughly 250–410 ms for about 635 MB of retained RAM. Before writing memory, the restore compares file descriptors, vnode identity/offsets, sockets, pipes, kqueues, saved Mach names/right types/kernel objects, threads, process membership, and parent topology; a deliberate extra-FD test is rejected with zero bytes written. It still does **not** certify arbitrary apps or games because closed-file and namespace history remain uncovered, other resources are guarded rather than recreated, and XPC message queues, WindowServer, GPU, audio, and device reconstruction remain unfinished.
+> **Current status: v0.3 research build.** Continuum now proves one real AppKit cold-restore path: an ordinary direct `calloc` made during deterministic main-thread startup is captured in a tagged RAM capsule, the original GUI process fully exits, and a different PID relaunches with that saved value at the same address and a new functional WindowServer window. The replacement is fully prepared and validated before the live app is closed. Current files are deliberately left unchanged. The broader signed proof still validates 202 live/cold memory restores and guarded process resources. This is **not** arbitrary-app certification: Swift/Objective-C/framework heaps, general post-launch allocations, sockets, Mach/XPC queues, GPU state, audio, devices, and full thread continuation remain outside the proven cold path.
 
 Continuum requires macOS 15 or later. The cooperative signed proof works through explicit development entitlements and verifies that it never changes SIP state. Testing unmodified third-party processes on this development Mac currently relies on the user's SIP-disabled configuration; that is not a consumer distribution plan or proof of universal compatibility.
 
@@ -14,14 +14,15 @@ Continuum requires macOS 15 or later. The cooperative signed proof works through
 - Exact blockers for Apple platform binaries, sandbox or identity-bound apps, App Store/DRM targets, restricted entitlements, unsupported nested code, malformed bundles, and standalone executables that cannot use the current bundle route.
 - A floating native snapshot picker opened by a configurable global shortcut, with arrow-key navigation, Return to restore, Escape to cancel, and clear Ready or Unavailable states.
 - Global `Control–Option–Command–S` hot-snapshot registration plus safe rewind-shortcut presets while Continuum is running.
-- A shipping `HotProcessCheckpointService` that retains live process-group snapshots, expires them after relaunch/eviction, refuses changed resource topology, and never promotes them to exact local restoration.
+- A shipping `HotProcessCheckpointService` that retains live process-group snapshots and promotes an expired snapshot to fresh-process restore only when it contains a deterministic tagged startup capsule; legacy and untagged snapshots fail closed.
+- A GUI cold-restorer that preflights a stopped replacement while the original remains alive, validates executable/OS/mapping identity and encrypted chunks, then closes the current app, resumes the new PID, and activates its windows.
 - Typed snapshot, checkpoint, branch, compatibility, storage, and external-effect models shared by the app, store, and test harness.
 - An encrypted, content-addressed snapshot-store implementation with immutable manual snapshots, provisional pre-rewind safety snapshots, atomic branch creation, deduplication, and integrity verification.
 - A signed multi-process Mach proof that discovers a root/helper tree, suspends it with `task_suspend2` tokens, copies every readable+writable private/COW region without aliasing or mutating target VM maps, captures ARM64 general/NEON registers, and restores coalesced changed-page runs plus registers helpers-first.
 - A generic kernel-resource fingerprint for descriptor topology, vnode identity and offsets, sockets, pipes, kqueues, shared-memory/semaphore descriptors, Mach rights, and thread identities.
 - An automatic pre-restore safety snapshot, full readback validation, rollback on partial failure, PID/start-time/executable-inode pinning, strict VM-layout/resource/thread-set validation, bounded protocol timeouts, and balanced target suspend/resume handling. A descriptor mutation is proven to fail before any memory or register write.
-- A per-app APFS local-file checkpoint layer that creates cheap COW clones, verifies live device/inode identity, restores bytes through the existing vnode, fsyncs the result, and refuses a replaced path rather than silently breaking open descriptors.
-- Snapshot metadata and UI language for per-app capture groups, exact **App + Local Files** rewind, and a future **App Only — Keep Current Files** choice that remains disabled unless old memory with newer files is explicitly certified safe.
+- A separate APFS local-file checkpoint research layer. The current consumer cold-restore path does not invoke it and never rewrites file bytes.
+- Snapshot metadata and UI language for per-app capture groups and process-only restore with current files left unchanged.
 - Command-line setup, memory, external-target, and transaction proofs, plus tests for models, storage, setup recovery, app inventory, permissions, hotkeys, and runtime primitives.
 
 The app deliberately distinguishes **Managed Copy Prepared** from rewind certification. Preparation makes an eligible copy attachable for the next runtime gate; it does not enable **Play from Here**.
@@ -32,7 +33,7 @@ The app deliberately distinguishes **Managed Copy Prepared** from rewind certifi
 - VM-map topology restoration when an app allocates, frees, splits, or replaces a captured mapping. The runtime fails closed when topology changes, including when private memory becomes a live shared mapping.
 - Recreation of file descriptors, closed/renamed/deleted files, Mach ports, XPC, sockets, pipes, kqueues, launchd-reparented/XPC helpers, WindowServer, GPU, audio, devices, or input state. Stable descendant helpers and bytes of currently open writable regular files are now captured; changing or external helpers remain blockers.
 - File discovery/attribution, namespace journaling, SQLite WAL/SHM lock restoration, or automatic connection of the APFS byte layer to arbitrary apps.
-- Deterministic replay, outbound-effect suppression, crash interception, or cold restore after reboot.
+- Deterministic replay, outbound-effect suppression, crash interception, or a proven cold restore after reboot.
 - Resource reconstruction for sockets, Mach/XPC, WindowServer/Core Animation, GPU/Metal/OpenGL, audio, input, and devices. The current live restore engine guards or rejects these instead.
 - Runtime injection or launch of prepared managed copies, a privileged helper, or app-specific bridges.
 - A certified KSP, browser, IDE, Apple-app, DRM, or anti-cheat integration.
@@ -126,9 +127,8 @@ Continuum never grants itself access. Every prompt follows a user click, and onb
 - `Unavailable` snapshots may be inspected but cannot be restored. `Ready` means the original live process tree is still retained.
 - Local restoration can never unsend messages, undo purchases, retract uploads, or reverse changes already accepted by a remote service.
 - Capture is per app, not full-device: the selected app, its helpers, and certified dependent writers form one capture group. Unrelated apps and system services do not rewind.
-- Exact restore defaults to **App + Local Files**. APFS clones preserve file preimages and restoration writes through the same inode so open descriptors remain valid.
-- **App Only — Keep Current Files** is offered only when a compatibility run proves that combining historical memory with current files is safe. Databases, games, and IDEs should normally keep it disabled.
-- Choosing **Open App From Here** always saves the app and captured local files being left first, so disk changes branch with memory instead of being destructively overwritten.
+- The current cold path restores only its certified RAM capsule. It does not roll files backward; file contents on disk remain current.
+- Continuum validates and stops a replacement process before closing the live app, so a corrupt or incompatible checkpoint fails without first destroying the current process.
 
 The store proves these transaction semantics using harness-owned artifacts. It does not make another app's state restorable by itself.
 

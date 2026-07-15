@@ -1178,6 +1178,35 @@ static uint32_t continuum_canonical_share_mode(uint32_t share_mode) {
         : share_mode;
 }
 
+static int continuum_region_is_app_state(
+    mach_vm_address_t address,
+    mach_vm_size_t size,
+    uint32_t user_tag
+) {
+    static const mach_vm_address_t arena_bases[] = {
+        UINT64_C(0x0000000140000000),
+        UINT64_C(0x0000000150000000),
+        UINT64_C(0x0000000160000000),
+        UINT64_C(0x0000000170000000),
+    };
+    if (user_tag != VM_MEMORY_APPLICATION_SPECIFIC_1 || size == 0) {
+        return 0;
+    }
+    uint64_t end = 0;
+    if (!continuum_add_u64(address, size, &end)) {
+        return 0;
+    }
+    for (size_t index = 0;
+         index < sizeof(arena_bases) / sizeof(arena_bases[0]);
+         index += 1) {
+        const uint64_t arena_end = arena_bases[index] + UINT64_C(0x10000000);
+        if (address >= arena_bases[index] && end <= arena_end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void continuum_hash_vm_region(
     uint64_t *hash,
     mach_vm_address_t address,
@@ -3667,17 +3696,7 @@ static continuum_status continuum_capture_process_snapshot_suspended(
     }
 
     continuum_vm_range_set app_state_ranges;
-    status = continuum_collect_named_malloc_zone_ranges(
-        session->task,
-        "ContinuumAppState",
-        MALLOC_PTR_IN_USE_RANGE_TYPE | MALLOC_ADMIN_REGION_RANGE_TYPE,
-        &app_state_ranges
-    );
-    if (status != CONTINUUM_STATUS_OK) {
-        memset(&app_state_ranges, 0, sizeof(app_state_ranges));
-        status = CONTINUUM_STATUS_OK;
-    }
-    snapshot->has_isolated_app_state = app_state_ranges.count > 0;
+    memset(&app_state_ranges, 0, sizeof(app_state_ranges));
 
     size_t capacity = 0;
     mach_vm_address_t address = 0;
@@ -3710,21 +3729,11 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         const int writable =
             (info.protection & (VM_PROT_READ | VM_PROT_WRITE))
                 == (VM_PROT_READ | VM_PROT_WRITE);
-        int app_owned_state =
-            info.user_tag == VM_MEMORY_APPLICATION_SPECIFIC_1;
-        for (size_t range_index = 0;
-             range_index < app_state_ranges.count;
-             range_index += 1) {
-            if (continuum_ranges_overlap(
-                    address,
-                    region_size,
-                    app_state_ranges.ranges[range_index].address,
-                    app_state_ranges.ranges[range_index].size
-                )) {
-                app_owned_state = 1;
-                break;
-            }
-        }
+        const int app_owned_state = continuum_region_is_app_state(
+            address,
+            region_size,
+            info.user_tag
+        );
         const int eligible_memory = writable
             && !continuum_region_overlaps_shared_cache(address, region_size)
             && !continuum_region_contains_workqueue_runtime_state(
@@ -3805,17 +3814,7 @@ static continuum_status continuum_capture_process_snapshot_suspended(
                     &quartzcore_ranges
                 );
             region->is_app_owned_state = app_owned_state;
-            for (size_t range_index = 0;
-                 range_index < app_state_ranges.count;
-                 range_index += 1) {
-                if (!continuum_ranges_overlap(
-                    address,
-                    region_size,
-                    app_state_ranges.ranges[range_index].address,
-                    app_state_ranges.ranges[range_index].size
-                )) {
-                    continue;
-                }
+            if (app_owned_state) {
                 vm_range_t *resized = realloc(
                     region->app_state_allocations,
                     (region->app_state_allocation_count + 1)
@@ -3828,8 +3827,12 @@ static continuum_status continuum_capture_process_snapshot_suspended(
                 region->app_state_allocations = resized;
                 region->app_state_allocations[
                     region->app_state_allocation_count
-                ] = app_state_ranges.ranges[range_index];
+                ] = (vm_range_t) {
+                    .address = address,
+                    .size = region_size,
+                };
                 region->app_state_allocation_count += 1;
+                snapshot->has_isolated_app_state = 1;
             }
             if (status != CONTINUUM_STATUS_OK) {
                 break;
@@ -5231,17 +5234,45 @@ continuum_status continuum_remote_process_has_app_state_zone(
         return status;
     }
 
-    continuum_vm_range_set ranges;
-    status = continuum_collect_named_malloc_zone_ranges(
-        session->task,
-        "ContinuumAppState",
-        MALLOC_PTR_IN_USE_RANGE_TYPE | MALLOC_ADMIN_REGION_RANGE_TYPE,
-        &ranges
-    );
-    if (status == CONTINUUM_STATUS_OK) {
-        *out_has_app_state_zone = ranges.count > 0 ? 1 : 0;
+    mach_vm_address_t address = 0;
+    natural_t depth = 0;
+    while (status == CONTINUUM_STATUS_OK) {
+        mach_vm_size_t region_size = 0;
+        vm_region_submap_info_data_64_t info;
+        memset(&info, 0, sizeof(info));
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t result = mach_vm_region_recurse(
+            session->task,
+            &address,
+            &region_size,
+            &depth,
+            (vm_region_recurse_info_t)&info,
+            &count
+        );
+        if (result == KERN_INVALID_ADDRESS) {
+            break;
+        }
+        if (result != KERN_SUCCESS || region_size == 0) {
+            status = CONTINUUM_STATUS_MACH_ERROR;
+            break;
+        }
+        if (info.is_submap) {
+            depth += 1;
+            continue;
+        }
+        if (continuum_region_is_app_state(
+                address,
+                region_size,
+                info.user_tag
+            )) {
+            *out_has_app_state_zone = 1;
+            break;
+        }
+        if (UINT64_MAX - address < region_size) {
+            break;
+        }
+        address += region_size;
     }
-    free(ranges.ranges);
     continuum_remote_session_destroy(session);
     return status;
 }

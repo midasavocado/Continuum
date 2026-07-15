@@ -119,6 +119,23 @@ enum GUIColdProof {
             titleSuffix: "333"
         )
 
+        // Build and validate the stopped replacement before destroying the
+        // live app. The consumer restore path uses this ordering so a corrupt
+        // checkpoint cannot close the user's current process first.
+        let restorer = ColdProcessRestorer(
+            bootstrapLibraryURL: URL(fileURLWithPath: bootstrapPath)
+        )
+        let preparation = try await restorer.prepareRootProcess(
+            from: snapshot.id,
+            repository: store
+        )
+        guard preparation.replacementProcessIdentifier != originalPID,
+              processExists(originalPID) else {
+            throw GUIColdProofError.failure(
+                "preflight did not preserve the original GUI process"
+            )
+        }
+
         kill(originalPID, SIGKILL)
         original.waitUntilExit()
         originalReaped = true
@@ -127,13 +144,6 @@ enum GUIColdProof {
         }
         try await waitForWindowAbsence(processIdentifier: originalPID)
 
-        let restorer = ColdProcessRestorer(
-            bootstrapLibraryURL: URL(fileURLWithPath: bootstrapPath)
-        )
-        let preparation = try await restorer.prepareRootProcess(
-            from: snapshot.id,
-            repository: store
-        )
         let commit = try await restorer.commit(preparation.id)
         let replacementPID = commit.processIdentifier
         var replacementReaped = false
@@ -188,6 +198,7 @@ enum GUIColdProof {
         print("gui-cold-proof: PASS")
         print("  original PID:    \(originalPID) (exited)")
         print("  replacement PID: \(replacementPID)")
+        print("  preflight:       replacement validated before original exit")
         print("  restored RAM:    0x\(String(saved.address, radix: 16)) = 222")
         print("  divergent future: 333 discarded with the original PID")
         print("  live mutation:   333 after restore")

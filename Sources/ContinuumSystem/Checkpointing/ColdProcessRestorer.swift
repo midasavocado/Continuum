@@ -151,13 +151,6 @@ public actor ColdProcessRestorer {
         let usesDeterministicAddressSpace =
             launch.addressSpacePolicy == .continuumDeterministic
         try validateExecutable(process: process, launch: launch)
-        guard image.members.allSatisfy({
-            Self.processIsAbsent($0.processIdentifier)
-        }) else {
-            throw ContinuumError.restoreUnavailable(
-                "Cold restoration requires the captured process tree to be fully exited."
-            )
-        }
         guard let bootstrapLibraryPath,
               FileManager.default.fileExists(atPath: bootstrapLibraryPath) else {
             throw ContinuumError.restoreUnavailable(
@@ -174,6 +167,13 @@ public actor ColdProcessRestorer {
                 repository: repository,
                 bootstrapLibraryPath: bootstrapLibraryPath,
                 usesDeterministicAddressSpace: usesDeterministicAddressSpace
+            )
+        }
+        guard image.members.allSatisfy({
+            Self.processIsAbsent($0.processIdentifier)
+        }) else {
+            throw ContinuumError.restoreUnavailable(
+                "Cold restoration requires the captured process tree to be fully exited."
             )
         }
 
@@ -1475,8 +1475,7 @@ public actor ColdProcessRestorer {
                 "The checkpoint page size does not match this Mac."
             )
         }
-        guard image.operatingSystemBuild
-                == ProcessInfo.processInfo.operatingSystemVersionString else {
+        guard image.operatingSystemBuild == (try currentOperatingSystemBuild()) else {
             throw ContinuumError.restoreUnavailable(
                 "macOS changed since this checkpoint was captured."
             )
