@@ -27,8 +27,7 @@ enum AppBootstrap {
                 rootDirectory: try? appSetupStoreURL(),
                 bootstrapLibraryURL: Bundle.main.privateFrameworksURL?
                     .appendingPathComponent("libContinuumBootstrap.dylib")
-            ),
-            automaticallyPreparesCaptureTargets: true
+            )
         )
     }
 

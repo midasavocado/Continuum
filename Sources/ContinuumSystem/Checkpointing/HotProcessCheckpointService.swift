@@ -77,7 +77,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             }
             guard preflight == CONTINUUM_STATUS_OK, hasBootstrap != 0 else {
                 throw ContinuumError.runtimeUnsupported(
-                    "Continuum needs to prepare and reopen this app once before its first restorable snapshot."
+                    "Continuum did not change or restart this app, so no false snapshot was created. This process was not armed before launch."
                 )
             }
             guard kill(rootProcessIdentifier, SIGUSR2) == 0 else {
