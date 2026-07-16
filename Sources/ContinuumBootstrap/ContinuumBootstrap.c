@@ -773,6 +773,15 @@ volatile continuum_bootstrap_pty_safepoint_status
         .structure_size = sizeof(continuum_bootstrap_pty_safepoint_status),
     };
 
+__attribute__((visibility("default")))
+volatile continuum_bootstrap_descriptor_safepoint_status
+    continuum_bootstrap_descriptor_safepoint_report = {
+        .magic = CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_MAGIC,
+        .version = 1,
+        .structure_size =
+            sizeof(continuum_bootstrap_descriptor_safepoint_status),
+    };
+
 extern id objc_alloc(Class cls);
 extern id objc_allocWithZone(Class cls);
 extern id objc_alloc_init(Class cls);
@@ -1668,15 +1677,51 @@ static void continuum_publish_pty_safepoint_status(void) {
         descriptors,
         (int)capacity
     );
+    uint32_t exported_descriptor_count = 0;
+    int descriptor_overflow = 0;
     if (returned_bytes < 0
         || returned_bytes % (int)sizeof(struct proc_fdinfo) != 0
         || (size_t)returned_bytes > capacity) {
         queue_state_known = 0;
+        descriptor_overflow = 1;
     } else {
         size_t descriptor_count =
             (size_t)returned_bytes / sizeof(struct proc_fdinfo);
         for (size_t index = 0; index < descriptor_count; index += 1) {
             int descriptor = descriptors[index].proc_fd;
+            uint32_t kind = 0;
+            switch (descriptors[index].proc_fdtype) {
+                case PROX_FDTYPE_SOCKET:
+                    kind = CONTINUUM_BOOTSTRAP_DESCRIPTOR_SOCKET;
+                    break;
+                case PROX_FDTYPE_PIPE:
+                    kind = CONTINUUM_BOOTSTRAP_DESCRIPTOR_PIPE;
+                    break;
+                case PROX_FDTYPE_KQUEUE:
+                    kind = CONTINUUM_BOOTSTRAP_DESCRIPTOR_KQUEUE;
+                    break;
+                default:
+                    break;
+            }
+            if (kind != 0) {
+                int descriptor_flags = fcntl(descriptor, F_GETFD);
+                int status_flags = fcntl(descriptor, F_GETFL);
+                if (descriptor_flags < 0 || status_flags < 0
+                    || exported_descriptor_count
+                        >= CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_LIMIT) {
+                    descriptor_overflow = 1;
+                } else {
+                    continuum_bootstrap_descriptor_status_entry entry = {
+                        .file_descriptor = descriptor,
+                        .descriptor_flags = descriptor_flags,
+                        .status_flags = status_flags,
+                        .kind = kind,
+                    };
+                    continuum_bootstrap_descriptor_safepoint_report
+                        .descriptors[exported_descriptor_count] = entry;
+                    exported_descriptor_count += 1;
+                }
+            }
             if (!isatty(descriptor)) {
                 continue;
             }
@@ -1699,6 +1744,22 @@ static void continuum_publish_pty_safepoint_status(void) {
         }
     }
     free(descriptors);
+
+    continuum_bootstrap_descriptor_safepoint_report.safepoint_active = 0;
+    continuum_bootstrap_descriptor_safepoint_report.magic =
+        CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_MAGIC;
+    continuum_bootstrap_descriptor_safepoint_report.version = 1;
+    continuum_bootstrap_descriptor_safepoint_report.structure_size =
+        sizeof(continuum_bootstrap_descriptor_safepoint_status);
+    continuum_bootstrap_descriptor_safepoint_report.generation = generation;
+    continuum_bootstrap_descriptor_safepoint_report.descriptor_count =
+        exported_descriptor_count;
+    continuum_bootstrap_descriptor_safepoint_report.overflow =
+        descriptor_overflow ? 1 : 0;
+    continuum_bootstrap_descriptor_safepoint_report.reserved[0] = 0;
+    continuum_bootstrap_descriptor_safepoint_report.reserved[1] = 0;
+    __sync_synchronize();
+    continuum_bootstrap_descriptor_safepoint_report.safepoint_active = 1;
 
     continuum_bootstrap_pty_safepoint_report.safepoint_active = 0;
     continuum_bootstrap_pty_safepoint_report.magic =
@@ -1748,6 +1809,7 @@ static void continuum_run_loop_safepoint(
     continuum_publish_pty_safepoint_status();
     continuum_bootstrap_safepoint_spin();
     continuum_bootstrap_pty_safepoint_report.safepoint_active = 0;
+    continuum_bootstrap_descriptor_safepoint_report.safepoint_active = 0;
     continuum_preservation_active = 0;
     __sync_lock_release(&continuum_safepoint_claimed);
 }

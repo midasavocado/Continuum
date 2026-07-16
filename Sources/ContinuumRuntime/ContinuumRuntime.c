@@ -2067,6 +2067,9 @@ typedef struct continuum_bootstrap_pthread_wire_report {
 } continuum_bootstrap_pthread_wire_report;
 
 #define CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC UINT64_C(0x434F4E5450545951)
+#define CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_MAGIC \
+    UINT64_C(0x434F4E5446445354)
+#define CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_LIMIT 1024
 
 typedef struct continuum_bootstrap_pty_safepoint_wire_status {
     uint64_t magic;
@@ -2080,6 +2083,26 @@ typedef struct continuum_bootstrap_pty_safepoint_wire_status {
     uint8_t safepoint_active;
     uint8_t reserved;
 } continuum_bootstrap_pty_safepoint_wire_status;
+
+typedef struct continuum_bootstrap_descriptor_status_wire_entry {
+    int32_t file_descriptor;
+    int32_t descriptor_flags;
+    int32_t status_flags;
+    uint32_t kind;
+} continuum_bootstrap_descriptor_status_wire_entry;
+
+typedef struct continuum_bootstrap_descriptor_safepoint_wire_status {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t structure_size;
+    uint64_t generation;
+    uint32_t descriptor_count;
+    uint8_t overflow;
+    uint8_t safepoint_active;
+    uint8_t reserved[2];
+    continuum_bootstrap_descriptor_status_wire_entry
+        descriptors[CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_LIMIT];
+} continuum_bootstrap_descriptor_safepoint_wire_status;
 
 struct continuum_remote_session {
     mach_port_t task;
@@ -2889,9 +2912,12 @@ continuum_status continuum_inspect_local_bootstrap_library(
         handle, "continuum_bootstrap_prepare_pthreads_and_trap");
     void *pty_status_symbol = dlsym(
         handle, "continuum_bootstrap_pty_safepoint_report");
+    void *descriptor_status_symbol = dlsym(
+        handle, "continuum_bootstrap_descriptor_safepoint_report");
     Dl_info info;
     memset(&info, 0, sizeof(info));
     if (symbol == NULL || pthread_symbol == NULL || pty_status_symbol == NULL
+        || descriptor_status_symbol == NULL
         || dladdr(symbol, &info) == 0
         || info.dli_fbase == NULL || info.dli_fname == NULL) {
         goto cleanup;
@@ -2918,17 +2944,24 @@ continuum_status continuum_inspect_local_bootstrap_library(
     );
 #endif
     uintptr_t pty_status_address = (uintptr_t)pty_status_symbol;
+    uintptr_t descriptor_status_address =
+        (uintptr_t)descriptor_status_symbol;
     uintptr_t image_base = (uintptr_t)info.dli_fbase;
     Dl_info pthread_info;
     Dl_info pty_status_info;
+    Dl_info descriptor_status_info;
     memset(&pthread_info, 0, sizeof(pthread_info));
     memset(&pty_status_info, 0, sizeof(pty_status_info));
+    memset(&descriptor_status_info, 0, sizeof(descriptor_status_info));
     if (copy_address <= image_base || pthread_prepare_address <= image_base
         || pty_status_address <= image_base
+        || descriptor_status_address <= image_base
         || dladdr(pthread_symbol, &pthread_info) == 0
         || dladdr(pty_status_symbol, &pty_status_info) == 0
+        || dladdr(descriptor_status_symbol, &descriptor_status_info) == 0
         || pthread_info.dli_fbase != info.dli_fbase
-        || pty_status_info.dli_fbase != info.dli_fbase) {
+        || pty_status_info.dli_fbase != info.dli_fbase
+        || descriptor_status_info.dli_fbase != info.dli_fbase) {
         goto cleanup;
     }
     status = continuum_copy_local_image_uuid(
@@ -2947,6 +2980,10 @@ continuum_status continuum_inspect_local_bootstrap_library(
     out_identity->pty_safepoint_status_address = pty_status_address;
     out_identity->pty_safepoint_status_offset =
         pty_status_address - image_base;
+    out_identity->descriptor_safepoint_status_address =
+        descriptor_status_address;
+    out_identity->descriptor_safepoint_status_offset =
+        descriptor_status_address - image_base;
 
 cleanup:
     dlclose(handle);
@@ -12641,8 +12678,180 @@ static continuum_status continuum_descriptor_graph_validate(
     return CONTINUUM_STATUS_OK;
 }
 
-continuum_status continuum_remote_process_group_capture_descriptor_graph(
+static continuum_status continuum_descriptor_graph_merge_bootstrap_flags(
     const continuum_remote_process_group_snapshot *snapshot,
+    const char *bootstrap_library_path,
+    continuum_remote_descriptor_graph *graph
+) {
+    continuum_bootstrap_identity identity;
+    continuum_status status = continuum_inspect_local_bootstrap_library(
+        bootstrap_library_path,
+        &identity
+    );
+    if (status != CONTINUUM_STATUS_OK
+        || identity.pty_safepoint_status_offset == 0
+        || identity.descriptor_safepoint_status_offset == 0) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+
+    continuum_bootstrap_descriptor_safepoint_wire_status *descriptor_report =
+        calloc(1, sizeof(*descriptor_report));
+    if (descriptor_report == NULL) return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    for (size_t member_index = 0;
+         member_index < snapshot->member_count;
+         member_index += 1) {
+        const continuum_remote_process_group_member *member =
+            &snapshot->members[member_index];
+        if (member->session == NULL || member->snapshot == NULL
+            || member->snapshot->threads == NULL) {
+            status = CONTINUUM_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+        status = continuum_validate_session_identity(member->session);
+        if (status != CONTINUUM_STATUS_OK) break;
+
+        mach_vm_address_t image_base = 0;
+        status = continuum_find_authenticated_bootstrap_base(
+            member->session,
+            bootstrap_library_path,
+            identity.image_uuid,
+            &image_base
+        );
+        uint64_t pty_address = 0;
+        uint64_t descriptor_address = 0;
+        if (status == CONTINUUM_STATUS_OK
+            && (!continuum_add_u64(
+                    image_base,
+                    identity.pty_safepoint_status_offset,
+                    &pty_address
+                )
+                || !continuum_add_u64(
+                    image_base,
+                    identity.descriptor_safepoint_status_offset,
+                    &descriptor_address
+                ))) {
+            status = CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        if (status != CONTINUUM_STATUS_OK) break;
+
+        continuum_bootstrap_pty_safepoint_wire_status pty_report;
+        memset(&pty_report, 0, sizeof(pty_report));
+        memset(descriptor_report, 0, sizeof(*descriptor_report));
+        status = continuum_read_task_bytes(
+            member->session->task,
+            pty_address,
+            sizeof(pty_report),
+            &pty_report
+        );
+        if (status == CONTINUUM_STATUS_OK) {
+            status = continuum_read_task_bytes(
+                member->session->task,
+                descriptor_address,
+                sizeof(*descriptor_report),
+                descriptor_report
+            );
+        }
+        if (status != CONTINUUM_STATUS_OK) break;
+        if (pty_report.magic != CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC
+            || pty_report.version != 2
+            || pty_report.structure_size != sizeof(pty_report)
+            || pty_report.generation == 0
+            || pty_report.safepoint_thread_identifier == 0
+            || pty_report.safepoint_active != 1
+            || descriptor_report->magic
+                != CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_MAGIC
+            || descriptor_report->version != 1
+            || descriptor_report->structure_size != sizeof(*descriptor_report)
+            || descriptor_report->generation != pty_report.generation
+            || descriptor_report->descriptor_count
+                > CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_LIMIT
+            || descriptor_report->overflow != 0
+            || descriptor_report->safepoint_active != 1) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+            break;
+        }
+
+        size_t matching_safepoint_threads = 0;
+        for (size_t thread_index = 0;
+             thread_index < member->snapshot->threads->count;
+             thread_index += 1) {
+            if (member->snapshot->threads->entries[thread_index].identifier
+                == pty_report.safepoint_thread_identifier) {
+                matching_safepoint_threads += 1;
+            }
+        }
+        if (matching_safepoint_threads != 1) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+            break;
+        }
+
+        const int32_t process_id = member->session->identity.process_id;
+        size_t expected_count = 0;
+        for (size_t index = 0; index < graph->handle_count; index += 1) {
+            if (graph->handles[index].process_id == process_id) {
+                graph->handles[index].descriptor_flags = -1;
+                expected_count += 1;
+            }
+        }
+        if (expected_count != descriptor_report->descriptor_count) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+            break;
+        }
+        for (uint32_t entry_index = 0;
+             entry_index < descriptor_report->descriptor_count;
+             entry_index += 1) {
+            const continuum_bootstrap_descriptor_status_wire_entry *entry =
+                &descriptor_report->descriptors[entry_index];
+            continuum_remote_descriptor_handle_info *match = NULL;
+            if (entry->file_descriptor < 0 || entry->descriptor_flags < 0
+                || entry->status_flags < 0
+                || entry->kind < CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_SOCKET
+                || entry->kind > CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_KQUEUE) {
+                status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                break;
+            }
+            for (size_t handle_index = 0;
+                 handle_index < graph->handle_count;
+                 handle_index += 1) {
+                continuum_remote_descriptor_handle_info *candidate =
+                    &graph->handles[handle_index];
+                if (candidate->process_id == process_id
+                    && candidate->file_descriptor == entry->file_descriptor) {
+                    if (match != NULL
+                        || (uint32_t)candidate->resource_kind != entry->kind) {
+                        status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                        break;
+                    }
+                    match = candidate;
+                }
+            }
+            if (status != CONTINUUM_STATUS_OK) break;
+            if (match == NULL || match->descriptor_flags >= 0) {
+                status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                break;
+            }
+            match->descriptor_flags = entry->descriptor_flags;
+            match->status_flags = entry->status_flags;
+        }
+        if (status != CONTINUUM_STATUS_OK) break;
+        for (size_t index = 0; index < graph->handle_count; index += 1) {
+            if (graph->handles[index].process_id == process_id
+                && graph->handles[index].descriptor_flags < 0) {
+                status = CONTINUUM_STATUS_VALIDATION_FAILED;
+                break;
+            }
+        }
+        if (status != CONTINUUM_STATUS_OK) break;
+    }
+    free(descriptor_report);
+    return status;
+}
+
+static continuum_status continuum_capture_descriptor_graph_internal(
+    const continuum_remote_process_group_snapshot *snapshot,
+    const char *bootstrap_library_path,
     continuum_remote_descriptor_graph **out_graph
 ) {
     if (snapshot == NULL || out_graph == NULL) {
@@ -12765,6 +12974,13 @@ continuum_status continuum_remote_process_group_capture_descriptor_graph(
         }
         free(descriptors);
     }
+    if (status == CONTINUUM_STATUS_OK && bootstrap_library_path != NULL) {
+        status = continuum_descriptor_graph_merge_bootstrap_flags(
+            snapshot,
+            bootstrap_library_path,
+            graph
+        );
+    }
     if (status == CONTINUUM_STATUS_OK) {
         status = continuum_descriptor_graph_validate(graph);
     }
@@ -12774,6 +12990,29 @@ continuum_status continuum_remote_process_group_capture_descriptor_graph(
     }
     *out_graph = graph;
     return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_process_group_capture_descriptor_graph(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_descriptor_graph **out_graph
+) {
+    return continuum_capture_descriptor_graph_internal(snapshot, NULL, out_graph);
+}
+
+continuum_status
+continuum_remote_process_group_capture_descriptor_graph_authenticated(
+    const continuum_remote_process_group_snapshot *snapshot,
+    const char *bootstrap_library_path,
+    continuum_remote_descriptor_graph **out_graph
+) {
+    if (bootstrap_library_path == NULL || bootstrap_library_path[0] == '\0') {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_capture_descriptor_graph_internal(
+        snapshot,
+        bootstrap_library_path,
+        out_graph
+    );
 }
 
 size_t continuum_remote_descriptor_graph_handle_count(

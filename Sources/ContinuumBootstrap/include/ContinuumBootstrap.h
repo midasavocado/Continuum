@@ -12,6 +12,39 @@ enum { CONTINUUM_BOOTSTRAP_SAFEPOINT_REGISTER = 28 };
 #define CONTINUUM_BOOTSTRAP_SAFEPOINT_MAGIC UINT64_C(0x434F4E5453414645)
 #define CONTINUUM_BOOTSTRAP_APP_STATE_ZONE_NAME "ContinuumAppState"
 #define CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC UINT64_C(0x434F4E5450545951)
+#define CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_MAGIC \
+    UINT64_C(0x434F4E5446445354)
+
+enum { CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_LIMIT = 1024 };
+
+typedef enum continuum_bootstrap_descriptor_kind {
+    CONTINUUM_BOOTSTRAP_DESCRIPTOR_SOCKET = 1,
+    CONTINUUM_BOOTSTRAP_DESCRIPTOR_PIPE = 2,
+    CONTINUUM_BOOTSTRAP_DESCRIPTOR_KQUEUE = 3
+} continuum_bootstrap_descriptor_kind;
+
+typedef struct continuum_bootstrap_descriptor_status_entry {
+    int32_t file_descriptor;
+    int32_t descriptor_flags;
+    int32_t status_flags;
+    uint32_t kind;
+} continuum_bootstrap_descriptor_status_entry;
+
+typedef struct continuum_bootstrap_descriptor_safepoint_status {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t structure_size;
+    uint64_t generation;
+    uint32_t descriptor_count;
+    uint8_t overflow;
+    uint8_t safepoint_active;
+    uint8_t reserved[2];
+    continuum_bootstrap_descriptor_status_entry
+        descriptors[CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_LIMIT];
+} continuum_bootstrap_descriptor_safepoint_status;
+
+extern volatile continuum_bootstrap_descriptor_safepoint_status
+    continuum_bootstrap_descriptor_safepoint_report;
 
 typedef struct continuum_bootstrap_pty_safepoint_status {
     uint64_t magic;

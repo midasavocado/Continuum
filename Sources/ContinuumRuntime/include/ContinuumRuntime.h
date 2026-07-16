@@ -71,6 +71,8 @@ typedef struct continuum_bootstrap_identity {
     uint64_t pthread_prepare_offset;
     uint64_t pty_safepoint_status_address;
     uint64_t pty_safepoint_status_offset;
+    uint64_t descriptor_safepoint_status_address;
+    uint64_t descriptor_safepoint_status_offset;
     uint8_t image_uuid[16];
 } continuum_bootstrap_identity;
 
@@ -1305,6 +1307,13 @@ continuum_status continuum_remote_process_group_copy_tcp_endpoints(
 /// Unsupported or ambiguous resources fail closed.
 continuum_status continuum_remote_process_group_capture_descriptor_graph(
     const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_descriptor_graph **out_graph
+);
+
+continuum_status
+continuum_remote_process_group_capture_descriptor_graph_authenticated(
+    const continuum_remote_process_group_snapshot *snapshot,
+    const char *bootstrap_library_path,
     continuum_remote_descriptor_graph **out_graph
 );
 

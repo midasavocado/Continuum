@@ -12,6 +12,11 @@ struct ContinuumHarnessMain {
                 try RuntimeProof.inspect()
             case .memoryProof:
                 try RuntimeProof.runMemoryProof()
+            case let .descriptorFlagsProof(target, bootstrap):
+                try RuntimeProof.runDescriptorFlagsProof(
+                    targetPath: target,
+                    bootstrapPath: bootstrap
+                )
             case .transactionProof:
                 try await TransactionProof.run()
             case let .externalHotProof(target, cycles):
@@ -43,6 +48,7 @@ struct ContinuumHarnessMain {
 private enum HarnessCommand: Equatable {
     case inspect
     case memoryProof
+    case descriptorFlagsProof(target: String, bootstrap: String)
     case transactionProof
     case externalHotProof(target: String, cycles: Int)
     case guiColdProof(target: String)
@@ -54,6 +60,8 @@ private enum HarnessCommand: Equatable {
 
       inspect            Print this process's VM-region and thread inventory.
       memory-proof       Checkpoint, mutate, and restore a tracked memory region.
+      descriptor-flags-proof --target <path> --bootstrap <dylib>
+                         Prove authenticated descriptor flags at a CLI safepoint.
       transaction-proof  Prove durable manual snapshots and rewind branching.
       external-hot-proof --target <path> [--cycles <n>]
                          Rewind the included cooperative proof target at least 100 times.
@@ -69,6 +77,9 @@ private enum HarnessCommand: Equatable {
 
         if name == "external-hot-proof" {
             return try parseExternalHotProof(arguments.dropFirst())
+        }
+        if name == "descriptor-flags-proof" {
+            return try parseDescriptorFlagsProof(arguments.dropFirst())
         }
         if name == "gui-cold-proof" {
             return try parseGUIColdProof(arguments.dropFirst())
@@ -88,6 +99,39 @@ private enum HarnessCommand: Equatable {
         case "help", "--help", "-h": .help
         default: throw HarnessFailure.usage("Unknown command: \(name)")
         }
+    }
+
+    private static func parseDescriptorFlagsProof(
+        _ arguments: ArraySlice<String>
+    ) throws -> Self {
+        let values = Array(arguments)
+        var target: String?
+        var bootstrap: String?
+        var index = 0
+        while index < values.count {
+            let option = values[index]
+            index += 1
+            guard index < values.count else {
+                throw HarnessFailure.usage("\(option) requires a path")
+            }
+            switch option {
+            case "--target" where target == nil:
+                target = values[index]
+            case "--bootstrap" where bootstrap == nil:
+                bootstrap = values[index]
+            default:
+                throw HarnessFailure.usage(
+                    "Unknown or repeated descriptor-flags-proof option: \(option)"
+                )
+            }
+            index += 1
+        }
+        guard let target, let bootstrap else {
+            throw HarnessFailure.usage(
+                "descriptor-flags-proof requires --target and --bootstrap"
+            )
+        }
+        return .descriptorFlagsProof(target: target, bootstrap: bootstrap)
     }
 
     private static func parseGUIColdProof(
