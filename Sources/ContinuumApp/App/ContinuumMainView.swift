@@ -24,6 +24,13 @@ struct ContinuumMainView: View {
                 }
                 .disabled(model.isLoading || model.isPerformingAction)
 
+                Button {
+                    Task { await model.openRewindableTerminal() }
+                } label: {
+                    Label("Open Rewindable Terminal", systemImage: "terminal")
+                }
+                .disabled(model.isPerformingAction)
+
                 if model.canCaptureFunctionalState {
                     Button {
                         Task { await model.saveManualSnapshot() }

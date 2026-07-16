@@ -29,13 +29,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/proc.h>
 #include <sys/ptrace.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
+#include <netinet/in.h>
 #include <time.h>
 #include <unistd.h>
+#include <util.h>
 
 extern char **environ;
 extern int posix_spawnattr_disable_ptr_auth_a_keys_np(
@@ -50,12 +56,153 @@ extern int posix_spawnattr_disable_ptr_auth_a_keys_np(
 #define CONTINUUM_DESTROY_RESUME_ATTEMPT_LIMIT 32U
 #define CONTINUUM_POSIX_SPAWN_DISABLE_ASLR 0x0100
 
+/* Apple exposes this through proc_pidfdinfo but omits the ABI from the public
+   SDK. Keep this byte-for-byte aligned with XNU's proc_info_private.h. */
+#define CONTINUUM_PROC_PIDFDKQUEUE_EXTINFO 9
+#define CONTINUUM_PROC_KQUEUE_WORKQ 0x0040U
+#define CONTINUUM_PROC_KQUEUE_WORKLOOP 0x0080U
+#define CONTINUUM_KNOTE_ACTIVE 0x001U
+#define CONTINUUM_KNOTE_QUEUED 0x002U
+#define CONTINUUM_KNOTE_DISABLED 0x004U
+#define CONTINUUM_KNOTE_PENDING_MASK 0xFFBU
+
+typedef struct continuum_kevent_qos_private {
+    uint64_t ident;
+    int16_t filter;
+    uint16_t flags;
+    uint32_t qos;
+    uint64_t udata;
+    uint32_t fflags;
+    uint32_t xflags;
+    int64_t data;
+    uint64_t ext[4];
+} continuum_kevent_qos_private;
+
+typedef struct continuum_kevent_extinfo_private {
+    continuum_kevent_qos_private event;
+    uint64_t saved_data;
+    int32_t status;
+    int32_t saved_fflags;
+    uint64_t reserved[2];
+} continuum_kevent_extinfo_private;
+
+enum {
+    CONTINUUM_BROKER_MAGIC = 0x4342524b,
+    CONTINUUM_BROKER_VERSION = 1,
+    CONTINUUM_BROKER_SETUP = 1,
+    CONTINUUM_BROKER_SPAWN_CHILD = 2,
+    CONTINUUM_BROKER_RELEASE = 3,
+    CONTINUUM_BROKER_ABORT = 4,
+    CONTINUUM_BROKER_READY = 5,
+    CONTINUUM_BROKER_CHILD_READY = 6,
+    CONTINUUM_BROKER_RELEASED = 7,
+    CONTINUUM_BROKER_FAILED = 8,
+    CONTINUUM_BROKER_CHILD_TO_BOOTSTRAP = 9,
+    CONTINUUM_BROKER_CHILD_BOOTSTRAP_RELEASED = 10,
+    CONTINUUM_BROKER_ROOT_TO_BOOTSTRAP = 11,
+    CONTINUUM_BROKER_ROOT_BOOTSTRAP_RELEASED = 12,
+    CONTINUUM_BROKER_CHILD_TO_ENTRY = 13,
+    CONTINUUM_BROKER_CHILD_ENTRY_REACHED = 14,
+    CONTINUUM_BROKER_CHILD_DETACH = 15,
+    CONTINUUM_BROKER_CHILD_DETACHED = 16,
+    CONTINUUM_BROKER_MAX_REMAPS = 64,
+    CONTINUUM_BROKER_MAX_ARGUMENTS = 64,
+    CONTINUUM_BROKER_MAX_ENVIRONMENT = 256,
+    CONTINUUM_BROKER_MAX_STRING_BYTES = 65536,
+};
+
+typedef struct continuum_broker_header {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t type;
+    uint32_t payload_length;
+} continuum_broker_header;
+
+typedef struct continuum_broker_setup {
+    uint32_t create_session;
+    uint32_t process_group_policy;
+    int32_t process_group_id;
+    int32_t captured_process_id;
+    int32_t captured_process_group_id;
+    int32_t foreground_process_group_id;
+    int32_t controlling_terminal_descriptor;
+    uint32_t remap_count;
+} continuum_broker_setup;
+
+typedef struct continuum_broker_child {
+    uint32_t argument_count;
+    uint32_t environment_count;
+    uint32_t executable_length;
+    uint32_t directory_length;
+    uint32_t bootstrap_length;
+    uint32_t string_bytes;
+    uint32_t remap_count;
+    uint32_t process_group_policy;
+    int32_t process_group_id;
+    int32_t captured_process_id;
+    int32_t captured_process_group_id;
+    uint8_t disable_aslr;
+    uint8_t reserved[3];
+} continuum_broker_child;
+
+typedef struct continuum_broker_reply {
+    int32_t process_id;
+    int32_t parent_process_id;
+    int32_t session_id;
+    int32_t process_group_id;
+    int32_t controlling_terminal_process_group;
+    int32_t error_code;
+} continuum_broker_reply;
+
+struct continuum_brokered_pair {
+    int channel;
+    pid_t root_process_id;
+    pid_t child_process_id;
+    uint64_t root_start_seconds;
+    uint64_t root_start_microseconds;
+    uint64_t child_start_seconds;
+    uint64_t child_start_microseconds;
+    uint8_t state;
+    uint8_t root_released;
+    uint8_t child_released;
+};
+
+enum {
+    CONTINUUM_BROKER_PAIR_PREPARED = 1,
+    CONTINUUM_BROKER_PAIR_ENTRY_STOPPED = 2,
+    CONTINUUM_BROKER_PAIR_FAILED = 3,
+};
+
+enum {
+    CONTINUUM_REPLACEMENT_STOP_DIRECT_PTRACE = 0,
+    CONTINUUM_REPLACEMENT_STOP_BROKER_SIGNAL = 1,
+};
+
+static continuum_status continuum_advance_bootstrap_stopped_process_to_entry(
+    int32_t process_id,
+    uint32_t timeout_milliseconds,
+    int already_traced,
+    int broker_channel
+);
+static continuum_status continuum_wait_for_child_signal_stop(
+    int32_t process_id,
+    uint64_t deadline,
+    int expected_signal
+);
+static void continuum_broker_kill_and_reap_traced_child(
+    pid_t process_id,
+    uint64_t deadline
+);
+
 static continuum_status continuum_spawn_process_suspended_internal(
     const char *executable_path,
     const char *const arguments[],
     const char *const environment[],
     const char *working_directory,
     int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap *descriptor_remaps,
+    size_t descriptor_remap_count,
+    const continuum_spawn_process_topology *topology,
     int disable_aslr,
     int start_suspended,
     int32_t *out_process_id
@@ -63,10 +210,67 @@ static continuum_status continuum_spawn_process_suspended_internal(
     if (executable_path == NULL || executable_path[0] == '\0'
         || arguments == NULL || arguments[0] == NULL
         || working_directory == NULL || working_directory[0] == '\0'
-        || out_process_id == NULL) {
+        || out_process_id == NULL
+        || descriptor_remap_count > CONTINUUM_SPAWN_DESCRIPTOR_REMAP_LIMIT
+        || (descriptor_remap_count > 0 && descriptor_remaps == NULL)) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
     }
     *out_process_id = 0;
+
+    if (topology != NULL) {
+        if (topology->structure_size != sizeof(*topology)
+            || topology->create_session > 1
+            || topology->process_group_policy
+                < CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT
+            || topology->process_group_policy
+                > CONTINUUM_SPAWN_PROCESS_GROUP_JOIN
+            || topology->controlling_terminal_descriptor < -1) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        if (topology->controlling_terminal_descriptor >= 0) {
+            // XNU applies spawn file actions before POSIX_SPAWN_SETSID. A PTY
+            // opened or duplicated there is detached again by setsid and
+            // cannot become the replacement's controlling terminal.
+            return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+        }
+        if ((topology->process_group_policy
+                == CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT
+                && topology->process_group_id != 0)
+            || (topology->process_group_policy
+                    == CONTINUUM_SPAWN_PROCESS_GROUP_CREATE
+                && topology->process_group_id != 0)
+            || (topology->process_group_policy
+                    == CONTINUUM_SPAWN_PROCESS_GROUP_JOIN
+                && topology->process_group_id <= 0)
+            || (topology->create_session
+                && topology->process_group_policy
+                    != CONTINUUM_SPAWN_PROCESS_GROUP_CREATE)) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+    }
+
+    for (size_t index = 0; index < descriptor_remap_count; index += 1) {
+        const continuum_spawn_descriptor_remap remap = descriptor_remaps[index];
+        if (remap.source_descriptor < 0 || remap.target_descriptor < 0
+            || fcntl(remap.source_descriptor, F_GETFD) < 0
+            || remap.target_descriptor == inherited_descriptor) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        for (size_t other = 0; other < descriptor_remap_count; other += 1) {
+            if (other != index
+                && descriptor_remaps[other].target_descriptor
+                    == remap.target_descriptor) {
+                return CONTINUUM_STATUS_INVALID_ARGUMENT;
+            }
+            if (other != index
+                && remap.target_descriptor
+                    == descriptor_remaps[other].source_descriptor) {
+                // posix_spawn file actions are ordered. Reject an overlap that
+                // could overwrite a later source before it is duplicated.
+                return CONTINUUM_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
 
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attributes;
@@ -80,6 +284,23 @@ static continuum_status continuum_spawn_process_suspended_internal(
             &actions,
             inherited_descriptor
         );
+    }
+    for (size_t index = 0;
+         result == 0 && index < descriptor_remap_count;
+         index += 1) {
+        const continuum_spawn_descriptor_remap remap = descriptor_remaps[index];
+        if (remap.source_descriptor == remap.target_descriptor) {
+            result = posix_spawn_file_actions_addinherit_np(
+                &actions,
+                remap.source_descriptor
+            );
+        } else {
+            result = posix_spawn_file_actions_adddup2(
+                &actions,
+                remap.source_descriptor,
+                remap.target_descriptor
+            );
+        }
     }
     if (result != 0) {
         posix_spawn_file_actions_destroy(&actions);
@@ -98,6 +319,13 @@ static continuum_status continuum_spawn_process_suspended_internal(
     if (disable_aslr) {
         flags |= CONTINUUM_POSIX_SPAWN_DISABLE_ASLR;
     }
+    if (topology != NULL && topology->create_session) {
+        flags |= POSIX_SPAWN_SETSID;
+    } else if (topology != NULL
+        && topology->process_group_policy
+            != CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT) {
+        flags |= POSIX_SPAWN_SETPGROUP;
+    }
     result = posix_spawnattr_setflags(&attributes, flags);
     if (result == 0) {
         sigset_t empty_signal_mask;
@@ -109,6 +337,15 @@ static continuum_status continuum_spawn_process_suspended_internal(
     }
     if (result == 0) {
         result = posix_spawnattr_disable_ptr_auth_a_keys_np(&attributes, 0);
+    }
+    if (result == 0 && topology != NULL && !topology->create_session
+        && topology->process_group_policy
+            != CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT) {
+        pid_t process_group = topology->process_group_policy
+                == CONTINUUM_SPAWN_PROCESS_GROUP_CREATE
+            ? 0
+            : (pid_t)topology->process_group_id;
+        result = posix_spawnattr_setpgroup(&attributes, process_group);
     }
     pid_t process_id = 0;
     if (result == 0) {
@@ -131,6 +368,45 @@ static continuum_status continuum_spawn_process_suspended_internal(
     return CONTINUUM_STATUS_OK;
 }
 
+static void continuum_broker_kill_and_reap_traced_child(
+    pid_t process_id,
+    uint64_t deadline
+) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    // Leave ptrace ownership while delivering SIGKILL, then reap the ordinary
+    // BSD child. A traced SIGKILL may otherwise surface as another wait stop
+    // before exit and remain observable as a zombie until this controller dies.
+    if (ptrace(PT_DETACH, process_id, (caddr_t)1, SIGKILL) != 0) {
+        (void)ptrace(PT_KILL, process_id, (caddr_t)1, 0);
+        (void)kill(process_id, SIGKILL);
+    }
+    for (;;) {
+        int wait_status = 0;
+        pid_t waited = waitpid(
+            process_id, &wait_status, WUNTRACED | WNOHANG);
+        if (waited == process_id) {
+            if (WIFEXITED(wait_status) || WIFSIGNALED(wait_status)) break;
+            if (WIFSTOPPED(wait_status)) {
+                if (ptrace(
+                        PT_DETACH,
+                        process_id,
+                        (caddr_t)1,
+                        SIGKILL
+                    ) != 0) {
+                    (void)ptrace(PT_KILL, process_id, (caddr_t)1, 0);
+                    (void)kill(process_id, SIGKILL);
+                }
+            }
+        } else if (waited < 0 && errno != EINTR) {
+            break;
+        }
+        if (clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) break;
+        usleep(1000);
+    }
+#pragma clang diagnostic pop
+}
+
 continuum_status continuum_spawn_process_suspended(
     const char *executable_path,
     const char *const arguments[],
@@ -144,6 +420,9 @@ continuum_status continuum_spawn_process_suspended(
         environment,
         working_directory,
         -1,
+        NULL,
+        0,
+        NULL,
         1,
         1,
         out_process_id
@@ -158,6 +437,29 @@ continuum_status continuum_spawn_process_suspended_with_inherited_descriptor(
     int32_t inherited_descriptor,
     int32_t *out_process_id
 ) {
+    return continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps(
+        executable_path,
+        arguments,
+        environment,
+        working_directory,
+        inherited_descriptor,
+        NULL,
+        0,
+        out_process_id
+    );
+}
+
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    int32_t *out_process_id
+) {
     if (inherited_descriptor < 0
         || fcntl(inherited_descriptor, F_GETFD) < 0) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
@@ -168,6 +470,9 @@ continuum_status continuum_spawn_process_suspended_with_inherited_descriptor(
         environment,
         working_directory,
         inherited_descriptor,
+        descriptor_remaps,
+        descriptor_remap_count,
+        NULL,
         1,
         1,
         out_process_id
@@ -183,6 +488,29 @@ continuum_spawn_process_suspended_with_inherited_descriptor_system_aslr(
     int32_t inherited_descriptor,
     int32_t *out_process_id
 ) {
+    return continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps_system_aslr(
+        executable_path,
+        arguments,
+        environment,
+        working_directory,
+        inherited_descriptor,
+        NULL,
+        0,
+        out_process_id
+    );
+}
+
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps_system_aslr(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    int32_t *out_process_id
+) {
     if (inherited_descriptor < 0
         || fcntl(inherited_descriptor, F_GETFD) < 0) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
@@ -193,6 +521,9 @@ continuum_spawn_process_suspended_with_inherited_descriptor_system_aslr(
         environment,
         working_directory,
         inherited_descriptor,
+        descriptor_remaps,
+        descriptor_remap_count,
+        NULL,
         0,
         1,
         out_process_id
@@ -213,10 +544,861 @@ continuum_status continuum_spawn_process(
         environment,
         working_directory,
         -1,
+        NULL,
+        0,
+        NULL,
         disable_aslr != 0,
         0,
         out_process_id
     );
+}
+
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_remaps_and_topology(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    const continuum_spawn_process_topology *topology,
+    int32_t *out_process_id
+) {
+    if (inherited_descriptor < 0
+        || fcntl(inherited_descriptor, F_GETFD) < 0 || topology == NULL) {
+        if (out_process_id != NULL) {
+            *out_process_id = 0;
+        }
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_spawn_process_suspended_internal(
+        executable_path,
+        arguments,
+        environment,
+        working_directory,
+        inherited_descriptor,
+        descriptor_remaps,
+        descriptor_remap_count,
+        topology,
+        1,
+        1,
+        out_process_id
+    );
+}
+
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_remaps_and_topology_system_aslr(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    const continuum_spawn_process_topology *topology,
+    int32_t *out_process_id
+) {
+    if (inherited_descriptor < 0
+        || fcntl(inherited_descriptor, F_GETFD) < 0 || topology == NULL) {
+        if (out_process_id != NULL) {
+            *out_process_id = 0;
+        }
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_spawn_process_suspended_internal(
+        executable_path,
+        arguments,
+        environment,
+        working_directory,
+        inherited_descriptor,
+        descriptor_remaps,
+        descriptor_remap_count,
+        topology,
+        0,
+        1,
+        out_process_id
+    );
+}
+
+static int continuum_broker_write_all(int descriptor, const void *bytes, size_t length) {
+    const uint8_t *cursor = bytes;
+    while (length > 0) {
+        ssize_t result = send(descriptor, cursor, length, MSG_NOSIGNAL);
+        if (result > 0) {
+            cursor += result;
+            length -= (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int continuum_broker_read_all(int descriptor, void *bytes, size_t length) {
+    uint8_t *cursor = bytes;
+    while (length > 0) {
+        ssize_t result = read(descriptor, cursor, length);
+        if (result > 0) {
+            cursor += result;
+            length -= (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int continuum_broker_send_fds(
+    int descriptor,
+    const continuum_spawn_descriptor_remap *remaps,
+    size_t count
+) {
+    if (count == 0) return 1;
+    int sources[CONTINUUM_BROKER_MAX_REMAPS];
+    for (size_t index = 0; index < count; index += 1) {
+        sources[index] = remaps[index].source_descriptor;
+    }
+    char marker = 1;
+    char control[CMSG_SPACE(sizeof(int) * CONTINUUM_BROKER_MAX_REMAPS)];
+    struct iovec iov = {.iov_base = &marker, .iov_len = 1};
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = (socklen_t)CMSG_SPACE(sizeof(int) * count);
+    struct cmsghdr *entry = CMSG_FIRSTHDR(&message);
+    entry->cmsg_level = SOL_SOCKET;
+    entry->cmsg_type = SCM_RIGHTS;
+    entry->cmsg_len = (socklen_t)CMSG_LEN(sizeof(int) * count);
+    memcpy(CMSG_DATA(entry), sources, sizeof(int) * count);
+    ssize_t sent;
+    do {
+        sent = sendmsg(descriptor, &message, 0);
+    } while (sent < 0 && errno == EINTR);
+    return sent == 1;
+}
+
+static size_t continuum_broker_string_count(
+    const char *const values[],
+    size_t limit
+) {
+    if (values == NULL) return 0;
+    size_t count = 0;
+    while (count < limit && values[count] != NULL) count += 1;
+    return count;
+}
+
+static int continuum_broker_validate_spec(
+    const continuum_brokered_process_spec *spec,
+    int is_root
+) {
+    if (spec == NULL || spec->structure_size != sizeof(*spec)
+        || spec->captured_process_id <= 0
+        || spec->captured_process_group_id <= 0
+        || spec->foreground_process_group_id <= 0
+        || spec->executable_path == NULL
+        || spec->executable_path[0] == '\0' || spec->arguments == NULL
+        || spec->arguments[0] == NULL || spec->working_directory == NULL
+        || spec->working_directory[0] == '\0'
+        || spec->descriptor_remap_count > CONTINUUM_BROKER_MAX_REMAPS
+        || (spec->descriptor_remap_count > 0 && spec->descriptor_remaps == NULL)
+        || spec->disable_aslr > 1
+        || spec->topology.structure_size != sizeof(spec->topology)
+        || spec->topology.create_session > 1
+        || spec->topology.process_group_policy < CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT
+        || spec->topology.process_group_policy > CONTINUUM_SPAWN_PROCESS_GROUP_JOIN
+        || spec->topology.controlling_terminal_descriptor < -1
+        || (!is_root && spec->topology.create_session)) return 0;
+    if (is_root
+        && spec->topology.process_group_policy
+            == CONTINUUM_SPAWN_PROCESS_GROUP_JOIN) return 0;
+    if (spec->topology.create_session
+        && spec->topology.process_group_policy != CONTINUUM_SPAWN_PROCESS_GROUP_CREATE) return 0;
+    if (spec->topology.controlling_terminal_descriptor >= 0
+        && (!spec->topology.create_session || !is_root)) return 0;
+    size_t argc = continuum_broker_string_count(spec->arguments,
+        CONTINUUM_BROKER_MAX_ARGUMENTS + 1);
+    const char *const *effective_environment = spec->environment == NULL
+        ? (const char *const *)environ : spec->environment;
+    size_t envc = continuum_broker_string_count(effective_environment,
+        CONTINUUM_BROKER_MAX_ENVIRONMENT + 1);
+    if (argc == 0 || argc > CONTINUUM_BROKER_MAX_ARGUMENTS
+        || envc > CONTINUUM_BROKER_MAX_ENVIRONMENT) return 0;
+    for (size_t index = 0; index < envc; index += 1) {
+        if (strncmp(effective_environment[index], "CONTINUUM_BROKER_", 17) == 0) {
+            return 0;
+        }
+    }
+    int found_tty = spec->topology.controlling_terminal_descriptor < 0;
+    for (size_t index = 0; index < spec->descriptor_remap_count; index += 1) {
+        continuum_spawn_descriptor_remap remap = spec->descriptor_remaps[index];
+        if (remap.source_descriptor < 0 || remap.target_descriptor < 0
+            || remap.target_descriptor >= getdtablesize()
+            || fcntl(remap.source_descriptor, F_GETFD) < 0) return 0;
+        if (remap.target_descriptor == spec->topology.controlling_terminal_descriptor) found_tty = 1;
+        for (size_t other = index + 1; other < spec->descriptor_remap_count; other += 1) {
+            if (remap.target_descriptor == spec->descriptor_remaps[other].target_descriptor) return 0;
+        }
+    }
+    return found_tty;
+}
+
+static char **continuum_broker_launch_environment(
+    const char *const original[],
+    const char *bootstrap,
+    int channel
+) {
+    const char *const *source = original == NULL
+        ? (const char *const *)environ : original;
+    size_t count = continuum_broker_string_count(source,
+        CONTINUUM_BROKER_MAX_ENVIRONMENT + 1);
+    if (count > CONTINUUM_BROKER_MAX_ENVIRONMENT) return NULL;
+    const char *old_dyld = NULL;
+    for (size_t index = 0; index < count; index += 1) {
+        if (strncmp(source[index], "DYLD_INSERT_LIBRARIES=", 22) == 0) old_dyld = source[index] + 22;
+    }
+    char **result = calloc(count + 5, sizeof(char *));
+    if (result == NULL) return NULL;
+    size_t output = 0;
+    for (size_t index = 0; index < count; index += 1) {
+        if (strncmp(source[index], "DYLD_INSERT_LIBRARIES=", 22) != 0
+            && strncmp(source[index], "CONTINUUM_BROKER_", 17) != 0) {
+            result[output++] = strdup(source[index]);
+        }
+    }
+    if (asprintf(&result[output++], "DYLD_INSERT_LIBRARIES=%s%s%s", bootstrap,
+            old_dyld == NULL || old_dyld[0] == '\0' ? "" : ":",
+            old_dyld == NULL ? "" : old_dyld) < 0
+        || asprintf(&result[output++], "CONTINUUM_BROKER_FD=%d", channel) < 0
+        || asprintf(&result[output++], "CONTINUUM_BROKER_ORIGINAL_DYLD_PRESENT=%d",
+            old_dyld == NULL ? 0 : 1) < 0
+        || asprintf(&result[output++], "CONTINUUM_BROKER_ORIGINAL_DYLD=%s",
+            old_dyld == NULL ? "" : old_dyld) < 0) {
+        for (size_t index = 0; index < output; index += 1) free(result[index]);
+        free(result); return NULL;
+    }
+    return result;
+}
+
+static void continuum_broker_free_environment(char **environment) {
+    if (environment == NULL) return;
+    for (size_t index = 0; environment[index] != NULL; index += 1) free(environment[index]);
+    free(environment);
+}
+
+static int continuum_broker_send_setup(
+    int channel,
+    const continuum_brokered_process_spec *spec,
+    int32_t mapped_process_group
+) {
+    continuum_broker_setup setup = {
+        .create_session = spec->topology.create_session,
+        .process_group_policy = spec->topology.process_group_policy,
+        .process_group_id = mapped_process_group,
+        .captured_process_id = spec->captured_process_id,
+        .captured_process_group_id = spec->captured_process_group_id,
+        .foreground_process_group_id = spec->foreground_process_group_id,
+        .controlling_terminal_descriptor = spec->topology.controlling_terminal_descriptor,
+        .remap_count = (uint32_t)spec->descriptor_remap_count,
+    };
+    continuum_broker_header header = {
+        .magic = CONTINUUM_BROKER_MAGIC, .version = CONTINUUM_BROKER_VERSION,
+        .type = CONTINUUM_BROKER_SETUP,
+        .payload_length = sizeof(setup)
+            + (uint32_t)(sizeof(int32_t) * spec->descriptor_remap_count),
+    };
+    if (!continuum_broker_write_all(channel, &header, sizeof(header))
+        || !continuum_broker_write_all(channel, &setup, sizeof(setup))) return 0;
+    int32_t targets[CONTINUUM_BROKER_MAX_REMAPS];
+    for (size_t index = 0; index < spec->descriptor_remap_count; index += 1) {
+        targets[index] = spec->descriptor_remaps[index].target_descriptor;
+    }
+    return continuum_broker_write_all(channel, targets,
+        sizeof(int32_t) * spec->descriptor_remap_count)
+        && continuum_broker_send_fds(channel, spec->descriptor_remaps,
+            spec->descriptor_remap_count);
+}
+
+static int continuum_broker_receive_reply(
+    int channel,
+    uint16_t expected,
+    continuum_broker_reply *reply
+) {
+    continuum_broker_header header;
+    return continuum_broker_read_all(channel, &header, sizeof(header))
+        && header.magic == CONTINUUM_BROKER_MAGIC
+        && header.version == CONTINUUM_BROKER_VERSION
+        && header.type == expected && header.payload_length == sizeof(*reply)
+        && continuum_broker_read_all(channel, reply, sizeof(*reply))
+        && reply->error_code == 0;
+}
+
+static int continuum_broker_append_string(
+    uint8_t **cursor,
+    const uint8_t *limit,
+    const char *value
+) {
+    size_t length = strlen(value) + 1;
+    if (length > UINT32_MAX || (size_t)(limit - *cursor) < sizeof(uint32_t) + length) return 0;
+    uint32_t wire_length = (uint32_t)length;
+    memcpy(*cursor, &wire_length, sizeof(wire_length)); *cursor += sizeof(wire_length);
+    memcpy(*cursor, value, length); *cursor += length;
+    return 1;
+}
+
+static int continuum_broker_send_child(
+    int channel,
+    const char *bootstrap,
+    const continuum_brokered_process_spec *child
+) {
+    const char *const *environment = child->environment == NULL
+        ? (const char *const *)environ : child->environment;
+    size_t argc = continuum_broker_string_count(child->arguments, CONTINUUM_BROKER_MAX_ARGUMENTS);
+    size_t envc = continuum_broker_string_count(environment, CONTINUUM_BROKER_MAX_ENVIRONMENT);
+    size_t string_bytes = strlen(child->executable_path) + 1
+        + strlen(child->working_directory) + 1 + strlen(bootstrap) + 1;
+    for (size_t index = 0; index < argc; index += 1) string_bytes += sizeof(uint32_t) + strlen(child->arguments[index]) + 1;
+    for (size_t index = 0; index < envc; index += 1) string_bytes += sizeof(uint32_t) + strlen(environment[index]) + 1;
+    size_t payload_length = sizeof(continuum_broker_child) + string_bytes
+        + sizeof(int32_t) * child->descriptor_remap_count;
+    if (string_bytes > CONTINUUM_BROKER_MAX_STRING_BYTES || payload_length > UINT32_MAX) return 0;
+    uint8_t *payload = calloc(1, payload_length);
+    if (payload == NULL) return 0;
+    continuum_broker_child wire = {
+        .argument_count = (uint32_t)argc, .environment_count = (uint32_t)envc,
+        .executable_length = (uint32_t)(strlen(child->executable_path) + 1),
+        .directory_length = (uint32_t)(strlen(child->working_directory) + 1),
+        .bootstrap_length = (uint32_t)(strlen(bootstrap) + 1),
+        .string_bytes = (uint32_t)string_bytes,
+        .remap_count = (uint32_t)child->descriptor_remap_count,
+        .process_group_policy = child->topology.process_group_policy,
+        .process_group_id = child->topology.process_group_id,
+        .captured_process_id = child->captured_process_id,
+        .captured_process_group_id = child->captured_process_group_id,
+        .disable_aslr = child->disable_aslr,
+    };
+    memcpy(payload, &wire, sizeof(wire));
+    uint8_t *cursor = payload + sizeof(wire);
+    const uint8_t *limit = payload + payload_length;
+    int valid = 1;
+    for (size_t index = 0; valid && index < argc; index += 1) valid = continuum_broker_append_string(&cursor, limit, child->arguments[index]);
+    for (size_t index = 0; valid && index < envc; index += 1) valid = continuum_broker_append_string(&cursor, limit, environment[index]);
+    if (valid) { memcpy(cursor, child->executable_path, wire.executable_length); cursor += wire.executable_length; }
+    if (valid) { memcpy(cursor, child->working_directory, wire.directory_length); cursor += wire.directory_length; }
+    if (valid) { memcpy(cursor, bootstrap, wire.bootstrap_length); cursor += wire.bootstrap_length; }
+    for (size_t index = 0; valid && index < child->descriptor_remap_count; index += 1) {
+        int32_t target = child->descriptor_remaps[index].target_descriptor;
+        memcpy(cursor, &target, sizeof(target)); cursor += sizeof(target);
+    }
+    continuum_broker_header header = {
+        .magic = CONTINUUM_BROKER_MAGIC, .version = CONTINUUM_BROKER_VERSION,
+        .type = CONTINUUM_BROKER_SPAWN_CHILD, .payload_length = (uint32_t)payload_length,
+    };
+    valid = valid && cursor == limit
+        && continuum_broker_write_all(channel, &header, sizeof(header))
+        && continuum_broker_write_all(channel, payload, payload_length)
+        && continuum_broker_send_fds(channel, child->descriptor_remaps,
+            child->descriptor_remap_count);
+    free(payload);
+    return valid;
+}
+
+continuum_status continuum_brokered_pair_prepare(
+    const char *bootstrap_library_path,
+    const continuum_brokered_process_spec *root,
+    const continuum_brokered_process_spec *child,
+    continuum_brokered_pair **out_pair
+) {
+    if (out_pair == NULL) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    *out_pair = NULL;
+    struct stat bootstrap_stat;
+    if (bootstrap_library_path == NULL || bootstrap_library_path[0] == '\0'
+        || stat(bootstrap_library_path, &bootstrap_stat) != 0
+        || !S_ISREG(bootstrap_stat.st_mode)
+        || !continuum_broker_validate_spec(root, 1)
+        || !continuum_broker_validate_spec(child, 0)
+        || (child->topology.process_group_policy == CONTINUUM_SPAWN_PROCESS_GROUP_JOIN
+            && child->topology.process_group_id != root->captured_process_id)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    int channels[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0) return CONTINUUM_STATUS_SPAWN_FAILED;
+    int highest_target = channels[0];
+    for (size_t index = 0; index < root->descriptor_remap_count; index += 1) {
+        if (root->descriptor_remaps[index].target_descriptor > highest_target) {
+            highest_target = root->descriptor_remaps[index].target_descriptor;
+        }
+    }
+    int safe_child_channel = fcntl(channels[1], F_DUPFD_CLOEXEC,
+        highest_target + 1);
+    if (safe_child_channel < 0) {
+        close(channels[0]); close(channels[1]);
+        return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    close(channels[1]);
+    channels[1] = safe_child_channel;
+    char **environment = continuum_broker_launch_environment(root->environment,
+        bootstrap_library_path, channels[1]);
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    int actions_initialized = 0;
+    int attributes_initialized = 0;
+    int result = environment == NULL ? ENOMEM : posix_spawn_file_actions_init(&actions);
+    actions_initialized = result == 0;
+    if (result == 0) result = posix_spawn_file_actions_addchdir_np(&actions, root->working_directory);
+    if (result == 0) result = posix_spawn_file_actions_addinherit_np(&actions, channels[1]);
+    if (result == 0) {
+        result = posix_spawnattr_init(&attributes);
+        attributes_initialized = result == 0;
+    }
+    if (result == 0) {
+        short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+        if (root->disable_aslr) flags |= CONTINUUM_POSIX_SPAWN_DISABLE_ASLR;
+        result = posix_spawnattr_setflags(&attributes, flags);
+    }
+    pid_t root_pid = 0;
+    if (result == 0) result = posix_spawn(&root_pid, root->executable_path,
+        &actions, &attributes, (char *const *)root->arguments, environment);
+    if (environment != NULL) continuum_broker_free_environment(environment);
+    if (attributes_initialized) posix_spawnattr_destroy(&attributes);
+    if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
+    close(channels[1]);
+    if (result != 0 || root_pid <= 0) {
+        close(channels[0]); return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    continuum_broker_reply root_reply;
+    continuum_broker_reply child_reply;
+    int root_ready = continuum_broker_send_setup(channels[0], root, 0)
+        && continuum_broker_receive_reply(channels[0], CONTINUUM_BROKER_READY, &root_reply)
+        && root_reply.process_id == root_pid
+        && root_reply.parent_process_id == getpid();
+    int child_ready = root_ready
+        && continuum_broker_send_child(channels[0], bootstrap_library_path, child)
+        && continuum_broker_receive_reply(channels[0], CONTINUUM_BROKER_CHILD_READY, &child_reply)
+        && child_reply.parent_process_id == root_pid && child_reply.process_id > 0;
+    int prepared = root_ready && child_ready;
+    if (!prepared) {
+        if (child_ready) {
+            continuum_broker_header abort_header = {
+                .magic = CONTINUUM_BROKER_MAGIC,
+                .version = CONTINUUM_BROKER_VERSION,
+                .type = CONTINUUM_BROKER_ABORT,
+                .payload_length = 0,
+            };
+            (void)continuum_broker_write_all(channels[0], &abort_header,
+                sizeof(abort_header));
+        } else {
+            kill(root_pid, SIGKILL);
+        }
+        waitpid(root_pid, NULL, 0); close(channels[0]);
+        return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    struct proc_bsdinfo root_info;
+    struct proc_bsdinfo child_info;
+    memset(&root_info, 0, sizeof(root_info));
+    memset(&child_info, 0, sizeof(child_info));
+    if (proc_pidinfo(root_pid, PROC_PIDTBSDINFO, 0, &root_info,
+            (int)sizeof(root_info)) != (int)sizeof(root_info)
+        || proc_pidinfo(child_reply.process_id, PROC_PIDTBSDINFO, 0,
+            &child_info, (int)sizeof(child_info)) != (int)sizeof(child_info)
+        || root_info.pbi_ppid != getpid()
+        || child_info.pbi_ppid != (uint32_t)root_pid) {
+        continuum_broker_header abort_header = {
+            .magic = CONTINUUM_BROKER_MAGIC,
+            .version = CONTINUUM_BROKER_VERSION,
+            .type = CONTINUUM_BROKER_ABORT,
+            .payload_length = 0,
+        };
+        (void)continuum_broker_write_all(channels[0], &abort_header,
+            sizeof(abort_header));
+        waitpid(root_pid, NULL, 0);
+        close(channels[0]);
+        return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    }
+    continuum_brokered_pair *pair = calloc(1, sizeof(*pair));
+    if (pair == NULL) {
+        continuum_broker_header abort_header = {
+            .magic = CONTINUUM_BROKER_MAGIC,
+            .version = CONTINUUM_BROKER_VERSION,
+            .type = CONTINUUM_BROKER_ABORT,
+            .payload_length = 0,
+        };
+        (void)continuum_broker_write_all(channels[0], &abort_header,
+            sizeof(abort_header));
+        waitpid(root_pid, NULL, 0); close(channels[0]);
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+    pair->channel = channels[0]; pair->root_process_id = root_pid;
+    pair->child_process_id = child_reply.process_id;
+    pair->root_start_seconds = root_info.pbi_start_tvsec;
+    pair->root_start_microseconds = root_info.pbi_start_tvusec;
+    pair->child_start_seconds = child_info.pbi_start_tvsec;
+    pair->child_start_microseconds = child_info.pbi_start_tvusec;
+    pair->state = CONTINUUM_BROKER_PAIR_PREPARED;
+    *out_pair = pair;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_brokered_pair_process_identifiers(
+    const continuum_brokered_pair *pair,
+    int32_t *out_root_process_id,
+    int32_t *out_child_process_id
+) {
+    if (pair == NULL || out_root_process_id == NULL || out_child_process_id == NULL)
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    *out_root_process_id = pair->root_process_id;
+    *out_child_process_id = pair->child_process_id;
+    return CONTINUUM_STATUS_OK;
+}
+
+static int continuum_broker_process_matches(
+    pid_t process_id,
+    pid_t expected_parent,
+    uint64_t start_seconds,
+    uint64_t start_microseconds,
+    int require_stopped
+) {
+    struct proc_bsdinfo info;
+    memset(&info, 0, sizeof(info));
+    return proc_pidinfo(process_id, PROC_PIDTBSDINFO, 0, &info,
+            (int)sizeof(info)) == (int)sizeof(info)
+        && info.pbi_ppid == (uint32_t)expected_parent
+        && info.pbi_uid == geteuid()
+        && info.pbi_start_tvsec == start_seconds
+        && info.pbi_start_tvusec == start_microseconds
+        && (!require_stopped || info.pbi_status == SSTOP);
+}
+
+static continuum_status continuum_broker_wait_for_stop(
+    pid_t process_id,
+    pid_t expected_parent,
+    uint64_t start_seconds,
+    uint64_t start_microseconds,
+    uint64_t deadline
+) {
+    for (;;) {
+        if (continuum_broker_process_matches(
+                process_id,
+                expected_parent,
+                start_seconds,
+                start_microseconds,
+                1)) {
+            return CONTINUUM_STATUS_OK;
+        }
+        if (!continuum_broker_process_matches(
+                process_id,
+                expected_parent,
+                start_seconds,
+                start_microseconds,
+                0)) {
+            return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+        }
+        if (clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) {
+            return CONTINUUM_STATUS_SUSPEND_FAILED;
+        }
+        usleep(1000);
+    }
+}
+
+static continuum_status continuum_broker_send_empty_command(
+    int channel,
+    uint16_t command,
+    uint16_t expected_reply
+) {
+    continuum_broker_header header = {
+        .magic = CONTINUUM_BROKER_MAGIC,
+        .version = CONTINUUM_BROKER_VERSION,
+        .type = command,
+        .payload_length = 0,
+    };
+    continuum_broker_reply reply;
+    if (continuum_broker_write_all(channel, &header, sizeof(header))
+        && continuum_broker_receive_reply(channel, expected_reply, &reply)) {
+        return CONTINUUM_STATUS_OK;
+    }
+    if (command == CONTINUUM_BROKER_CHILD_TO_ENTRY) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    if (command == CONTINUUM_BROKER_CHILD_DETACH) {
+        return CONTINUUM_STATUS_RESUME_FAILED;
+    }
+    return CONTINUUM_STATUS_SPAWN_FAILED;
+}
+
+continuum_status continuum_brokered_pair_advance_to_entry_stops(
+    continuum_brokered_pair *pair,
+    uint32_t timeout_milliseconds
+) {
+    if (pair == NULL || timeout_milliseconds == 0
+        || pair->state != CONTINUUM_BROKER_PAIR_PREPARED) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    struct timeval receive_timeout = {
+        .tv_sec = (time_t)(timeout_milliseconds / 1000),
+        .tv_usec = (suseconds_t)(timeout_milliseconds % 1000) * 1000,
+    };
+    if (setsockopt(
+            pair->channel,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &receive_timeout,
+            sizeof(receive_timeout)) != 0) {
+        return CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    uint64_t timeout = (uint64_t)timeout_milliseconds * UINT64_C(1000000);
+    if (UINT64_MAX - now < timeout) {
+        (void)kill(pair->child_process_id, SIGKILL);
+        (void)kill(pair->root_process_id, SIGKILL);
+        (void)waitpid(pair->root_process_id, NULL, 0);
+        close(pair->channel);
+        pair->channel = -1;
+        pair->state = CONTINUUM_BROKER_PAIR_FAILED;
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    uint64_t deadline = now + timeout;
+    int root_traced = 0;
+    continuum_status status = continuum_broker_process_matches(
+            pair->child_process_id,
+            pair->root_process_id,
+            pair->child_start_seconds,
+            pair->child_start_microseconds,
+            0)
+        ? CONTINUUM_STATUS_OK
+        : CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    continuum_broker_header command = {
+        .magic = CONTINUUM_BROKER_MAGIC,
+        .version = CONTINUUM_BROKER_VERSION,
+        .type = CONTINUUM_BROKER_CHILD_TO_BOOTSTRAP,
+        .payload_length = 0,
+    };
+    if (status == CONTINUUM_STATUS_OK
+        && !continuum_broker_write_all(
+            pair->channel, &command, sizeof(command))) {
+        status = CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    continuum_broker_reply reply;
+    if (status == CONTINUUM_STATUS_OK
+        && !continuum_broker_receive_reply(
+            pair->channel,
+            CONTINUUM_BROKER_CHILD_BOOTSTRAP_RELEASED,
+            &reply)) {
+        status = CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        uint64_t current = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        uint64_t remaining = deadline > current ? deadline - current : 0;
+        status = remaining == 0
+            ? CONTINUUM_STATUS_SUSPEND_FAILED
+            : continuum_advance_bootstrap_stopped_process_to_entry(
+                pair->child_process_id,
+                (uint32_t)(remaining / UINT64_C(1000000) + 1),
+                1,
+                pair->channel
+            );
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        if (ptrace(PT_ATTACH, pair->root_process_id, NULL, 0) == 0) {
+            root_traced = 1;
+            status = continuum_wait_for_child_signal_stop(
+                pair->root_process_id,
+                deadline,
+                SIGSTOP
+            );
+        } else {
+            status = CONTINUUM_STATUS_ACCESS_DENIED;
+        }
+    }
+    command.type = CONTINUUM_BROKER_ROOT_TO_BOOTSTRAP;
+    if (status == CONTINUUM_STATUS_OK
+        && !continuum_broker_write_all(
+            pair->channel, &command, sizeof(command))) {
+        status = CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    if (status == CONTINUUM_STATUS_OK
+        && ptrace(PT_CONTINUE, pair->root_process_id, (caddr_t)1, 0) != 0) {
+        status = CONTINUUM_STATUS_RESUME_FAILED;
+    }
+    if (status == CONTINUUM_STATUS_OK
+        && !continuum_broker_receive_reply(
+            pair->channel,
+            CONTINUUM_BROKER_ROOT_BOOTSTRAP_RELEASED,
+            &reply)) {
+        status = CONTINUUM_STATUS_SPAWN_FAILED;
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_wait_for_child_signal_stop(
+            pair->root_process_id,
+            deadline,
+            SIGSTOP
+        );
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        uint64_t current = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+        uint64_t remaining = deadline > current ? deadline - current : 0;
+        status = remaining == 0
+            ? CONTINUUM_STATUS_SUSPEND_FAILED
+            : continuum_advance_bootstrap_stopped_process_to_entry(
+                pair->root_process_id,
+                (uint32_t)(remaining / UINT64_C(1000000) + 1),
+                1,
+                -1
+            );
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        continuum_broker_header abort_command = {
+            .magic = CONTINUUM_BROKER_MAGIC,
+            .version = CONTINUUM_BROKER_VERSION,
+            .type = CONTINUUM_BROKER_ABORT,
+            .payload_length = 0,
+        };
+        (void)continuum_broker_write_all(
+            pair->channel, &abort_command, sizeof(abort_command));
+        (void)kill(pair->child_process_id, SIGKILL);
+        (void)waitpid(pair->child_process_id, NULL, 0);
+        if (root_traced) {
+            continuum_broker_kill_and_reap_traced_child(
+                pair->root_process_id,
+                clock_gettime_nsec_np(CLOCK_MONOTONIC)
+                    + UINT64_C(2000000000)
+            );
+        } else {
+            (void)kill(pair->root_process_id, SIGKILL);
+            (void)waitpid(pair->root_process_id, NULL, 0);
+        }
+    }
+#pragma clang diagnostic pop
+    close(pair->channel);
+    pair->channel = -1;
+    pair->state = status == CONTINUUM_STATUS_OK
+        ? CONTINUUM_BROKER_PAIR_ENTRY_STOPPED
+        : CONTINUUM_BROKER_PAIR_FAILED;
+    return status;
+}
+
+static continuum_status continuum_brokered_pair_command(
+    continuum_brokered_pair *pair,
+    uint16_t type,
+    uint32_t timeout_milliseconds
+) {
+    if (pair == NULL || pair->state != CONTINUUM_BROKER_PAIR_PREPARED
+        || (type != CONTINUUM_BROKER_RELEASE && type != CONTINUUM_BROKER_ABORT))
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    continuum_broker_header header = {
+        .magic = CONTINUUM_BROKER_MAGIC, .version = CONTINUUM_BROKER_VERSION,
+        .type = type, .payload_length = 0,
+    };
+    int sent = continuum_broker_write_all(pair->channel, &header, sizeof(header));
+    continuum_status status = CONTINUUM_STATUS_OK;
+    if (type == CONTINUUM_BROKER_RELEASE) {
+        continuum_broker_reply reply;
+        if (!sent || !continuum_broker_receive_reply(pair->channel,
+            CONTINUUM_BROKER_RELEASED, &reply)) {
+            status = CONTINUUM_STATUS_RESUME_FAILED;
+            close(pair->channel);
+            pair->channel = -1;
+            kill(pair->child_process_id, SIGKILL);
+            kill(pair->root_process_id, SIGKILL);
+            waitpid(pair->root_process_id, NULL, 0);
+        }
+    } else {
+        uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+            + (uint64_t)timeout_milliseconds * UINT64_C(1000000);
+        int wait_status = 0;
+        for (;;) {
+            pid_t waited = waitpid(pair->root_process_id, &wait_status, WNOHANG);
+            if (waited == pair->root_process_id) break;
+            if (waited < 0 || clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) {
+                kill(pair->root_process_id, SIGKILL);
+                waitpid(pair->root_process_id, NULL, 0);
+                status = CONTINUUM_STATUS_TARGET_EXITED;
+                break;
+            }
+            usleep(1000);
+        }
+    }
+    if (pair->channel >= 0) close(pair->channel);
+    free(pair);
+    return status;
+}
+
+continuum_status continuum_brokered_pair_release(continuum_brokered_pair *pair) {
+    return continuum_brokered_pair_command(pair, CONTINUUM_BROKER_RELEASE, 0);
+}
+
+continuum_status continuum_brokered_pair_abort(
+    continuum_brokered_pair *pair,
+    uint32_t timeout_milliseconds
+) {
+    if (timeout_milliseconds == 0) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    if (pair == NULL) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    if (pair->state != CONTINUUM_BROKER_PAIR_PREPARED) {
+        if (continuum_broker_process_matches(
+                pair->child_process_id,
+                pair->root_process_id,
+                pair->child_start_seconds,
+                pair->child_start_microseconds,
+                0)) {
+            (void)kill(pair->child_process_id, SIGKILL);
+        }
+        if (continuum_broker_process_matches(
+                pair->root_process_id,
+                getpid(),
+                pair->root_start_seconds,
+                pair->root_start_microseconds,
+                0)) {
+            continuum_broker_kill_and_reap_traced_child(
+                pair->root_process_id,
+                clock_gettime_nsec_np(CLOCK_MONOTONIC)
+                    + (uint64_t)timeout_milliseconds * UINT64_C(1000000)
+            );
+        }
+        if (pair->channel >= 0) close(pair->channel);
+        free(pair);
+        return CONTINUUM_STATUS_OK;
+    }
+    return continuum_brokered_pair_command(pair, CONTINUUM_BROKER_ABORT,
+        timeout_milliseconds);
+}
+
+continuum_status continuum_brokered_pair_note_released_process(
+    continuum_brokered_pair *pair,
+    int32_t process_id
+) {
+    if (pair == NULL || pair->state != CONTINUUM_BROKER_PAIR_ENTRY_STOPPED) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (process_id == pair->root_process_id) {
+        if (pair->root_released) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        pair->root_released = 1;
+        return CONTINUUM_STATUS_OK;
+    }
+    if (process_id == pair->child_process_id) {
+        if (pair->child_released) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        pair->child_released = 1;
+        return CONTINUUM_STATUS_OK;
+    }
+    return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+}
+
+continuum_status continuum_brokered_pair_finish(
+    continuum_brokered_pair *pair
+) {
+    if (pair == NULL || pair->state != CONTINUUM_BROKER_PAIR_ENTRY_STOPPED
+        || !pair->root_released || !pair->child_released) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (pair->channel >= 0) close(pair->channel);
+    free(pair);
+    return CONTINUUM_STATUS_OK;
 }
 
 continuum_status continuum_wait_for_process_stop(
@@ -357,7 +1539,12 @@ continuum_status continuum_advance_process_to_bootstrap_stop(
         return CONTINUUM_STATUS_TARGET_EXITED;
     }
     if (process_info.pbi_ppid != getpid()) {
-        return CONTINUUM_STATUS_ACCESS_DENIED;
+        if (process_info.pbi_status != SSTOP) {
+            return CONTINUUM_STATUS_ACCESS_DENIED;
+        }
+        return kill(process_id, SIGCONT) == 0
+            ? CONTINUUM_STATUS_OK
+            : CONTINUUM_STATUS_RESUME_FAILED;
     }
 
     uint64_t timeout_nanoseconds =
@@ -879,6 +2066,21 @@ typedef struct continuum_bootstrap_pthread_wire_report {
     uint64_t pthread_region_lengths[CONTINUUM_REMOTE_PTHREAD_LIMIT];
 } continuum_bootstrap_pthread_wire_report;
 
+#define CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC UINT64_C(0x434F4E5450545951)
+
+typedef struct continuum_bootstrap_pty_safepoint_wire_status {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t structure_size;
+    uint64_t generation;
+    uint64_t safepoint_thread_identifier;
+    uint32_t pty_descriptor_count;
+    uint8_t queue_state_known;
+    uint8_t all_queues_zero;
+    uint8_t safepoint_active;
+    uint8_t reserved;
+} continuum_bootstrap_pty_safepoint_wire_status;
+
 struct continuum_remote_session {
     mach_port_t task;
     int owns_task_port;
@@ -894,6 +2096,11 @@ struct continuum_remote_session {
     int has_active_reconstruction;
     int has_prepared_pthread_set;
     int has_reconstructed_thread_set;
+    uint8_t replacement_stop_kind;
+    uint8_t has_brokered_stop_authorization;
+    int32_t brokered_expected_parent_process_id;
+    uint64_t brokered_start_seconds;
+    uint64_t brokered_start_microseconds;
     continuum_remote_pthread_bootstrap_report prepared_pthreads;
 };
 
@@ -935,7 +2142,8 @@ typedef struct continuum_remote_process_group_member {
 } continuum_remote_process_group_member;
 
 struct continuum_remote_process_group_snapshot {
-    int32_t root_process_id;
+    int32_t *root_process_ids;
+    size_t root_process_count;
     continuum_remote_process_group_member *members;
     size_t member_count;
     continuum_remote_process_group_snapshot_info info;
@@ -1679,9 +2887,12 @@ continuum_status continuum_inspect_local_bootstrap_library(
     void *symbol = dlsym(handle, "continuum_bootstrap_copy_and_trap");
     void *pthread_symbol = dlsym(
         handle, "continuum_bootstrap_prepare_pthreads_and_trap");
+    void *pty_status_symbol = dlsym(
+        handle, "continuum_bootstrap_pty_safepoint_report");
     Dl_info info;
     memset(&info, 0, sizeof(info));
-    if (symbol == NULL || pthread_symbol == NULL || dladdr(symbol, &info) == 0
+    if (symbol == NULL || pthread_symbol == NULL || pty_status_symbol == NULL
+        || dladdr(symbol, &info) == 0
         || info.dli_fbase == NULL || info.dli_fname == NULL) {
         goto cleanup;
     }
@@ -1706,12 +2917,18 @@ continuum_status continuum_inspect_local_bootstrap_library(
         ptrauth_key_function_pointer
     );
 #endif
+    uintptr_t pty_status_address = (uintptr_t)pty_status_symbol;
     uintptr_t image_base = (uintptr_t)info.dli_fbase;
     Dl_info pthread_info;
+    Dl_info pty_status_info;
     memset(&pthread_info, 0, sizeof(pthread_info));
+    memset(&pty_status_info, 0, sizeof(pty_status_info));
     if (copy_address <= image_base || pthread_prepare_address <= image_base
+        || pty_status_address <= image_base
         || dladdr(pthread_symbol, &pthread_info) == 0
-        || pthread_info.dli_fbase != info.dli_fbase) {
+        || dladdr(pty_status_symbol, &pty_status_info) == 0
+        || pthread_info.dli_fbase != info.dli_fbase
+        || pty_status_info.dli_fbase != info.dli_fbase) {
         goto cleanup;
     }
     status = continuum_copy_local_image_uuid(
@@ -1727,6 +2944,9 @@ continuum_status continuum_inspect_local_bootstrap_library(
     out_identity->pthread_prepare_address = pthread_prepare_address;
     out_identity->pthread_prepare_offset =
         pthread_prepare_address - image_base;
+    out_identity->pty_safepoint_status_address = pty_status_address;
+    out_identity->pty_safepoint_status_offset =
+        pty_status_address - image_base;
 
 cleanup:
     dlclose(handle);
@@ -2495,22 +3715,18 @@ static continuum_status continuum_wait_for_child_signal_stop(
     }
 }
 
-continuum_status continuum_advance_process_to_entry_stop(
+static continuum_status continuum_advance_bootstrap_stopped_process_to_entry(
     int32_t process_id,
-    uint32_t timeout_milliseconds
+    uint32_t timeout_milliseconds,
+    int already_traced,
+    int broker_channel
 ) {
 #if !defined(__arm64__)
     (void)process_id;
     (void)timeout_milliseconds;
     return CONTINUUM_STATUS_UNSUPPORTED_ARCHITECTURE;
 #else
-    continuum_status status = continuum_advance_process_to_bootstrap_stop(
-        process_id,
-        timeout_milliseconds
-    );
-    if (status != CONTINUUM_STATUS_OK) {
-        return status;
-    }
+    continuum_status status = CONTINUUM_STATUS_OK;
 
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t result = task_for_pid(
@@ -2531,13 +3747,14 @@ continuum_status continuum_advance_process_to_entry_stop(
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    int attach_result = ptrace(PT_ATTACH, process_id, NULL, 0);
+    int attach_result = already_traced
+        ? 0
+        : ptrace(PT_ATTACH, process_id, NULL, 0);
 #pragma clang diagnostic pop
     if (attach_result != 0) {
         mach_port_deallocate(mach_task_self(), task);
         return CONTINUUM_STATUS_ACCESS_DENIED;
     }
-
     uint64_t timeout_nanoseconds =
         (uint64_t)timeout_milliseconds * UINT64_C(1000000);
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -2546,14 +3763,16 @@ continuum_status continuum_advance_process_to_entry_stop(
         return CONTINUUM_STATUS_RANGE_ERROR;
     }
     uint64_t deadline = now + timeout_nanoseconds;
-    status = continuum_wait_for_child_signal_stop(
-        process_id,
-        deadline,
-        SIGSTOP
-    );
-    if (status != CONTINUUM_STATUS_OK) {
-        mach_port_deallocate(mach_task_self(), task);
-        return status;
+    if (!already_traced) {
+        status = continuum_wait_for_child_signal_stop(
+            process_id,
+            deadline,
+            SIGSTOP
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            mach_port_deallocate(mach_task_self(), task);
+            return status;
+        }
     }
 
     thread_act_array_t threads = NULL;
@@ -2613,7 +3832,13 @@ continuum_status continuum_advance_process_to_entry_stop(
         }
     }
 
-    if (status == CONTINUUM_STATUS_OK) {
+    if (status == CONTINUUM_STATUS_OK && broker_channel >= 0) {
+        status = continuum_broker_send_empty_command(
+            broker_channel,
+            CONTINUUM_BROKER_CHILD_TO_ENTRY,
+            CONTINUUM_BROKER_CHILD_ENTRY_REACHED
+        );
+    } else if (status == CONTINUUM_STATUS_OK) {
         if (ptrace(PT_CONTINUE, process_id, (caddr_t)1, 0) != 0) {
             status = CONTINUUM_STATUS_RESUME_FAILED;
         } else {
@@ -2653,6 +3878,13 @@ continuum_status continuum_advance_process_to_entry_stop(
             status = CONTINUUM_STATUS_VALIDATION_FAILED;
         }
     }
+    if (status == CONTINUUM_STATUS_OK && broker_channel >= 0) {
+        status = continuum_broker_send_empty_command(
+            broker_channel,
+            CONTINUUM_BROKER_CHILD_DETACH,
+            CONTINUUM_BROKER_CHILD_DETACHED
+        );
+    }
 
     mach_port_deallocate(mach_task_self(), threads[0]);
     vm_deallocate(
@@ -2663,6 +3895,25 @@ continuum_status continuum_advance_process_to_entry_stop(
     mach_port_deallocate(mach_task_self(), task);
     return status;
 #endif
+}
+
+continuum_status continuum_advance_process_to_entry_stop(
+    int32_t process_id,
+    uint32_t timeout_milliseconds
+) {
+    continuum_status status = continuum_advance_process_to_bootstrap_stop(
+        process_id,
+        timeout_milliseconds
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+    return continuum_advance_bootstrap_stopped_process_to_entry(
+        process_id,
+        timeout_milliseconds,
+        0,
+        -1
+    );
 }
 
 continuum_status continuum_release_entry_stopped_child(
@@ -2684,7 +3935,12 @@ continuum_status continuum_release_entry_stopped_child(
         return CONTINUUM_STATUS_TARGET_EXITED;
     }
     if (process_info.pbi_ppid != getpid()) {
-        return CONTINUUM_STATUS_ACCESS_DENIED;
+        if (process_info.pbi_status != SSTOP) {
+            return CONTINUUM_STATUS_ACCESS_DENIED;
+        }
+        return kill(process_id, SIGCONT) == 0
+            ? CONTINUUM_STATUS_OK
+            : CONTINUUM_STATUS_RESUME_FAILED;
     }
 
 #pragma clang diagnostic push
@@ -4548,7 +5804,7 @@ static continuum_status continuum_validate_process_snapshot_layout(
     );
     if ((resource_changes
             & CONTINUUM_RESOURCE_CHANGE_UNSUPPORTED_DESCRIPTOR) != 0) {
-        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
     }
     if ((resource_changes & CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE) != 0) {
         return CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED;
@@ -5402,7 +6658,13 @@ continuum_status continuum_remote_process_has_bootstrap(
             sizeof(observed_path)
         );
         if (status != CONTINUUM_STATUS_OK) {
-            break;
+            // dyld may retain a transient or already-unmapped image-path
+            // pointer while another image is being unloaded. It cannot be
+            // the authenticated match because its canonical path is
+            // unreadable, so skip it and continue searching. Failure to find
+            // the expected path still fails closed below.
+            status = CONTINUUM_STATUS_OK;
+            continue;
         }
         if (realpath(observed_path, observed_canonical) == NULL
             || strcmp(expected_path, observed_canonical) != 0) {
@@ -5649,6 +6911,48 @@ continuum_status continuum_remote_session_range_is_unmapped(
     return status == CONTINUUM_STATUS_OK ? resume_status : status;
 }
 
+continuum_status continuum_brokered_pair_authorize_remote_session(
+    continuum_brokered_pair *pair,
+    continuum_remote_session *session,
+    continuum_brokered_process_role role
+) {
+    if (pair == NULL || session == NULL
+        || pair->state != CONTINUUM_BROKER_PAIR_ENTRY_STOPPED
+        || (role != CONTINUUM_BROKERED_PROCESS_ROOT
+            && role != CONTINUUM_BROKERED_PROCESS_CHILD)
+        || session->has_brokered_stop_authorization) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    pid_t process_id = role == CONTINUUM_BROKERED_PROCESS_ROOT
+        ? pair->root_process_id : pair->child_process_id;
+    pid_t expected_parent = role == CONTINUUM_BROKERED_PROCESS_ROOT
+        ? getpid() : pair->root_process_id;
+    uint64_t start_seconds = role == CONTINUUM_BROKERED_PROCESS_ROOT
+        ? pair->root_start_seconds : pair->child_start_seconds;
+    uint64_t start_microseconds = role == CONTINUUM_BROKERED_PROCESS_ROOT
+        ? pair->root_start_microseconds : pair->child_start_microseconds;
+    if (session->identity.process_id != process_id
+        || session->identity.start_seconds != start_seconds
+        || session->identity.start_microseconds != start_microseconds
+        || !continuum_broker_process_matches(
+            process_id,
+            expected_parent,
+            start_seconds,
+            start_microseconds,
+            1
+        )) {
+        return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    }
+    session->replacement_stop_kind = role == CONTINUUM_BROKERED_PROCESS_CHILD
+        ? CONTINUUM_REPLACEMENT_STOP_BROKER_SIGNAL
+        : CONTINUUM_REPLACEMENT_STOP_DIRECT_PTRACE;
+    session->has_brokered_stop_authorization = 1;
+    session->brokered_expected_parent_process_id = expected_parent;
+    session->brokered_start_seconds = start_seconds;
+    session->brokered_start_microseconds = start_microseconds;
+    return CONTINUUM_STATUS_OK;
+}
+
 static continuum_status continuum_validate_stopped_replacement_session(
     continuum_remote_session *session
 ) {
@@ -5669,9 +6973,20 @@ static continuum_status continuum_validate_stopped_replacement_session(
         (int)sizeof(process_info)
     );
     if (copied != (int)sizeof(process_info)
-        || process_info.pbi_ppid != getpid()
         || process_info.pbi_status != SSTOP) {
         return CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+    if (!session->has_brokered_stop_authorization) {
+        return process_info.pbi_ppid == getpid()
+            ? CONTINUUM_STATUS_OK
+            : CONTINUUM_STATUS_ACCESS_DENIED;
+    }
+    if (process_info.pbi_ppid
+            != (uint32_t)session->brokered_expected_parent_process_id
+        || process_info.pbi_start_tvsec != session->brokered_start_seconds
+        || process_info.pbi_start_tvusec
+            != session->brokered_start_microseconds) {
+        return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
     }
     return CONTINUUM_STATUS_OK;
 }
@@ -8712,10 +10027,20 @@ continuum_status continuum_remote_session_release_entry_stopped_child(
                 : CONTINUUM_STATUS_ROLLBACK_FAILED;
         }
     }
-    if (ptrace(PT_DETACH, process_id, (caddr_t)1, 0) != 0) {
+    int stop_release_result = 0;
+    if (session->replacement_stop_kind
+            == CONTINUUM_REPLACEMENT_STOP_BROKER_SIGNAL) {
+        stop_release_result = kill(process_id, SIGCONT);
+    } else {
+        stop_release_result = ptrace(PT_DETACH, process_id, (caddr_t)1, 0);
+    }
+    if (stop_release_result != 0) {
         status = errno == ESRCH
             ? CONTINUUM_STATUS_TARGET_EXITED
-            : CONTINUUM_STATUS_ACCESS_DENIED;
+            : (session->replacement_stop_kind
+                    == CONTINUUM_REPLACEMENT_STOP_BROKER_SIGNAL
+                ? CONTINUUM_STATUS_RESUME_FAILED
+                : CONTINUUM_STATUS_ACCESS_DENIED);
         int rollback_verified = 1;
         while (resumed_worker_count > 0) {
             resumed_worker_count -= 1;
@@ -8752,9 +10077,9 @@ continuum_status continuum_remote_session_release_entry_stopped_child(
     if (status == CONTINUUM_STATUS_OK) {
         session->has_reconstructed_thread_set = 0;
     } else if (task_terminate(session->task) == KERN_SUCCESS) {
-        // PT_DETACH already committed the ptrace transition. If the owned task
-        // suspension cannot be released exactly, fail closed so no later
-        // session cleanup can accidentally run a partially released child.
+        // The ptrace or signal-stop transition already committed. If the owned
+        // task suspension cannot be released exactly, fail closed so no later
+        // session cleanup can accidentally run a partially released process.
         session->owned_suspend_count = 0;
         session->has_reconstructed_thread_set = 0;
     }
@@ -9172,13 +10497,22 @@ static int continuum_process_tree_contains(
     return 0;
 }
 
-static continuum_status continuum_discover_process_tree(
-    int32_t root_process_id,
+static continuum_status continuum_discover_process_forest(
+    const int32_t *root_process_ids,
+    size_t root_process_count,
     continuum_remote_process_tree_entry **out_entries,
     size_t *out_count
 ) {
-    if (root_process_id <= 0 || out_entries == NULL || out_count == NULL) {
+    if (root_process_ids == NULL || root_process_count == 0
+        || out_entries == NULL || out_count == NULL) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    for (size_t root_index = 0;
+         root_index < root_process_count;
+         root_index += 1) {
+        if (root_process_ids[root_index] <= 1) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
     }
     *out_entries = NULL;
     *out_count = 0;
@@ -9245,18 +10579,32 @@ static continuum_status continuum_discover_process_tree(
     }
 
     size_t tree_count = 0;
-    for (size_t index = 0; index < all_count; index += 1) {
-        if (all_entries[index].process_id == root_process_id) {
-            tree[tree_count] = all_entries[index];
-            tree[tree_count].depth = 0;
-            tree_count += 1;
+    for (size_t root_index = 0;
+         root_index < root_process_count;
+         root_index += 1) {
+        const int32_t root_process_id = root_process_ids[root_index];
+        int found = 0;
+        for (size_t index = 0; index < all_count; index += 1) {
+            if (all_entries[index].process_id != root_process_id) {
+                continue;
+            }
+            found = 1;
+            if (!continuum_process_tree_contains(
+                    tree,
+                    tree_count,
+                    root_process_id,
+                    NULL
+                )) {
+                tree[tree_count] = all_entries[index];
+                tree_count += 1;
+            }
             break;
         }
-    }
-    if (tree_count == 0) {
-        free(tree);
-        free(all_entries);
-        return CONTINUUM_STATUS_TARGET_EXITED;
+        if (!found) {
+            free(tree);
+            free(all_entries);
+            return CONTINUUM_STATUS_TARGET_EXITED;
+        }
     }
 
     int added = 1;
@@ -9273,22 +10621,50 @@ static continuum_status continuum_discover_process_tree(
                 )) {
                 continue;
             }
-            uint32_t parent_depth = 0;
             if (!continuum_process_tree_contains(
                     tree,
                     tree_count,
                     candidate.parent_process_id,
-                    &parent_depth
+                    NULL
                 )) {
                 continue;
             }
             tree[tree_count] = candidate;
-            tree[tree_count].depth = parent_depth + 1;
             tree_count += 1;
             added = 1;
         }
     }
     free(all_entries);
+
+    // Depth is derived from captured parent links after the complete union is
+    // known. This keeps an explicitly named descendant behind its captured
+    // ancestor when roots overlap, while independent roots remain depth zero.
+    for (size_t index = 0; index < tree_count; index += 1) {
+        uint32_t depth = 0;
+        int32_t parent_process_id = tree[index].parent_process_id;
+        for (size_t step = 0; step < tree_count; step += 1) {
+            int parent_found = 0;
+            for (size_t parent_index = 0;
+                 parent_index < tree_count;
+                 parent_index += 1) {
+                if (tree[parent_index].process_id != parent_process_id) {
+                    continue;
+                }
+                parent_found = 1;
+                parent_process_id = tree[parent_index].parent_process_id;
+                depth += 1;
+                break;
+            }
+            if (!parent_found) {
+                break;
+            }
+            if (step + 1 == tree_count) {
+                free(tree);
+                return CONTINUUM_STATUS_PROCESS_TREE_CHANGED;
+            }
+        }
+        tree[index].depth = depth;
+    }
     qsort(
         tree,
         tree_count,
@@ -9429,12 +10805,14 @@ void continuum_remote_process_group_snapshot_destroy(
         memset(&snapshot->members[index], 0, sizeof(snapshot->members[index]));
     }
     free(snapshot->members);
+    free(snapshot->root_process_ids);
     memset(snapshot, 0, sizeof(*snapshot));
     free(snapshot);
 }
 
 static continuum_status continuum_capture_process_group_attempt(
-    int32_t root_process_id,
+    const int32_t *root_process_ids,
+    size_t root_process_count,
     uint64_t maximum_captured_bytes,
     continuum_remote_resource_capture_callback resource_callback,
     void *resource_context,
@@ -9442,8 +10820,9 @@ static continuum_status continuum_capture_process_group_attempt(
 ) {
     continuum_remote_process_tree_entry *tree = NULL;
     size_t tree_count = 0;
-    continuum_status status = continuum_discover_process_tree(
-        root_process_id,
+    continuum_status status = continuum_discover_process_forest(
+        root_process_ids,
+        root_process_count,
         &tree,
         &tree_count
     );
@@ -9456,11 +10835,26 @@ static continuum_status continuum_capture_process_group_attempt(
         free(tree);
         return CONTINUUM_STATUS_OUT_OF_MEMORY;
     }
-    group->root_process_id = root_process_id;
+    group->root_process_ids = calloc(
+        root_process_count,
+        sizeof(*group->root_process_ids)
+    );
+    if (group->root_process_ids == NULL) {
+        free(tree);
+        free(group);
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+    memcpy(
+        group->root_process_ids,
+        root_process_ids,
+        root_process_count * sizeof(*group->root_process_ids)
+    );
+    group->root_process_count = root_process_count;
     group->member_count = tree_count;
     group->members = calloc(tree_count, sizeof(*group->members));
     if (group->members == NULL) {
         free(tree);
+        free(group->root_process_ids);
         free(group);
         return CONTINUUM_STATUS_OUT_OF_MEMORY;
     }
@@ -9482,8 +10876,9 @@ static continuum_status continuum_capture_process_group_attempt(
     continuum_remote_process_tree_entry *verified_tree = NULL;
     size_t verified_count = 0;
     if (status == CONTINUUM_STATUS_OK) {
-        status = continuum_discover_process_tree(
-            root_process_id,
+        status = continuum_discover_process_forest(
+            root_process_ids,
+            root_process_count,
             &verified_tree,
             &verified_count
         );
@@ -9553,14 +10948,16 @@ static continuum_status continuum_capture_process_group_attempt(
 }
 
 static continuum_status continuum_remote_process_group_capture_internal(
-    int32_t root_process_id,
+    const int32_t *root_process_ids,
+    size_t root_process_count,
     uint64_t maximum_captured_bytes,
     continuum_remote_resource_capture_callback resource_callback,
     void *resource_context,
     continuum_remote_process_group_snapshot **out_snapshot,
     continuum_remote_process_group_snapshot_info *out_info
 ) {
-    if (root_process_id <= 0 || root_process_id == getpid()
+    if (root_process_ids == NULL || root_process_count == 0
+        || root_process_count > SIZE_MAX / sizeof(*root_process_ids)
         || maximum_captured_bytes == 0 || out_snapshot == NULL
         || out_info == NULL) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
@@ -9568,10 +10965,39 @@ static continuum_status continuum_remote_process_group_capture_internal(
     *out_snapshot = NULL;
     memset(out_info, 0, sizeof(*out_info));
 
+    int32_t *unique_roots = calloc(root_process_count, sizeof(*unique_roots));
+    if (unique_roots == NULL) {
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+    size_t unique_root_count = 0;
+    for (size_t root_index = 0;
+         root_index < root_process_count;
+         root_index += 1) {
+        const int32_t process_id = root_process_ids[root_index];
+        if (process_id <= 1 || process_id == getpid()) {
+            free(unique_roots);
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        int duplicate = 0;
+        for (size_t existing_index = 0;
+             existing_index < unique_root_count;
+             existing_index += 1) {
+            if (unique_roots[existing_index] == process_id) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (!duplicate) {
+            unique_roots[unique_root_count] = process_id;
+            unique_root_count += 1;
+        }
+    }
+
     continuum_status status = CONTINUUM_STATUS_PROCESS_TREE_CHANGED;
     for (size_t attempt = 0; attempt < 3; attempt += 1) {
         status = continuum_capture_process_group_attempt(
-            root_process_id,
+            unique_roots,
+            unique_root_count,
             maximum_captured_bytes,
             resource_callback,
             resource_context,
@@ -9582,6 +11008,7 @@ static continuum_status continuum_remote_process_group_capture_internal(
             break;
         }
     }
+    free(unique_roots);
     if (status != CONTINUUM_STATUS_OK) {
         return status;
     }
@@ -9595,8 +11022,28 @@ continuum_status continuum_remote_process_group_capture(
     continuum_remote_process_group_snapshot **out_snapshot,
     continuum_remote_process_group_snapshot_info *out_info
 ) {
+    const int32_t roots[] = { root_process_id };
     return continuum_remote_process_group_capture_internal(
-        root_process_id,
+        roots,
+        1,
+        maximum_captured_bytes,
+        NULL,
+        NULL,
+        out_snapshot,
+        out_info
+    );
+}
+
+continuum_status continuum_remote_process_group_capture_roots(
+    const int32_t root_process_ids[],
+    size_t root_process_count,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+) {
+    return continuum_remote_process_group_capture_internal(
+        root_process_ids,
+        root_process_count,
         maximum_captured_bytes,
         NULL,
         NULL,
@@ -9616,8 +11063,33 @@ continuum_status continuum_remote_process_group_capture_with_resources(
     if (callback == NULL) {
         return CONTINUUM_STATUS_INVALID_ARGUMENT;
     }
+    const int32_t roots[] = { root_process_id };
     return continuum_remote_process_group_capture_internal(
-        root_process_id,
+        roots,
+        1,
+        maximum_captured_bytes,
+        callback,
+        callback_context,
+        out_snapshot,
+        out_info
+    );
+}
+
+continuum_status continuum_remote_process_group_capture_roots_with_resources(
+    const int32_t root_process_ids[],
+    size_t root_process_count,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_resource_capture_callback callback,
+    void *callback_context,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+) {
+    if (callback == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    return continuum_remote_process_group_capture_internal(
+        root_process_ids,
+        root_process_count,
         maximum_captured_bytes,
         callback,
         callback_context,
@@ -9644,6 +11116,227 @@ continuum_status continuum_remote_process_group_live_status(
         );
         if (status != CONTINUUM_STATUS_OK) {
             return status;
+        }
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+static continuum_status continuum_find_authenticated_bootstrap_base(
+    continuum_remote_session *session,
+    const char *library_path,
+    const uint8_t expected_uuid[16],
+    mach_vm_address_t *out_image_base
+) {
+    if (session == NULL || library_path == NULL || library_path[0] == '\0'
+        || expected_uuid == NULL || out_image_base == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_image_base = 0;
+    char expected_path[PATH_MAX];
+    if (realpath(library_path, expected_path) == NULL) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    task_dyld_info_data_t dyld_info;
+    memset(&dyld_info, 0, sizeof(dyld_info));
+    mach_msg_type_number_t dyld_info_count = TASK_DYLD_INFO_COUNT;
+    kern_return_t result = task_info(
+        session->task,
+        TASK_DYLD_INFO,
+        (task_info_t)&dyld_info,
+        &dyld_info_count
+    );
+    if (result != KERN_SUCCESS || dyld_info.all_image_info_addr == 0) {
+        return CONTINUUM_STATUS_MACH_ERROR;
+    }
+
+    struct dyld_all_image_infos all_images;
+    memset(&all_images, 0, sizeof(all_images));
+    continuum_status status = continuum_read_task_bytes(
+        session->task,
+        dyld_info.all_image_info_addr,
+        sizeof(all_images),
+        &all_images
+    );
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+    if (all_images.infoArrayCount == 0
+        || all_images.infoArrayCount > UINT32_C(1048576)
+        || all_images.infoArray == NULL) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+
+    size_t byte_count =
+        (size_t)all_images.infoArrayCount * sizeof(struct dyld_image_info);
+    struct dyld_image_info *entries = malloc(byte_count);
+    if (entries == NULL) {
+        return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    }
+    status = continuum_read_task_bytes(
+        session->task,
+        (mach_vm_address_t)(uintptr_t)all_images.infoArray,
+        byte_count,
+        entries
+    );
+    for (uint32_t index = 0;
+         status == CONTINUUM_STATUS_OK && index < all_images.infoArrayCount;
+         index += 1) {
+        if (entries[index].imageLoadAddress == NULL
+            || entries[index].imageFilePath == NULL) {
+            continue;
+        }
+        char observed_path[PATH_MAX];
+        char observed_canonical[PATH_MAX];
+        status = continuum_read_task_cstring(
+            session->task,
+            (mach_vm_address_t)(uintptr_t)entries[index].imageFilePath,
+            observed_path,
+            sizeof(observed_path)
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            status = CONTINUUM_STATUS_OK;
+            continue;
+        }
+        if (realpath(observed_path, observed_canonical) == NULL
+            || strcmp(expected_path, observed_canonical) != 0) {
+            continue;
+        }
+        uint8_t remote_uuid[16];
+        status = continuum_copy_remote_image_uuid(
+            session->task,
+            (mach_vm_address_t)(uintptr_t)entries[index].imageLoadAddress,
+            remote_uuid
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            break;
+        }
+        if (memcmp(remote_uuid, expected_uuid, sizeof(remote_uuid)) != 0
+            || *out_image_base != 0) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+            break;
+        }
+        *out_image_base =
+            (mach_vm_address_t)(uintptr_t)entries[index].imageLoadAddress;
+    }
+    free(entries);
+    if (status != CONTINUUM_STATUS_OK) {
+        return status;
+    }
+    return *out_image_base != 0
+        ? CONTINUUM_STATUS_OK
+        : CONTINUUM_STATUS_VALIDATION_FAILED;
+}
+
+continuum_status continuum_remote_process_group_copy_pty_safepoint_status(
+    const continuum_remote_process_group_snapshot *snapshot,
+    const char *bootstrap_library_path,
+    continuum_remote_pty_safepoint_status *out_status
+) {
+    if (snapshot == NULL || snapshot->member_count == 0
+        || bootstrap_library_path == NULL
+        || bootstrap_library_path[0] == '\0' || out_status == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(out_status, 0, sizeof(*out_status));
+
+    continuum_bootstrap_identity local_identity;
+    continuum_status status = continuum_inspect_local_bootstrap_library(
+        bootstrap_library_path,
+        &local_identity
+    );
+    if (status != CONTINUUM_STATUS_OK
+        || local_identity.pty_safepoint_status_offset == 0) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+
+    out_status->process_count = snapshot->member_count;
+    out_status->queue_state_known = 1;
+    out_status->all_queues_zero = 1;
+    for (size_t member_index = 0;
+         member_index < snapshot->member_count;
+         member_index += 1) {
+        const continuum_remote_process_group_member *member =
+            &snapshot->members[member_index];
+        if (member->session == NULL || member->snapshot == NULL
+            || member->snapshot->threads == NULL) {
+            memset(out_status, 0, sizeof(*out_status));
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        status = continuum_validate_session_identity(member->session);
+        if (status != CONTINUUM_STATUS_OK) {
+            memset(out_status, 0, sizeof(*out_status));
+            return status;
+        }
+
+        mach_vm_address_t remote_image_base = 0;
+        status = continuum_find_authenticated_bootstrap_base(
+            member->session,
+            bootstrap_library_path,
+            local_identity.image_uuid,
+            &remote_image_base
+        );
+        uint64_t remote_status_address = 0;
+        if (status != CONTINUUM_STATUS_OK
+            || !continuum_add_u64(
+                remote_image_base,
+                local_identity.pty_safepoint_status_offset,
+                &remote_status_address
+            )) {
+            memset(out_status, 0, sizeof(*out_status));
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_RANGE_ERROR
+                : status;
+        }
+        continuum_bootstrap_pty_safepoint_wire_status remote_status;
+        memset(&remote_status, 0, sizeof(remote_status));
+        status = continuum_read_task_bytes(
+            member->session->task,
+            remote_status_address,
+            sizeof(remote_status),
+            &remote_status
+        );
+        if (status != CONTINUUM_STATUS_OK
+            || remote_status.magic != CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC
+            || remote_status.version != 2
+            || remote_status.structure_size != sizeof(remote_status)
+            || remote_status.generation == 0
+            || remote_status.safepoint_thread_identifier == 0
+            || remote_status.safepoint_active != 1) {
+            memset(out_status, 0, sizeof(*out_status));
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : status;
+        }
+        size_t matching_safepoint_threads = 0;
+        const continuum_remote_thread_snapshot *threads =
+            member->snapshot->threads;
+        for (size_t thread_index = 0;
+             thread_index < threads->count;
+             thread_index += 1) {
+            if (threads->entries[thread_index].identifier
+                == remote_status.safepoint_thread_identifier) {
+                matching_safepoint_threads += 1;
+            }
+        }
+        if (matching_safepoint_threads != 1) {
+            memset(out_status, 0, sizeof(*out_status));
+            return CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+        if (UINT64_MAX - out_status->pty_descriptor_count
+                < remote_status.pty_descriptor_count) {
+            memset(out_status, 0, sizeof(*out_status));
+            return CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        out_status->pty_descriptor_count +=
+            remote_status.pty_descriptor_count;
+        if (!remote_status.queue_state_known) {
+            out_status->queue_state_known = 0;
+            out_status->all_queues_zero = 0;
+        } else if (!remote_status.all_queues_zero) {
+            out_status->all_queues_zero = 0;
         }
     }
     return CONTINUUM_STATUS_OK;
@@ -10034,6 +11727,1731 @@ continuum_status continuum_remote_process_group_copy_writable_vnodes(
     return CONTINUUM_STATUS_OK;
 }
 
+static continuum_remote_pty_role continuum_pty_role_for_vnode(
+    const struct vnode_fdinfowithpath *info
+) {
+    if (info == NULL
+        || (info->pvip.vip_vi.vi_stat.vst_mode & S_IFMT) != S_IFCHR) {
+        return CONTINUUM_REMOTE_PTY_ROLE_UNKNOWN;
+    }
+    if (strcmp(info->pvip.vip_path, "/dev/ptmx") == 0) {
+        return CONTINUUM_REMOTE_PTY_ROLE_MASTER;
+    }
+    if (strncmp(info->pvip.vip_path, "/dev/ttys", 9) == 0
+        && info->pvip.vip_path[9] != '\0') {
+        return CONTINUUM_REMOTE_PTY_ROLE_SLAVE;
+    }
+    return CONTINUUM_REMOTE_PTY_ROLE_UNKNOWN;
+}
+
+static uint64_t continuum_pty_alias_identity(
+    uint32_t tty_index,
+    continuum_remote_pty_role role
+) {
+    uint64_t hash = CONTINUUM_FNV_OFFSET;
+    continuum_hash_u64(&hash, UINT64_C(0x505459414C494153));
+    continuum_hash_u64(&hash, tty_index);
+    continuum_hash_u64(&hash, (uint64_t)role);
+    return hash;
+}
+
+static void continuum_copy_pty_terminal_state(
+    const char *observed_path,
+    uint32_t tty_index,
+    continuum_remote_pty_descriptor_info *result
+) {
+    if (result == NULL) {
+        return;
+    }
+    char slave_path[64];
+    const char *path = observed_path;
+    if (result->role == CONTINUUM_REMOTE_PTY_ROLE_MASTER) {
+        int length = snprintf(
+            slave_path,
+            sizeof(slave_path),
+            "/dev/ttys%03x",
+            tty_index
+        );
+        if (length <= 0 || (size_t)length >= sizeof(slave_path)) {
+            return;
+        }
+        path = slave_path;
+    }
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+
+    struct stat status;
+    memset(&status, 0, sizeof(status));
+    if (stat(path, &status) != 0 || !S_ISCHR(status.st_mode)
+        || (uint32_t)minor(status.st_rdev) != tty_index) {
+        return;
+    }
+    int descriptor = open(
+        path,
+        O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC
+    );
+    if (descriptor < 0) {
+        return;
+    }
+    struct termios attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    if (tcgetattr(descriptor, &attributes) == 0) {
+        result->terminal_attributes = attributes;
+        result->terminal_attributes_known = 1;
+    }
+    struct winsize window_size;
+    memset(&window_size, 0, sizeof(window_size));
+    if (ioctl(descriptor, TIOCGWINSZ, &window_size) == 0) {
+        result->window_size = window_size;
+        result->window_size_known = 1;
+    }
+    close(descriptor);
+
+    // libproc exposes remote vnode identity but no operation equivalent to
+    // dup(2) for an arbitrary target fd. Opening the slave path can safely
+    // read termios/winsize, but its queue ioctls do not identify which bytes
+    // belong to the captured master/slave fileglob. Leave both counts unknown.
+    result->input_queue_known = 0;
+    result->output_queue_known = 0;
+}
+
+continuum_status continuum_remote_process_group_copy_pty_descriptors(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_pty_descriptor_info *entries,
+    size_t entry_capacity,
+    size_t *out_entry_count
+) {
+    if (snapshot == NULL || out_entry_count == NULL
+        || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_entry_count = 0;
+    size_t result_count = 0;
+
+    for (size_t member_index = 0;
+         member_index < snapshot->member_count;
+         member_index += 1) {
+        const continuum_remote_process_group_member *member =
+            &snapshot->members[member_index];
+        if (member->session == NULL) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        continuum_status status = continuum_validate_session_identity(
+            member->session
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            return status;
+        }
+
+        const int32_t process_id = member->session->identity.process_id;
+        int required_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            NULL,
+            0
+        );
+        if (required_bytes < 0) {
+            return CONTINUUM_STATUS_MACH_ERROR;
+        }
+        size_t capacity = (size_t)required_bytes
+            + 32U * sizeof(struct proc_fdinfo);
+        if (capacity < sizeof(struct proc_fdinfo) || capacity > INT_MAX) {
+            return CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        struct proc_fdinfo *descriptors = calloc(1, capacity);
+        if (descriptors == NULL) {
+            return CONTINUUM_STATUS_OUT_OF_MEMORY;
+        }
+        int returned_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            descriptors,
+            (int)capacity
+        );
+        if (returned_bytes < 0
+            || returned_bytes % (int)sizeof(struct proc_fdinfo) != 0) {
+            free(descriptors);
+            return CONTINUUM_STATUS_MACH_ERROR;
+        }
+        const size_t descriptor_count =
+            (size_t)returned_bytes / sizeof(struct proc_fdinfo);
+        qsort(
+            descriptors,
+            descriptor_count,
+            sizeof(*descriptors),
+            continuum_fd_info_compare
+        );
+
+        for (size_t descriptor_index = 0;
+             descriptor_index < descriptor_count;
+             descriptor_index += 1) {
+            const struct proc_fdinfo descriptor = descriptors[descriptor_index];
+            if (descriptor.proc_fdtype != PROX_FDTYPE_VNODE) {
+                continue;
+            }
+            struct vnode_fdinfowithpath info;
+            memset(&info, 0, sizeof(info));
+            int bytes = proc_pidfdinfo(
+                process_id,
+                descriptor.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                &info,
+                sizeof(info)
+            );
+            if (bytes != (int)sizeof(info)) {
+                free(descriptors);
+                return CONTINUUM_STATUS_MACH_ERROR;
+            }
+            continuum_remote_pty_role role = continuum_pty_role_for_vnode(
+                &info
+            );
+            if (role == CONTINUUM_REMOTE_PTY_ROLE_UNKNOWN) {
+                continue;
+            }
+
+            if (entries != NULL && result_count >= entry_capacity) {
+                free(descriptors);
+                return CONTINUUM_STATUS_RANGE_ERROR;
+            }
+            if (entries != NULL) {
+                continuum_remote_pty_descriptor_info *result =
+                    &entries[result_count];
+                memset(result, 0, sizeof(*result));
+                const uint32_t raw_device =
+                    info.pvip.vip_vi.vi_stat.vst_rdev;
+                result->process_id = process_id;
+                result->file_descriptor = descriptor.proc_fd;
+                result->open_flags = info.pfi.fi_openflags;
+                result->role = role;
+                result->device = info.pvip.vip_vi.vi_stat.vst_dev;
+                result->inode = info.pvip.vip_vi.vi_stat.vst_ino;
+                result->raw_device = raw_device;
+                result->device_major = (uint32_t)major(raw_device);
+                result->device_minor = (uint32_t)minor(raw_device);
+                result->tty_index = result->device_minor;
+                result->alias_identity = continuum_pty_alias_identity(
+                    result->tty_index,
+                    role
+                );
+                continuum_copy_pty_terminal_state(
+                    info.pvip.vip_path,
+                    result->tty_index,
+                    result
+                );
+            }
+            result_count += 1;
+        }
+        free(descriptors);
+    }
+
+    *out_entry_count = result_count;
+    return CONTINUUM_STATUS_OK;
+}
+
+static continuum_status continuum_copy_tcp_endpoint_address(
+    const struct in_sockinfo *internet_info,
+    int local,
+    uint8_t destination[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX],
+    uint32_t *out_length
+) {
+    if (internet_info == NULL || destination == NULL || out_length == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(destination, 0, CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX);
+    *out_length = 0;
+
+    if (internet_info->insi_vflag == INI_IPV4) {
+        struct sockaddr_in address;
+        memset(&address, 0, sizeof(address));
+        address.sin_len = sizeof(address);
+        address.sin_family = AF_INET;
+        address.sin_port = (in_port_t)(local
+            ? internet_info->insi_lport
+            : internet_info->insi_fport);
+        address.sin_addr = local
+            ? internet_info->insi_laddr.ina_46.i46a_addr4
+            : internet_info->insi_faddr.ina_46.i46a_addr4;
+        if (sizeof(address) > CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX) {
+            return CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        memcpy(destination, &address, sizeof(address));
+        *out_length = (uint32_t)sizeof(address);
+        return CONTINUUM_STATUS_OK;
+    }
+
+    if (internet_info->insi_vflag == INI_IPV6) {
+        struct sockaddr_in6 address;
+        memset(&address, 0, sizeof(address));
+        address.sin6_len = sizeof(address);
+        address.sin6_family = AF_INET6;
+        address.sin6_port = (in_port_t)(local
+            ? internet_info->insi_lport
+            : internet_info->insi_fport);
+        address.sin6_addr = local
+            ? internet_info->insi_laddr.ina_6
+            : internet_info->insi_faddr.ina_6;
+        address.sin6_scope_id = internet_info->insi_v6.in6_ifindex;
+        if (sizeof(address) > CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX) {
+            return CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        memcpy(destination, &address, sizeof(address));
+        *out_length = (uint32_t)sizeof(address);
+        return CONTINUUM_STATUS_OK;
+    }
+    return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+}
+
+continuum_status continuum_remote_process_group_copy_tcp_endpoints(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_tcp_endpoint_info *entries,
+    size_t entry_capacity,
+    size_t *out_entry_count
+) {
+    if (snapshot == NULL || out_entry_count == NULL
+        || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_entry_count = 0;
+    size_t result_count = 0;
+
+    for (size_t member_index = 0;
+         member_index < snapshot->member_count;
+         member_index += 1) {
+        const continuum_remote_process_group_member *member =
+            &snapshot->members[member_index];
+        if (member->session == NULL) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        continuum_status status = continuum_validate_session_identity(
+            member->session
+        );
+        if (status != CONTINUUM_STATUS_OK) {
+            return status;
+        }
+
+        const int32_t process_id = member->session->identity.process_id;
+        int required_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            NULL,
+            0
+        );
+        if (required_bytes < 0) {
+            return CONTINUUM_STATUS_MACH_ERROR;
+        }
+        size_t capacity = (size_t)required_bytes
+            + 32U * sizeof(struct proc_fdinfo);
+        if (capacity < sizeof(struct proc_fdinfo) || capacity > INT_MAX) {
+            return CONTINUUM_STATUS_RANGE_ERROR;
+        }
+        struct proc_fdinfo *descriptors = calloc(1, capacity);
+        if (descriptors == NULL) {
+            return CONTINUUM_STATUS_OUT_OF_MEMORY;
+        }
+        int returned_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            descriptors,
+            (int)capacity
+        );
+        if (returned_bytes < 0
+            || returned_bytes % (int)sizeof(struct proc_fdinfo) != 0) {
+            free(descriptors);
+            return CONTINUUM_STATUS_MACH_ERROR;
+        }
+        const size_t descriptor_count =
+            (size_t)returned_bytes / sizeof(struct proc_fdinfo);
+        qsort(
+            descriptors,
+            descriptor_count,
+            sizeof(*descriptors),
+            continuum_fd_info_compare
+        );
+
+        for (size_t descriptor_index = 0;
+             descriptor_index < descriptor_count;
+             descriptor_index += 1) {
+            const struct proc_fdinfo descriptor = descriptors[descriptor_index];
+            if (descriptor.proc_fdtype != PROX_FDTYPE_SOCKET) {
+                continue;
+            }
+            struct socket_fdinfo info;
+            memset(&info, 0, sizeof(info));
+            int bytes = proc_pidfdinfo(
+                process_id,
+                descriptor.proc_fd,
+                PROC_PIDFDSOCKETINFO,
+                &info,
+                sizeof(info)
+            );
+            if (bytes != (int)sizeof(info)) {
+                free(descriptors);
+                return CONTINUUM_STATUS_MACH_ERROR;
+            }
+            if (info.psi.soi_kind != SOCKINFO_TCP
+                || info.psi.soi_type != SOCK_STREAM
+                || info.psi.soi_protocol != IPPROTO_TCP
+                || (info.psi.soi_family != AF_INET
+                    && info.psi.soi_family != AF_INET6)
+                || info.psi.soi_proto.pri_tcp.tcpsi_state
+                    != TSI_S_ESTABLISHED) {
+                continue;
+            }
+
+            if (entries != NULL && result_count >= entry_capacity) {
+                free(descriptors);
+                return CONTINUUM_STATUS_RANGE_ERROR;
+            }
+            if (entries != NULL) {
+                continuum_remote_tcp_endpoint_info *result =
+                    &entries[result_count];
+                memset(result, 0, sizeof(*result));
+                result->process_id = process_id;
+                result->file_descriptor = descriptor.proc_fd;
+                result->domain = info.psi.soi_family;
+                result->socket_type = info.psi.soi_type;
+                result->protocol = info.psi.soi_protocol;
+                result->tcp_state = info.psi.soi_proto.pri_tcp.tcpsi_state;
+                result->socket_state = (uint32_t)(uint16_t)info.psi.soi_state;
+                result->receive_shutdown =
+                    (info.psi.soi_state & SOI_S_CANTRCVMORE) != 0;
+                result->send_shutdown =
+                    (info.psi.soi_state & SOI_S_CANTSENDMORE) != 0;
+                result->receive_queue_bytes = info.psi.soi_rcv.sbi_cc;
+                result->send_queue_bytes = info.psi.soi_snd.sbi_cc;
+
+                const struct in_sockinfo *internet_info =
+                    &info.psi.soi_proto.pri_tcp.tcpsi_ini;
+                status = continuum_copy_tcp_endpoint_address(
+                    internet_info,
+                    1,
+                    result->local_address,
+                    &result->local_address_length
+                );
+                if (status == CONTINUUM_STATUS_OK) {
+                    status = continuum_copy_tcp_endpoint_address(
+                        internet_info,
+                        0,
+                        result->remote_address,
+                        &result->remote_address_length
+                    );
+                }
+                if (status != CONTINUUM_STATUS_OK) {
+                    free(descriptors);
+                    return status;
+                }
+            }
+            result_count += 1;
+        }
+        free(descriptors);
+    }
+
+    *out_entry_count = result_count;
+    return CONTINUUM_STATUS_OK;
+}
+
+struct continuum_remote_descriptor_graph {
+    continuum_remote_descriptor_handle_info *handles;
+    size_t handle_count;
+    continuum_remote_socket_resource_info *sockets;
+    size_t socket_count;
+    continuum_remote_pipe_resource_info *pipes;
+    size_t pipe_count;
+    continuum_remote_kqueue_resource_info *kqueues;
+    size_t kqueue_count;
+    continuum_remote_kqueue_registration_info *kqueue_registrations;
+    size_t kqueue_registration_count;
+};
+
+static continuum_status continuum_descriptor_graph_append(
+    void **storage,
+    size_t *count,
+    size_t element_size,
+    const void *element
+) {
+    if (storage == NULL || count == NULL || element == NULL
+        || element_size == 0 || *count == SIZE_MAX) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (*count > SIZE_MAX / element_size - 1) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    void *grown = realloc(*storage, (*count + 1) * element_size);
+    if (grown == NULL) return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    *storage = grown;
+    memcpy((uint8_t *)grown + *count * element_size, element, element_size);
+    *count += 1;
+    return CONTINUUM_STATUS_OK;
+}
+
+static ssize_t continuum_descriptor_socket_index(
+    const continuum_remote_descriptor_graph *graph,
+    uint64_t identity
+) {
+    if (graph == NULL || identity == 0) return -1;
+    for (size_t index = 0; index < graph->socket_count; index += 1) {
+        if (graph->sockets[index].resource_identity == identity) {
+            return (ssize_t)index;
+        }
+    }
+    return -1;
+}
+
+static ssize_t continuum_descriptor_pipe_index(
+    const continuum_remote_descriptor_graph *graph,
+    uint64_t identity
+) {
+    if (graph == NULL || identity == 0) return -1;
+    for (size_t index = 0; index < graph->pipe_count; index += 1) {
+        if (graph->pipes[index].resource_identity == identity) {
+            return (ssize_t)index;
+        }
+    }
+    return -1;
+}
+
+static uint64_t continuum_descriptor_kqueue_identity(
+    int32_t process_id,
+    int32_t file_descriptor
+) {
+    /* libproc intentionally hides the kqueue object pointer. This identity is
+       stable for the frozen cut, but it does not claim that duplicated kqueue
+       descriptors are independent resources. PROC_FP_SHARED is rejected below. */
+    uint64_t identity = UINT64_C(0x4b51000000000000)
+        ^ ((uint64_t)(uint32_t)process_id << 24)
+        ^ (uint64_t)(uint32_t)file_descriptor;
+    return identity == 0 ? 1 : identity;
+}
+
+static int continuum_descriptor_address_equal(
+    const uint8_t *first,
+    uint32_t first_length,
+    const uint8_t *second,
+    uint32_t second_length
+) {
+    return first_length == second_length
+        && first_length <= CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX
+        && memcmp(first, second, first_length) == 0;
+}
+
+static continuum_status continuum_copy_unix_address(
+    const struct sockaddr_un *address,
+    uint8_t destination[CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX],
+    uint32_t *out_length
+) {
+    if (address == NULL || destination == NULL || out_length == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    memset(destination, 0, CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX);
+    *out_length = 0;
+    if (address->sun_len == 0) return CONTINUUM_STATUS_OK;
+    if (address->sun_family != AF_UNIX
+        || address->sun_len > sizeof(*address)) {
+        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+    }
+    memcpy(destination, address, address->sun_len);
+    *out_length = address->sun_len;
+    return CONTINUUM_STATUS_OK;
+}
+
+static int continuum_unix_address_has_path(
+    const uint8_t bytes[CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX],
+    uint32_t length
+) {
+    if (length <= offsetof(struct sockaddr_un, sun_path)
+        || length > sizeof(struct sockaddr_un)) {
+        return 0;
+    }
+    const struct sockaddr_un *address =
+        (const struct sockaddr_un *)(const void *)bytes;
+    return address->sun_family == AF_UNIX && address->sun_path[0] != '\0';
+}
+
+static continuum_status continuum_descriptor_graph_add_handle(
+    continuum_remote_descriptor_graph *graph,
+    int32_t process_id,
+    int32_t file_descriptor,
+    int32_t status_flags,
+    continuum_remote_descriptor_resource_kind kind,
+    uint64_t identity
+) {
+    if (graph == NULL || identity == 0) {
+        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+    }
+    continuum_remote_descriptor_handle_info handle;
+    memset(&handle, 0, sizeof(handle));
+    handle.resource_identity = identity;
+    handle.process_id = process_id;
+    handle.file_descriptor = file_descriptor;
+    /* Remote libproc metadata does not expose an authenticated F_GETFD value. */
+    handle.descriptor_flags = -1;
+    handle.status_flags = status_flags;
+    handle.resource_kind = kind;
+    return continuum_descriptor_graph_append(
+        (void **)&graph->handles,
+        &graph->handle_count,
+        sizeof(handle),
+        &handle
+    );
+}
+
+static continuum_status continuum_descriptor_graph_add_socket(
+    continuum_remote_descriptor_graph *graph,
+    int32_t process_id,
+    int32_t file_descriptor,
+    const struct socket_fdinfo *info
+) {
+    if (graph == NULL || info == NULL) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    const struct socket_info *socket = &info->psi;
+    if (socket->soi_so == 0 || socket->soi_type != SOCK_STREAM) {
+        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+    }
+
+    continuum_remote_socket_resource_info resource;
+    memset(&resource, 0, sizeof(resource));
+    resource.resource_identity = socket->soi_so;
+    resource.domain = socket->soi_family;
+    resource.socket_type = socket->soi_type;
+    resource.protocol = socket->soi_protocol;
+    resource.socket_state = (uint32_t)(uint16_t)socket->soi_state;
+    resource.receive_shutdown =
+        (socket->soi_state & SOI_S_CANTRCVMORE) != 0;
+    resource.send_shutdown =
+        (socket->soi_state & SOI_S_CANTSENDMORE) != 0;
+    resource.receive_queue_bytes = socket->soi_rcv.sbi_cc;
+    resource.send_queue_bytes = socket->soi_snd.sbi_cc;
+    resource.backlog = socket->soi_qlimit;
+
+    continuum_status status = CONTINUUM_STATUS_OK;
+    if ((socket->soi_family == AF_INET || socket->soi_family == AF_INET6)
+        && socket->soi_kind == SOCKINFO_TCP
+        && socket->soi_protocol == IPPROTO_TCP) {
+        const struct tcp_sockinfo *tcp = &socket->soi_proto.pri_tcp;
+        if (tcp->tcpsi_state == TSI_S_LISTEN) {
+            if (socket->soi_qlen != 0 || socket->soi_incqlen != 0) {
+                return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            }
+            resource.kind = CONTINUUM_REMOTE_SOCKET_TCP_LISTENER;
+        } else if (tcp->tcpsi_state == TSI_S_ESTABLISHED) {
+            resource.kind = CONTINUUM_REMOTE_SOCKET_TCP_CONNECTED;
+        } else {
+            return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+        }
+        uint8_t address[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX];
+        uint32_t length = 0;
+        status = continuum_copy_tcp_endpoint_address(
+            &tcp->tcpsi_ini, 1, address, &length
+        );
+        if (status == CONTINUUM_STATUS_OK) {
+            memcpy(resource.local_address, address, length);
+            resource.local_address_length = length;
+        }
+        if (status == CONTINUUM_STATUS_OK
+            && resource.kind == CONTINUUM_REMOTE_SOCKET_TCP_CONNECTED) {
+            status = continuum_copy_tcp_endpoint_address(
+                &tcp->tcpsi_ini, 0, address, &length
+            );
+            if (status == CONTINUUM_STATUS_OK) {
+                memcpy(resource.remote_address, address, length);
+                resource.remote_address_length = length;
+            }
+        }
+    } else if (socket->soi_family == AF_UNIX
+               && socket->soi_kind == SOCKINFO_UN) {
+        const struct un_sockinfo *unix_info = &socket->soi_proto.pri_un;
+        if ((socket->soi_options & SO_ACCEPTCONN) != 0) {
+            if (socket->soi_qlen != 0 || socket->soi_incqlen != 0) {
+                return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            }
+            resource.kind = CONTINUUM_REMOTE_SOCKET_UNIX_LISTENER;
+        } else if ((socket->soi_state & SOI_S_ISCONNECTED) != 0) {
+            resource.kind = CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED;
+            resource.peer_identity = unix_info->unsi_conn_so;
+        } else {
+            return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+        }
+        status = continuum_copy_unix_address(
+            &unix_info->unsi_addr.ua_sun,
+            resource.local_address,
+            &resource.local_address_length
+        );
+        if (status == CONTINUUM_STATUS_OK
+            && resource.kind == CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED) {
+            status = continuum_copy_unix_address(
+                &unix_info->unsi_caddr.ua_sun,
+                resource.remote_address,
+                &resource.remote_address_length
+            );
+        }
+    } else {
+        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+    }
+    if (status != CONTINUUM_STATUS_OK) return status;
+
+    const ssize_t existing = continuum_descriptor_socket_index(
+        graph, resource.resource_identity
+    );
+    if (existing >= 0) {
+        if (memcmp(&graph->sockets[existing], &resource, sizeof(resource)) != 0) {
+            return CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+    } else {
+        status = continuum_descriptor_graph_append(
+            (void **)&graph->sockets,
+            &graph->socket_count,
+            sizeof(resource),
+            &resource
+        );
+        if (status != CONTINUUM_STATUS_OK) return status;
+    }
+    return continuum_descriptor_graph_add_handle(
+        graph,
+        process_id,
+        file_descriptor,
+        (int32_t)info->pfi.fi_openflags,
+        CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_SOCKET,
+        resource.resource_identity
+    );
+}
+
+static continuum_status continuum_descriptor_graph_add_pipe(
+    continuum_remote_descriptor_graph *graph,
+    int32_t process_id,
+    int32_t file_descriptor,
+    const struct pipe_fdinfo *info
+) {
+    if (graph == NULL || info == NULL
+        || info->pipeinfo.pipe_handle == 0
+        || info->pipeinfo.pipe_peerhandle == 0) {
+        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+    }
+    continuum_remote_pipe_resource_info resource;
+    memset(&resource, 0, sizeof(resource));
+    resource.resource_identity = info->pipeinfo.pipe_handle;
+    resource.peer_identity = info->pipeinfo.pipe_peerhandle;
+    resource.capacity = info->pipeinfo.pipe_stat.vst_blksize;
+    resource.queued_bytes = info->pipeinfo.pipe_stat.vst_size;
+    resource.status = (uint32_t)info->pipeinfo.pipe_status;
+
+    const ssize_t existing = continuum_descriptor_pipe_index(
+        graph, resource.resource_identity
+    );
+    continuum_status status = CONTINUUM_STATUS_OK;
+    if (existing >= 0) {
+        if (memcmp(&graph->pipes[existing], &resource, sizeof(resource)) != 0) {
+            return CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+    } else {
+        status = continuum_descriptor_graph_append(
+            (void **)&graph->pipes,
+            &graph->pipe_count,
+            sizeof(resource),
+            &resource
+        );
+        if (status != CONTINUUM_STATUS_OK) return status;
+    }
+    return continuum_descriptor_graph_add_handle(
+        graph,
+        process_id,
+        file_descriptor,
+        (int32_t)info->pfi.fi_openflags,
+        CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_PIPE,
+        resource.resource_identity
+    );
+}
+
+static continuum_status continuum_descriptor_graph_add_kqueue(
+    continuum_remote_descriptor_graph *graph,
+    int32_t process_id,
+    int32_t file_descriptor,
+    const struct kqueue_fdinfo *info
+) {
+    if (graph == NULL || info == NULL) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    if ((info->kqueueinfo.kq_state
+            & (CONTINUUM_PROC_KQUEUE_WORKQ | CONTINUUM_PROC_KQUEUE_WORKLOOP)) != 0
+        || (info->pfi.fi_status & PROC_FP_SHARED) != 0) {
+        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+    }
+
+    const uint64_t identity = continuum_descriptor_kqueue_identity(
+        process_id, file_descriptor
+    );
+    int measured_bytes = proc_pidfdinfo(
+        process_id,
+        file_descriptor,
+        CONTINUUM_PROC_PIDFDKQUEUE_EXTINFO,
+        NULL,
+        0
+    );
+    if (measured_bytes < 0) return CONTINUUM_STATUS_MACH_ERROR;
+    if (measured_bytes % (int)sizeof(continuum_kevent_extinfo_private) != 0) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    const size_t registration_count =
+        (size_t)measured_bytes / sizeof(continuum_kevent_extinfo_private);
+    if (registration_count > SIZE_MAX / sizeof(continuum_kevent_extinfo_private)) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    continuum_kevent_extinfo_private *registrations = NULL;
+    if (registration_count != 0) {
+        registrations = calloc(
+            (size_t)registration_count, sizeof(*registrations)
+        );
+        if (registrations == NULL) return CONTINUUM_STATUS_OUT_OF_MEMORY;
+        int returned_bytes = proc_pidfdinfo(
+            process_id,
+            file_descriptor,
+            CONTINUUM_PROC_PIDFDKQUEUE_EXTINFO,
+            registrations,
+            measured_bytes
+        );
+        if (returned_bytes != measured_bytes) {
+            free(registrations);
+            return returned_bytes < 0
+                ? CONTINUUM_STATUS_MACH_ERROR
+                : CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+    }
+
+    continuum_remote_kqueue_resource_info resource;
+    memset(&resource, 0, sizeof(resource));
+    resource.resource_identity = identity;
+    resource.process_id = process_id;
+    resource.state = info->kqueueinfo.kq_state;
+    resource.registration_start = graph->kqueue_registration_count;
+    resource.registration_count = registration_count;
+
+    continuum_status status = CONTINUUM_STATUS_OK;
+    for (size_t index = 0; index < registration_count; index += 1) {
+        const continuum_kevent_extinfo_private *raw = &registrations[index];
+        const int16_t filter = raw->event.filter;
+        if (filter != EVFILT_READ && filter != EVFILT_WRITE
+            && filter != EVFILT_USER) {
+            status = CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            break;
+        }
+        if (((uint32_t)raw->status & CONTINUUM_KNOTE_PENDING_MASK) != 0) {
+            status = CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            break;
+        }
+        if (filter == EVFILT_USER
+            && (((uint32_t)raw->status
+                    & (CONTINUUM_KNOTE_ACTIVE | CONTINUUM_KNOTE_QUEUED)) != 0
+                || (raw->event.fflags & NOTE_TRIGGER) != 0)) {
+            status = CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            break;
+        }
+        continuum_remote_kqueue_registration_info registration;
+        memset(&registration, 0, sizeof(registration));
+        registration.resource_identity = identity;
+        registration.ident = raw->event.ident;
+        registration.filter = filter;
+        registration.flags = raw->event.flags;
+        registration.fflags = raw->event.fflags;
+        registration.data = raw->event.data;
+        registration.udata = raw->event.udata;
+        registration.qos = raw->event.qos;
+        registration.saved_data = (int64_t)raw->saved_data;
+        registration.status = (uint32_t)raw->status;
+        status = continuum_descriptor_graph_append(
+            (void **)&graph->kqueue_registrations,
+            &graph->kqueue_registration_count,
+            sizeof(registration),
+            &registration
+        );
+        if (status != CONTINUUM_STATUS_OK) break;
+    }
+    free(registrations);
+    if (status != CONTINUUM_STATUS_OK) return status;
+
+    status = continuum_descriptor_graph_append(
+        (void **)&graph->kqueues,
+        &graph->kqueue_count,
+        sizeof(resource),
+        &resource
+    );
+    if (status != CONTINUUM_STATUS_OK) return status;
+    return continuum_descriptor_graph_add_handle(
+        graph,
+        process_id,
+        file_descriptor,
+        (int32_t)info->pfi.fi_openflags,
+        CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_KQUEUE,
+        identity
+    );
+}
+
+static continuum_status continuum_descriptor_graph_validate(
+    continuum_remote_descriptor_graph *graph
+) {
+    if (graph == NULL) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    for (size_t index = 0; index < graph->pipe_count; index += 1) {
+        const continuum_remote_pipe_resource_info *pipe = &graph->pipes[index];
+        if (pipe->queued_bytes != 0
+            || continuum_descriptor_pipe_index(graph, pipe->peer_identity) < 0) {
+            return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+        }
+    }
+    for (size_t index = 0; index < graph->socket_count; index += 1) {
+        continuum_remote_socket_resource_info *socket = &graph->sockets[index];
+        if (socket->receive_queue_bytes != 0 || socket->send_queue_bytes != 0) {
+            return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+        }
+        if (socket->kind == CONTINUUM_REMOTE_SOCKET_TCP_CONNECTED) {
+            ssize_t peer = -1;
+            for (size_t candidate = 0; candidate < graph->socket_count; candidate += 1) {
+                if (candidate == index) continue;
+                const continuum_remote_socket_resource_info *other =
+                    &graph->sockets[candidate];
+                if (other->kind == CONTINUUM_REMOTE_SOCKET_TCP_CONNECTED
+                    && other->domain == socket->domain
+                    && continuum_descriptor_address_equal(
+                        socket->local_address, socket->local_address_length,
+                        other->remote_address, other->remote_address_length
+                    )
+                    && continuum_descriptor_address_equal(
+                        socket->remote_address, socket->remote_address_length,
+                        other->local_address, other->local_address_length
+                    )) {
+                    if (peer >= 0) return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+                    peer = (ssize_t)candidate;
+                }
+            }
+            if (peer < 0) return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            socket->peer_identity = graph->sockets[peer].resource_identity;
+        } else if (socket->kind == CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED) {
+            if (continuum_descriptor_socket_index(graph, socket->peer_identity) < 0) {
+                const int externally_reconnectable =
+                    socket->local_address_length == 0
+                    && continuum_unix_address_has_path(
+                        socket->remote_address, socket->remote_address_length
+                    );
+                if (!externally_reconnectable) {
+                    return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+                }
+                socket->peer_identity = 0;
+            }
+        }
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_process_group_capture_descriptor_graph(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_descriptor_graph **out_graph
+) {
+    if (snapshot == NULL || out_graph == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_graph = NULL;
+    continuum_remote_descriptor_graph *graph = calloc(1, sizeof(*graph));
+    if (graph == NULL) return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    continuum_status status = CONTINUUM_STATUS_OK;
+
+    for (size_t member_index = 0;
+         member_index < snapshot->member_count && status == CONTINUUM_STATUS_OK;
+         member_index += 1) {
+        const continuum_remote_process_group_member *member =
+            &snapshot->members[member_index];
+        if (member->session == NULL) {
+            status = CONTINUUM_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+        status = continuum_validate_session_identity(member->session);
+        if (status != CONTINUUM_STATUS_OK) break;
+        const int32_t process_id = member->session->identity.process_id;
+
+        int required_bytes = proc_pidinfo(
+            process_id, PROC_PIDLISTFDS, 0, NULL, 0
+        );
+        if (required_bytes < 0) {
+            status = CONTINUUM_STATUS_MACH_ERROR;
+            break;
+        }
+        size_t capacity = (size_t)required_bytes
+            + 32U * sizeof(struct proc_fdinfo);
+        if (capacity < sizeof(struct proc_fdinfo) || capacity > INT_MAX) {
+            status = CONTINUUM_STATUS_RANGE_ERROR;
+            break;
+        }
+        struct proc_fdinfo *descriptors = calloc(1, capacity);
+        if (descriptors == NULL) {
+            status = CONTINUUM_STATUS_OUT_OF_MEMORY;
+            break;
+        }
+        int returned_bytes = proc_pidinfo(
+            process_id,
+            PROC_PIDLISTFDS,
+            0,
+            descriptors,
+            (int)capacity
+        );
+        if (returned_bytes < 0
+            || returned_bytes % (int)sizeof(struct proc_fdinfo) != 0) {
+            free(descriptors);
+            status = CONTINUUM_STATUS_MACH_ERROR;
+            break;
+        }
+        const size_t descriptor_count =
+            (size_t)returned_bytes / sizeof(struct proc_fdinfo);
+        qsort(
+            descriptors,
+            descriptor_count,
+            sizeof(*descriptors),
+            continuum_fd_info_compare
+        );
+        for (size_t descriptor_index = 0;
+             descriptor_index < descriptor_count;
+             descriptor_index += 1) {
+            const struct proc_fdinfo descriptor = descriptors[descriptor_index];
+            if (descriptor.proc_fdtype == PROX_FDTYPE_SOCKET) {
+                struct socket_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDSOCKETINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                status = continuum_descriptor_graph_add_socket(
+                    graph, process_id, descriptor.proc_fd, &info
+                );
+            } else if (descriptor.proc_fdtype == PROX_FDTYPE_PIPE) {
+                struct pipe_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDPIPEINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                status = continuum_descriptor_graph_add_pipe(
+                    graph, process_id, descriptor.proc_fd, &info
+                );
+            } else if (descriptor.proc_fdtype == PROX_FDTYPE_KQUEUE) {
+                struct kqueue_fdinfo info;
+                memset(&info, 0, sizeof(info));
+                int bytes = proc_pidfdinfo(
+                    process_id,
+                    descriptor.proc_fd,
+                    PROC_PIDFDKQUEUEINFO,
+                    &info,
+                    sizeof(info)
+                );
+                if (bytes != (int)sizeof(info)) {
+                    status = CONTINUUM_STATUS_MACH_ERROR;
+                    break;
+                }
+                status = continuum_descriptor_graph_add_kqueue(
+                    graph, process_id, descriptor.proc_fd, &info
+                );
+            }
+            if (status != CONTINUUM_STATUS_OK) break;
+        }
+        free(descriptors);
+    }
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_descriptor_graph_validate(graph);
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        continuum_remote_descriptor_graph_destroy(graph);
+        return status;
+    }
+    *out_graph = graph;
+    return CONTINUUM_STATUS_OK;
+}
+
+size_t continuum_remote_descriptor_graph_handle_count(
+    const continuum_remote_descriptor_graph *graph
+) {
+    return graph == NULL ? 0 : graph->handle_count;
+}
+
+size_t continuum_remote_descriptor_graph_socket_count(
+    const continuum_remote_descriptor_graph *graph
+) {
+    return graph == NULL ? 0 : graph->socket_count;
+}
+
+size_t continuum_remote_descriptor_graph_pipe_count(
+    const continuum_remote_descriptor_graph *graph
+) {
+    return graph == NULL ? 0 : graph->pipe_count;
+}
+
+size_t continuum_remote_descriptor_graph_kqueue_count(
+    const continuum_remote_descriptor_graph *graph
+) {
+    return graph == NULL ? 0 : graph->kqueue_count;
+}
+
+size_t continuum_remote_descriptor_graph_kqueue_registration_count(
+    const continuum_remote_descriptor_graph *graph
+) {
+    return graph == NULL ? 0 : graph->kqueue_registration_count;
+}
+
+continuum_status continuum_remote_descriptor_graph_copy_handles(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_descriptor_handle_info *entries,
+    size_t entry_capacity
+) {
+    if (graph == NULL || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (entry_capacity < graph->handle_count) return CONTINUUM_STATUS_RANGE_ERROR;
+    if (graph->handle_count != 0) {
+        memcpy(entries, graph->handles, graph->handle_count * sizeof(*entries));
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_descriptor_graph_copy_sockets(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_socket_resource_info *entries,
+    size_t entry_capacity
+) {
+    if (graph == NULL || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (entry_capacity < graph->socket_count) return CONTINUUM_STATUS_RANGE_ERROR;
+    if (graph->socket_count != 0) {
+        memcpy(entries, graph->sockets, graph->socket_count * sizeof(*entries));
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_descriptor_graph_copy_pipes(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_pipe_resource_info *entries,
+    size_t entry_capacity
+) {
+    if (graph == NULL || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (entry_capacity < graph->pipe_count) return CONTINUUM_STATUS_RANGE_ERROR;
+    if (graph->pipe_count != 0) {
+        memcpy(entries, graph->pipes, graph->pipe_count * sizeof(*entries));
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_descriptor_graph_copy_kqueues(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_kqueue_resource_info *entries,
+    size_t entry_capacity
+) {
+    if (graph == NULL || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (entry_capacity < graph->kqueue_count) return CONTINUUM_STATUS_RANGE_ERROR;
+    if (graph->kqueue_count != 0) {
+        memcpy(entries, graph->kqueues, graph->kqueue_count * sizeof(*entries));
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_descriptor_graph_copy_kqueue_registrations(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_kqueue_registration_info *entries,
+    size_t entry_capacity
+) {
+    if (graph == NULL || (entries == NULL && entry_capacity != 0)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    if (entry_capacity < graph->kqueue_registration_count) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    if (graph->kqueue_registration_count != 0) {
+        memcpy(
+            entries,
+            graph->kqueue_registrations,
+            graph->kqueue_registration_count * sizeof(*entries)
+        );
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+void continuum_remote_descriptor_graph_destroy(
+    continuum_remote_descriptor_graph *graph
+) {
+    if (graph == NULL) return;
+    free(graph->handles);
+    free(graph->sockets);
+    free(graph->pipes);
+    free(graph->kqueues);
+    free(graph->kqueue_registrations);
+    free(graph);
+}
+
+static int continuum_saved_tcp_address_is_valid(
+    const uint8_t bytes[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX],
+    uint32_t length,
+    int32_t domain
+) {
+    if (bytes == NULL) {
+        return 0;
+    }
+    if (domain == AF_INET) {
+        if (length != sizeof(struct sockaddr_in)) {
+            return 0;
+        }
+        const struct sockaddr_in *address =
+            (const struct sockaddr_in *)(const void *)bytes;
+        return address->sin_len == sizeof(*address)
+            && address->sin_family == AF_INET;
+    }
+    if (domain == AF_INET6) {
+        if (length != sizeof(struct sockaddr_in6)) {
+            return 0;
+        }
+        const struct sockaddr_in6 *address =
+            (const struct sockaddr_in6 *)(const void *)bytes;
+        return address->sin6_len == sizeof(*address)
+            && address->sin6_family == AF_INET6;
+    }
+    return 0;
+}
+
+static int continuum_saved_tcp_address_is_loopback(
+    const uint8_t bytes[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX],
+    int32_t domain
+) {
+    if (domain == AF_INET) {
+        const struct sockaddr_in *address =
+            (const struct sockaddr_in *)(const void *)bytes;
+        return IN_LOOPBACK(ntohl(address->sin_addr.s_addr));
+    }
+    if (domain == AF_INET6) {
+        const struct sockaddr_in6 *address =
+            (const struct sockaddr_in6 *)(const void *)bytes;
+        return IN6_IS_ADDR_LOOPBACK(&address->sin6_addr);
+    }
+    return 0;
+}
+
+static int continuum_tcp_address_matches(
+    const struct sockaddr_storage *observed,
+    socklen_t observed_length,
+    const uint8_t expected[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX],
+    uint32_t expected_length
+) {
+    return observed != NULL && expected != NULL
+        && observed_length == expected_length
+        && memcmp(observed, expected, expected_length) == 0;
+}
+
+static int continuum_process_is_absent(int32_t process_id) {
+    errno = 0;
+    if (kill(process_id, 0) == 0) {
+        return 0;
+    }
+    return errno == ESRCH;
+}
+
+static int continuum_apply_tcp_half_shutdowns(
+    int descriptor,
+    const continuum_remote_tcp_endpoint_info *endpoint
+) {
+    if (endpoint->receive_shutdown && endpoint->send_shutdown) {
+        return shutdown(descriptor, SHUT_RDWR);
+    }
+    if (endpoint->receive_shutdown
+        && shutdown(descriptor, SHUT_RD) != 0) {
+        return -1;
+    }
+    if (endpoint->send_shutdown
+        && shutdown(descriptor, SHUT_WR) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void continuum_make_tcp_address_ephemeral(
+    uint8_t address[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX],
+    int32_t domain
+) {
+    if (domain == AF_INET) {
+        ((struct sockaddr_in *)(void *)address)->sin_port = 0;
+    } else {
+        ((struct sockaddr_in6 *)(void *)address)->sin6_port = 0;
+    }
+}
+
+static int continuum_create_loopback_tcp_pair(
+    const continuum_remote_tcp_endpoint_info *first_endpoint,
+    const continuum_remote_tcp_endpoint_info *second_endpoint,
+    int preserve_saved_ports,
+    int32_t *out_first_descriptor,
+    int32_t *out_second_descriptor,
+    int *out_error
+) {
+    int listener = -1;
+    int client = -1;
+    int accepted = -1;
+    int success = 0;
+    int reuse_address = 1;
+    uint8_t listener_address[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX];
+    uint8_t client_address[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX];
+    memcpy(
+        listener_address,
+        first_endpoint->local_address,
+        sizeof(listener_address)
+    );
+    memcpy(
+        client_address,
+        second_endpoint->local_address,
+        sizeof(client_address)
+    );
+    if (!preserve_saved_ports) {
+        continuum_make_tcp_address_ephemeral(
+            listener_address,
+            first_endpoint->domain
+        );
+        continuum_make_tcp_address_ephemeral(
+            client_address,
+            second_endpoint->domain
+        );
+    }
+    *out_error = 0;
+
+    listener = socket(
+        first_endpoint->domain,
+        first_endpoint->socket_type,
+        first_endpoint->protocol
+    );
+    if (listener < 0) {
+        *out_error = errno;
+        goto cleanup;
+    }
+    client = socket(
+        second_endpoint->domain,
+        second_endpoint->socket_type,
+        second_endpoint->protocol
+    );
+    if (client < 0
+        || fcntl(listener, F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(client, F_SETFD, FD_CLOEXEC) != 0
+        || setsockopt(
+            listener,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse_address,
+            sizeof(reuse_address)
+        ) != 0
+        || setsockopt(
+            client,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse_address,
+            sizeof(reuse_address)
+        ) != 0
+        || setsockopt(
+            listener,
+            SOL_SOCKET,
+            SO_REUSEPORT,
+            &reuse_address,
+            sizeof(reuse_address)
+        ) != 0
+        || setsockopt(
+            client,
+            SOL_SOCKET,
+            SO_REUSEPORT,
+            &reuse_address,
+            sizeof(reuse_address)
+        ) != 0
+        || bind(
+            listener,
+            (const struct sockaddr *)(const void *)listener_address,
+            (socklen_t)first_endpoint->local_address_length
+        ) != 0
+        || listen(listener, 1) != 0) {
+        *out_error = errno;
+        goto cleanup;
+    }
+
+    struct sockaddr_storage listener_bound_address;
+    memset(&listener_bound_address, 0, sizeof(listener_bound_address));
+    socklen_t listener_bound_length = sizeof(listener_bound_address);
+    if (getsockname(
+            listener,
+            (struct sockaddr *)&listener_bound_address,
+            &listener_bound_length
+        ) != 0
+        || bind(
+            client,
+            (const struct sockaddr *)(const void *)client_address,
+            (socklen_t)second_endpoint->local_address_length
+        ) != 0
+        || connect(
+            client,
+            (const struct sockaddr *)&listener_bound_address,
+            listener_bound_length
+        ) != 0) {
+        *out_error = errno;
+        goto cleanup;
+    }
+    accepted = accept(listener, NULL, NULL);
+    if (accepted < 0 || fcntl(accepted, F_SETFD, FD_CLOEXEC) != 0) {
+        *out_error = errno;
+        goto cleanup;
+    }
+
+    struct sockaddr_storage first_local;
+    struct sockaddr_storage first_peer;
+    struct sockaddr_storage second_local;
+    struct sockaddr_storage second_peer;
+    memset(&first_local, 0, sizeof(first_local));
+    memset(&first_peer, 0, sizeof(first_peer));
+    memset(&second_local, 0, sizeof(second_local));
+    memset(&second_peer, 0, sizeof(second_peer));
+    socklen_t first_local_length = sizeof(first_local);
+    socklen_t first_peer_length = sizeof(first_peer);
+    socklen_t second_local_length = sizeof(second_local);
+    socklen_t second_peer_length = sizeof(second_peer);
+    if (getsockname(
+            accepted,
+            (struct sockaddr *)&first_local,
+            &first_local_length
+        ) != 0
+        || getpeername(
+            accepted,
+            (struct sockaddr *)&first_peer,
+            &first_peer_length
+        ) != 0
+        || getsockname(
+            client,
+            (struct sockaddr *)&second_local,
+            &second_local_length
+        ) != 0
+        || getpeername(
+            client,
+            (struct sockaddr *)&second_peer,
+            &second_peer_length
+        ) != 0) {
+        *out_error = errno;
+        goto cleanup;
+    }
+
+    if (preserve_saved_ports) {
+        if (!continuum_tcp_address_matches(
+                &first_local,
+                first_local_length,
+                first_endpoint->local_address,
+                first_endpoint->local_address_length
+            )
+            || !continuum_tcp_address_matches(
+                &first_peer,
+                first_peer_length,
+                first_endpoint->remote_address,
+                first_endpoint->remote_address_length
+            )
+            || !continuum_tcp_address_matches(
+                &second_local,
+                second_local_length,
+                second_endpoint->local_address,
+                second_endpoint->local_address_length
+            )
+            || !continuum_tcp_address_matches(
+                &second_peer,
+                second_peer_length,
+                second_endpoint->remote_address,
+                second_endpoint->remote_address_length
+            )) {
+            *out_error = EINVAL;
+            goto cleanup;
+        }
+    } else if (first_local_length != second_peer_length
+        || first_peer_length != second_local_length
+        || memcmp(&first_local, &second_peer, first_local_length) != 0
+        || memcmp(&first_peer, &second_local, first_peer_length) != 0) {
+        *out_error = EINVAL;
+        goto cleanup;
+    }
+
+    if (continuum_apply_tcp_half_shutdowns(accepted, first_endpoint) != 0
+        || continuum_apply_tcp_half_shutdowns(client, second_endpoint) != 0) {
+        *out_error = errno;
+        goto cleanup;
+    }
+
+    *out_first_descriptor = accepted;
+    *out_second_descriptor = client;
+    accepted = -1;
+    client = -1;
+    success = 1;
+
+cleanup:
+    if (accepted >= 0) {
+        close(accepted);
+    }
+    if (client >= 0) {
+        close(client);
+    }
+    if (listener >= 0) {
+        close(listener);
+    }
+    return success;
+}
+
+continuum_status continuum_recreate_closed_loopback_tcp_pair(
+    const continuum_remote_tcp_endpoint_info *first_endpoint,
+    const continuum_remote_tcp_endpoint_info *second_endpoint,
+    int32_t *out_first_descriptor,
+    int32_t *out_second_descriptor
+) {
+    if (first_endpoint == NULL || second_endpoint == NULL
+        || first_endpoint == second_endpoint
+        || out_first_descriptor == NULL || out_second_descriptor == NULL
+        || out_first_descriptor == out_second_descriptor) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_first_descriptor = -1;
+    *out_second_descriptor = -1;
+
+    if (first_endpoint->process_id <= 0
+        || second_endpoint->process_id <= 0
+        || first_endpoint->file_descriptor < 0
+        || second_endpoint->file_descriptor < 0
+        || (first_endpoint->process_id == second_endpoint->process_id
+            && first_endpoint->file_descriptor
+                == second_endpoint->file_descriptor)
+        || !continuum_saved_tcp_address_is_valid(
+            first_endpoint->local_address,
+            first_endpoint->local_address_length,
+            first_endpoint->domain
+        )
+        || !continuum_saved_tcp_address_is_valid(
+            first_endpoint->remote_address,
+            first_endpoint->remote_address_length,
+            first_endpoint->domain
+        )
+        || !continuum_saved_tcp_address_is_valid(
+            second_endpoint->local_address,
+            second_endpoint->local_address_length,
+            second_endpoint->domain
+        )
+        || !continuum_saved_tcp_address_is_valid(
+            second_endpoint->remote_address,
+            second_endpoint->remote_address_length,
+            second_endpoint->domain
+        )) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (first_endpoint->domain != second_endpoint->domain
+        || first_endpoint->socket_type != SOCK_STREAM
+        || second_endpoint->socket_type != SOCK_STREAM
+        || first_endpoint->socket_type != second_endpoint->socket_type
+        || first_endpoint->protocol != IPPROTO_TCP
+        || second_endpoint->protocol != IPPROTO_TCP
+        || first_endpoint->protocol != second_endpoint->protocol
+        || first_endpoint->tcp_state != TSI_S_ESTABLISHED
+        || second_endpoint->tcp_state != TSI_S_ESTABLISHED
+        || first_endpoint->receive_queue_bytes != 0
+        || first_endpoint->send_queue_bytes != 0
+        || second_endpoint->receive_queue_bytes != 0
+        || second_endpoint->send_queue_bytes != 0
+        || first_endpoint->local_address_length
+            != second_endpoint->remote_address_length
+        || first_endpoint->remote_address_length
+            != second_endpoint->local_address_length
+        || memcmp(
+            first_endpoint->local_address,
+            second_endpoint->remote_address,
+            first_endpoint->local_address_length
+        ) != 0
+        || memcmp(
+            first_endpoint->remote_address,
+            second_endpoint->local_address,
+            first_endpoint->remote_address_length
+        ) != 0
+        || !continuum_saved_tcp_address_is_loopback(
+            first_endpoint->local_address,
+            first_endpoint->domain
+        )
+        || !continuum_saved_tcp_address_is_loopback(
+            second_endpoint->local_address,
+            second_endpoint->domain
+        )
+        || !continuum_process_is_absent(first_endpoint->process_id)
+        || (second_endpoint->process_id != first_endpoint->process_id
+            && !continuum_process_is_absent(second_endpoint->process_id))) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    int exact_error = 0;
+    if (continuum_create_loopback_tcp_pair(
+            first_endpoint,
+            second_endpoint,
+            1,
+            out_first_descriptor,
+            out_second_descriptor,
+            &exact_error
+        )) {
+        return CONTINUUM_STATUS_OK;
+    }
+    if (exact_error != EADDRINUSE) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    // TIME_WAIT can make an otherwise closed exact four-tuple unavailable.
+    // Keep the stream and reverse-peer relationship on fresh loopback ports.
+    // A later descriptor virtualizer must report the saved sockaddr identity
+    // to app code that calls getsockname or getpeername.
+    int fallback_error = 0;
+    return continuum_create_loopback_tcp_pair(
+        first_endpoint,
+        second_endpoint,
+        0,
+        out_first_descriptor,
+        out_second_descriptor,
+        &fallback_error
+    ) ? CONTINUUM_STATUS_OK : CONTINUUM_STATUS_VALIDATION_FAILED;
+}
+
+continuum_status continuum_recreate_closed_pty_pair(
+    const continuum_remote_pty_descriptor_info *master_descriptor,
+    const continuum_remote_pty_descriptor_info *slave_descriptor,
+    int32_t *out_master_descriptor,
+    int32_t *out_slave_descriptor
+) {
+    if (master_descriptor == NULL || slave_descriptor == NULL
+        || master_descriptor == slave_descriptor
+        || out_master_descriptor == NULL || out_slave_descriptor == NULL
+        || out_master_descriptor == out_slave_descriptor) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_master_descriptor = -1;
+    *out_slave_descriptor = -1;
+
+    if (master_descriptor->process_id <= 0
+        || slave_descriptor->process_id <= 0
+        || master_descriptor->file_descriptor < 0
+        || slave_descriptor->file_descriptor < 0
+        || master_descriptor->role != CONTINUUM_REMOTE_PTY_ROLE_MASTER
+        || slave_descriptor->role != CONTINUUM_REMOTE_PTY_ROLE_SLAVE
+        || master_descriptor->tty_index != master_descriptor->device_minor
+        || slave_descriptor->tty_index != slave_descriptor->device_minor
+        || master_descriptor->tty_index != slave_descriptor->tty_index
+        || master_descriptor->alias_identity
+            != continuum_pty_alias_identity(
+                master_descriptor->tty_index,
+                CONTINUUM_REMOTE_PTY_ROLE_MASTER
+            )
+        || slave_descriptor->alias_identity
+            != continuum_pty_alias_identity(
+                slave_descriptor->tty_index,
+                CONTINUUM_REMOTE_PTY_ROLE_SLAVE
+            )) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (!continuum_process_is_absent(master_descriptor->process_id)
+        || (slave_descriptor->process_id != master_descriptor->process_id
+            && !continuum_process_is_absent(slave_descriptor->process_id))
+        || (master_descriptor->input_queue_known
+            && master_descriptor->input_queue_bytes != 0)
+        || (master_descriptor->output_queue_known
+            && master_descriptor->output_queue_bytes != 0)
+        || (slave_descriptor->input_queue_known
+            && slave_descriptor->input_queue_bytes != 0)
+        || (slave_descriptor->output_queue_known
+            && slave_descriptor->output_queue_bytes != 0)
+        || (!master_descriptor->terminal_attributes_known
+            && !slave_descriptor->terminal_attributes_known)
+        || (!master_descriptor->window_size_known
+            && !slave_descriptor->window_size_known)
+        || (master_descriptor->terminal_attributes_known
+            && slave_descriptor->terminal_attributes_known
+            && memcmp(
+                &master_descriptor->terminal_attributes,
+                &slave_descriptor->terminal_attributes,
+                sizeof(struct termios)
+            ) != 0)
+        || (master_descriptor->window_size_known
+            && slave_descriptor->window_size_known
+            && memcmp(
+                &master_descriptor->window_size,
+                &slave_descriptor->window_size,
+                sizeof(struct winsize)
+            ) != 0)) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    const struct termios *attributes =
+        master_descriptor->terminal_attributes_known
+            ? &master_descriptor->terminal_attributes
+            : &slave_descriptor->terminal_attributes;
+    const struct winsize *window_size = master_descriptor->window_size_known
+        ? &master_descriptor->window_size
+        : &slave_descriptor->window_size;
+    int master = -1;
+    int slave = -1;
+    if (openpty(
+            &master,
+            &slave,
+            NULL,
+            (struct termios *)(uintptr_t)attributes,
+            (struct winsize *)(uintptr_t)window_size
+        ) != 0
+        || fcntl(master, F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(slave, F_SETFD, FD_CLOEXEC) != 0) {
+        if (master >= 0) {
+            close(master);
+        }
+        if (slave >= 0) {
+            close(slave);
+        }
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+    *out_master_descriptor = master;
+    *out_slave_descriptor = slave;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_recreate_closed_pty_from_slave(
+    const continuum_remote_pty_descriptor_info *slave_descriptor,
+    int32_t *out_master_descriptor,
+    int32_t *out_slave_descriptor
+) {
+    if (slave_descriptor == NULL || out_master_descriptor == NULL
+        || out_slave_descriptor == NULL
+        || slave_descriptor->role != CONTINUUM_REMOTE_PTY_ROLE_SLAVE) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    continuum_remote_pty_descriptor_info master = *slave_descriptor;
+    master.file_descriptor = slave_descriptor->file_descriptor == INT32_MAX
+        ? INT32_MAX - 1
+        : slave_descriptor->file_descriptor + 1;
+    master.role = CONTINUUM_REMOTE_PTY_ROLE_MASTER;
+    master.alias_identity = continuum_pty_alias_identity(
+        master.tty_index,
+        CONTINUUM_REMOTE_PTY_ROLE_MASTER
+    );
+    return continuum_recreate_closed_pty_pair(
+        &master,
+        slave_descriptor,
+        out_master_descriptor,
+        out_slave_descriptor
+    );
+}
+
 size_t continuum_remote_process_group_member_region_count(
     const continuum_remote_process_group_snapshot *snapshot,
     size_t member_index
@@ -10208,8 +13626,9 @@ static continuum_status continuum_remote_process_group_restore_internal(
     continuum_remote_process_tree_entry *tree = NULL;
     size_t tree_count = 0;
     if (status == CONTINUUM_STATUS_OK) {
-        status = continuum_discover_process_tree(
-            snapshot->root_process_id,
+        status = continuum_discover_process_forest(
+            snapshot->root_process_ids,
+            snapshot->root_process_count,
             &tree,
             &tree_count
         );
@@ -10364,8 +13783,9 @@ continuum_status continuum_remote_process_group_with_suspended_resources(
     continuum_remote_process_tree_entry *tree = NULL;
     size_t tree_count = 0;
     if (status == CONTINUUM_STATUS_OK) {
-        status = continuum_discover_process_tree(
-            snapshot->root_process_id,
+        status = continuum_discover_process_forest(
+            snapshot->root_process_ids,
+            snapshot->root_process_count,
             &tree,
             &tree_count
         );

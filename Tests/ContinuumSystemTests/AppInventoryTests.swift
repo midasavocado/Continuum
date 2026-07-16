@@ -5,6 +5,220 @@ import ContinuumCore
 
 @Suite("macOS app inventory")
 struct AppInventoryTests {
+    @Test("Resolves one selected terminal session without capturing the emulator")
+    func resolvesTerminalWorkload() {
+        let root = MacAppInventoryService.terminalWorkloadRoot(
+            descendants: [110, 111, 112, 210],
+            sessions: [110: 110, 111: 110, 112: 110, 210: 210],
+            terminalDevices: [110: 7, 111: 7, 112: 7, 210: 8],
+            selectedTerminalDevice: 7
+        )
+
+        #expect(root == 110)
+    }
+
+    @Test("Prefers the selected terminal's foreground job over its shell")
+    func resolvesForegroundTerminalJob() {
+        let root = MacAppInventoryService.terminalWorkloadRoot(
+            descendants: [110, 211, 212],
+            sessions: [110: 110, 211: 110, 212: 110],
+            terminalDevices: [110: 7, 211: 7, 212: 7],
+            processGroups: [110: 110, 211: 211, 212: 211],
+            foregroundProcessGroups: [110: 211, 211: 211, 212: 211],
+            selectedTerminalDevice: 7
+        )
+
+        #expect(root == 211)
+    }
+
+    @Test("Pairs only established loopback TCP peers")
+    func parsesLoopbackPeers() {
+        let output = """
+        p410
+        f7
+        n127.0.0.1:55123->127.0.0.1:11434
+        p420
+        f9
+        n127.0.0.1:11434->127.0.0.1:55123
+        p430
+        f3
+        n192.168.1.10:50000->1.1.1.1:443
+        """
+
+        let connections = MacAppInventoryService.parseLoopbackConnections(output)
+
+        #expect(connections.count == 2)
+        #expect(Set(connections.map(\.processIdentifier)) == [410, 420])
+    }
+
+    @Test("Adds a same-user peer's complete launch tree as a capture root")
+    func expandsPeerProcessTree() {
+        let roots = MacAppInventoryService.dependencyRoots(
+            rootProcessIdentifier: 100,
+            selectedUserIdentifier: 501,
+            parents: [
+                100: 1,
+                101: 100,
+                190: 1,
+                200: 190,
+                201: 200
+            ],
+            userIdentifiers: [
+                100: 501,
+                101: 501,
+                190: 501,
+                200: 501,
+                201: 501
+            ],
+            sessions: [
+                100: 100,
+                101: 100,
+                190: 190,
+                200: 190,
+                201: 190
+            ],
+            connections: [
+                LoopbackConnection(
+                    processIdentifier: 101,
+                    localEndpoint: "127.0.0.1:55123",
+                    remoteEndpoint: "127.0.0.1:11434"
+                ),
+                LoopbackConnection(
+                    processIdentifier: 200,
+                    localEndpoint: "127.0.0.1:11434",
+                    remoteEndpoint: "127.0.0.1:55123"
+                )
+            ]
+        )
+
+        #expect(roots == [100, 190])
+    }
+
+    @Test("Does not absorb a terminal emulator across a session boundary")
+    func stopsPeerRootAtSessionLeader() {
+        let roots = MacAppInventoryService.dependencyRoots(
+            rootProcessIdentifier: 100,
+            selectedUserIdentifier: 501,
+            parents: [100: 90, 200: 190, 190: 80, 80: 1],
+            userIdentifiers: [80: 501, 90: 501, 100: 501, 190: 501, 200: 501],
+            sessions: [80: 80, 90: 90, 100: 90, 190: 190, 200: 190],
+            connections: [
+                LoopbackConnection(
+                    processIdentifier: 100,
+                    localEndpoint: "127.0.0.1:55123",
+                    remoteEndpoint: "127.0.0.1:11434"
+                ),
+                LoopbackConnection(
+                    processIdentifier: 200,
+                    localEndpoint: "127.0.0.1:11434",
+                    remoteEndpoint: "127.0.0.1:55123"
+                )
+            ]
+        )
+
+        #expect(roots == [100, 190])
+    }
+
+    @Test("Expands transitively across same-user Unix sockets and pipes")
+    func expandsKernelPeerForest() {
+        let roots = MacAppInventoryService.dependencyRoots(
+            rootProcessIdentifier: 100,
+            selectedUserIdentifier: 501,
+            parents: [100: 1, 200: 190, 190: 1, 300: 290, 290: 1],
+            userIdentifiers: [100: 501, 190: 501, 200: 501, 290: 501, 300: 501],
+            sessions: [100: 100, 190: 190, 200: 190, 290: 290, 300: 290],
+            connections: [],
+            kernelPeers: [
+                KernelPeerEndpoint(
+                    processIdentifier: 100,
+                    kind: .unixSocket,
+                    localHandle: 11,
+                    peerHandle: 22
+                ),
+                KernelPeerEndpoint(
+                    processIdentifier: 200,
+                    kind: .unixSocket,
+                    localHandle: 22,
+                    peerHandle: 11
+                ),
+                KernelPeerEndpoint(
+                    processIdentifier: 200,
+                    kind: .pipe,
+                    localHandle: 33,
+                    peerHandle: 44
+                ),
+                KernelPeerEndpoint(
+                    processIdentifier: 300,
+                    kind: .pipe,
+                    localHandle: 44,
+                    peerHandle: 33
+                )
+            ]
+        )
+
+        #expect(roots == [100, 190, 290])
+    }
+
+    @Test("Does not absorb a different-user kernel peer")
+    func rejectsDifferentUserKernelPeer() {
+        let roots = MacAppInventoryService.dependencyRoots(
+            rootProcessIdentifier: 100,
+            selectedUserIdentifier: 501,
+            parents: [100: 1, 900: 1],
+            userIdentifiers: [100: 501, 900: 0],
+            connections: [],
+            kernelPeers: [
+                KernelPeerEndpoint(
+                    processIdentifier: 100,
+                    kind: .unixSocket,
+                    localHandle: 11,
+                    peerHandle: 22
+                ),
+                KernelPeerEndpoint(
+                    processIdentifier: 900,
+                    kind: .unixSocket,
+                    localHandle: 22,
+                    peerHandle: 11
+                )
+            ]
+        )
+
+        #expect(roots == [100])
+    }
+
+    @Test("Fails closed when a kernel peer identity is ambiguous")
+    func rejectsAmbiguousKernelPeer() {
+        let roots = MacAppInventoryService.dependencyRoots(
+            rootProcessIdentifier: 100,
+            selectedUserIdentifier: 501,
+            parents: [100: 1, 200: 1, 300: 1],
+            userIdentifiers: [100: 501, 200: 501, 300: 501],
+            connections: [],
+            kernelPeers: [
+                KernelPeerEndpoint(
+                    processIdentifier: 100,
+                    kind: .pipe,
+                    localHandle: 11,
+                    peerHandle: 22
+                ),
+                KernelPeerEndpoint(
+                    processIdentifier: 200,
+                    kind: .pipe,
+                    localHandle: 22,
+                    peerHandle: 11
+                ),
+                KernelPeerEndpoint(
+                    processIdentifier: 300,
+                    kind: .pipe,
+                    localHandle: 22,
+                    peerHandle: 11
+                )
+            ]
+        )
+
+        #expect(roots == [100])
+    }
+
     @Test("Parses a fixture app without reading its documents")
     func parsesFixtureMetadata() throws {
         let fixture = try FixtureApp(

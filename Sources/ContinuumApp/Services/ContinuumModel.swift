@@ -191,8 +191,9 @@ final class ContinuumModel {
                 processes.append(frontmost)
             }
 
+            let captureRoot = try await self.captureRoot(for: frontmost)
             let processIdentifiers = await self.processIdentifiers(
-                rootedAt: frontmost,
+                rootedAt: captureRoot,
                 among: processes
             )
             // The first snapshot bootstraps the Main branch in repositories
@@ -212,6 +213,12 @@ final class ContinuumModel {
             self.runningProcesses = processes.sorted(by: Self.processSort)
             self.selectedSnapshotID = savedSnapshot.id
             self.selectedSection = .snapshots
+        }
+    }
+
+    func openRewindableTerminal() async {
+        await performAction {
+            try AppleTerminalPresentationProvider.openRewindableSession()
         }
     }
 
@@ -245,29 +252,42 @@ final class ContinuumModel {
             self.rewindPhase = .restoring(snapshotID)
             if snapshot.isColdRestoreCertified {
                 let preparation = try await self.coldProcessRestorer
-                    .prepareRootProcess(
+                    .prepareProcessForest(
                         from: snapshotID,
                         repository: self.repository
                     )
-                let commit: ColdProcessCommit
+                let commit: ColdProcessForestCommit
                 do {
                     try await self.closeRunningInstances(
                         of: snapshot.app,
-                        excluding: preparation.replacementProcessIdentifier
+                        excluding: preparation.rootReplacementProcessIdentifier
                     )
-                    commit = try await self.coldProcessRestorer.commit(
+                    for presentation in preparation.terminalPresentations {
+                        try AppleTerminalPresentationProvider.openRelay(
+                            socketPath: presentation.socketPath
+                        )
+                        try await self.coldProcessRestorer
+                            .waitUntilTerminalPresentationReady(
+                                presentation.sessionIdentifier
+                            )
+                    }
+                    commit = try await self.coldProcessRestorer.commitProcessForest(
                         preparation.id
                     )
                 } catch {
-                    try? await self.coldProcessRestorer.discard(
+                    try? await self.coldProcessRestorer.discardProcessForest(
                         preparation.id
                     )
                     throw error
                 }
-                try await self.activateRestoredApplication(
-                    processIdentifier: commit.processIdentifier,
-                    appName: snapshot.app.displayName
-                )
+                if preparation.terminalPresentations.isEmpty {
+                    try await self.activateRestoredApplication(
+                        processIdentifier: commit.rootProcessIdentifier,
+                        appName: snapshot.app.displayName
+                    )
+                } else {
+                    try await self.activateTerminalPresentation()
+                }
                 self.onlineWarning = snapshot.externalEffects.isEmpty
                     ? nil
                     : snapshot.externalEffects
@@ -387,6 +407,21 @@ final class ContinuumModel {
         }
         throw ContinuumError.restoreUnavailable(
             "Continuum rebuilt \(appName), but the restored app exited before its window became ready."
+        )
+    }
+
+    private func activateTerminalPresentation() async throws {
+        for _ in 0..<100 {
+            if let terminal = NSRunningApplication.runningApplications(
+                withBundleIdentifier: AppleTerminalPresentationProvider.bundleIdentifier
+            ).first(where: { !$0.isTerminated }) {
+                _ = terminal.activate(options: [.activateAllWindows])
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw ContinuumError.restoreUnavailable(
+            "Continuum restored the terminal workload, but Terminal did not open its relay window."
         )
     }
 
@@ -1166,6 +1201,15 @@ final class ContinuumModel {
         rootedAt root: ProcessDescriptor,
         among processes: [ProcessDescriptor]
     ) async -> [Int32] {
+        if let dependencyProvider = inventory as? any ProcessDependencyProviding {
+            let roots = await dependencyProvider.captureRootProcessIdentifiers(
+                rootedAt: root.processIdentifier
+            )
+            if !roots.isEmpty {
+                return [root.processIdentifier]
+                    + roots.filter { $0 != root.processIdentifier }.sorted()
+            }
+        }
         if let processTreeProvider = inventory as? any ProcessTreeProviding {
             let identifiers = await processTreeProvider.processIdentifiers(
                 inTreeRootedAt: root.processIdentifier
@@ -1179,6 +1223,38 @@ final class ContinuumModel {
         let identifiers = ProcessGroupResolver.identifiers(rootedAt: root, among: processes)
         return [root.processIdentifier]
             + identifiers.filter { $0 != root.processIdentifier }.sorted()
+    }
+
+    private func captureRoot(
+        for frontmost: ProcessDescriptor
+    ) async throws -> ProcessDescriptor {
+        guard frontmost.app.bundleIdentifier
+                == AppleTerminalPresentationProvider.bundleIdentifier else {
+            return frontmost
+        }
+        guard let terminalWorkloadProvider = inventory
+                as? any TerminalWorkloadProviding else {
+            throw ContinuumError.runtimeUnsupported(
+                "This build cannot resolve the workload behind Terminal."
+            )
+        }
+        let ttyPath = try AppleTerminalPresentationProvider.selectedTTYPath()
+        guard let processIdentifier = await terminalWorkloadProvider
+                .terminalWorkloadRootProcessIdentifier(
+                    descendedFrom: frontmost.processIdentifier,
+                    ttyPath: ttyPath
+                ) else {
+            throw ContinuumError.runtimeUnsupported(
+                "Continuum could not uniquely match Terminal's selected tab to its shell session."
+            )
+        }
+        return ProcessDescriptor(
+            processIdentifier: processIdentifier,
+            parentProcessIdentifier: frontmost.processIdentifier,
+            app: frontmost.app,
+            isFrontmost: true,
+            isTerminated: false
+        )
     }
 
     private func activeBranchID() throws -> BranchID {

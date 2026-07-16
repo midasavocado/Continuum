@@ -60,37 +60,49 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         }
 
         let snapshotID = UUID()
-        var safepointRequested = false
+        var safepointProcessIdentifiers: [Int32] = []
         if usesInjectedSafepoints {
             guard let bootstrapLibraryPath else {
                 throw ContinuumError.runtimeUnsupported(
                     "Continuum's checkpoint bootstrap is missing."
                 )
             }
-            var hasBootstrap: UInt8 = 0
-            let preflight = bootstrapLibraryPath.withCString {
-                continuum_remote_process_has_bootstrap(
-                    rootProcessIdentifier,
-                    $0,
-                    &hasBootstrap
-                )
-            }
-            guard preflight == CONTINUUM_STATUS_OK, hasBootstrap != 0 else {
+            let captureMembers = Self.captureMembers(
+                rootedAt: Set(processIdentifiers)
+            )
+            guard !captureMembers.isEmpty else {
                 throw ContinuumError.runtimeUnsupported(
-                    "Continuum did not change or restart this app, so no false snapshot was created. This process was not armed before launch."
+                    "Continuum could not discover the app's process group."
                 )
             }
-            guard kill(rootProcessIdentifier, SIGUSR2) == 0 else {
-                throw ContinuumError.runtimeUnsupported(
-                    "Continuum could not request the app's capture safepoint."
-                )
+            for processIdentifier in captureMembers {
+                var hasBootstrap: UInt8 = 0
+                let preflight = bootstrapLibraryPath.withCString {
+                    continuum_remote_process_has_bootstrap(
+                        processIdentifier,
+                        $0,
+                        &hasBootstrap
+                    )
+                }
+                guard preflight == CONTINUUM_STATUS_OK, hasBootstrap != 0 else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "Continuum did not change or restart process \(processIdentifier), so no false snapshot was created. Every helper must be armed before launch."
+                    )
+                }
             }
-            safepointRequested = true
+            for processIdentifier in captureMembers {
+                guard kill(processIdentifier, SIGUSR2) == 0 else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "Continuum could not request process \(processIdentifier)'s capture safepoint."
+                    )
+                }
+                safepointProcessIdentifiers.append(processIdentifier)
+            }
             usleep(250_000)
         }
         defer {
-            if safepointRequested {
-                _ = kill(rootProcessIdentifier, SIGUSR1)
+            for processIdentifier in safepointProcessIdentifiers {
+                _ = kill(processIdentifier, SIGUSR1)
             }
         }
         var rawSnapshot: OpaquePointer?
@@ -100,8 +112,17 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             captureSnapshotID: snapshotID
         )
         let resourceContext = Unmanaged.passUnretained(resourceBox).toOpaque()
-        let status = continuum_remote_process_group_capture_with_resources(
-            rootProcessIdentifier,
+        let roots = UnsafeMutablePointer<Int32>.allocate(
+            capacity: processIdentifiers.count
+        )
+        roots.initialize(from: processIdentifiers, count: processIdentifiers.count)
+        defer {
+            roots.deinitialize(count: processIdentifiers.count)
+            roots.deallocate()
+        }
+        let status = continuum_remote_process_group_capture_roots_with_resources(
+            roots,
+            processIdentifiers.count,
             maximumCapturedBytes,
             continuumCaptureHotResourceInventory,
             resourceContext,
@@ -114,18 +135,37 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             }
             throw captureError(status: status, appName: app.displayName)
         }
+        var ptySafepointStatus: continuum_remote_pty_safepoint_status?
         if usesInjectedSafepoints {
-            guard capturedSafepointCount(
-                in: rawSnapshot,
-                rootProcessIdentifier: rootProcessIdentifier
-            ) == 1 else {
+            guard let bootstrapLibraryPath else {
                 continuum_remote_process_group_snapshot_destroy(rawSnapshot)
                 throw ContinuumError.runtimeUnsupported(
-                    "The app did not reach Continuum's main-thread capture safepoint."
+                    "Continuum's checkpoint bootstrap is missing."
                 )
             }
-            _ = kill(rootProcessIdentifier, SIGUSR1)
-            safepointRequested = false
+            var report = continuum_remote_pty_safepoint_status()
+            let reportStatus = bootstrapLibraryPath.withCString {
+                continuum_remote_process_group_copy_pty_safepoint_status(
+                    rawSnapshot,
+                    $0,
+                    &report
+                )
+            }
+            guard reportStatus == CONTINUUM_STATUS_OK,
+                  report.process_count
+                    == continuum_remote_process_group_member_count(rawSnapshot),
+                  report.queue_state_known != 0,
+                  report.all_queues_zero != 0 else {
+                continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+                throw ContinuumError.runtimeUnsupported(
+                    "The app and its helpers did not reach one coherent checkpoint boundary with empty terminal queues. Try the snapshot again."
+                )
+            }
+            ptySafepointStatus = report
+            for processIdentifier in safepointProcessIdentifiers {
+                _ = kill(processIdentifier, SIGUSR1)
+            }
+            safepointProcessIdentifiers.removeAll(keepingCapacity: true)
         }
 
         guard let writableVnodes = resourceBox.inventory else {
@@ -134,9 +174,58 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 "The coherent resource callback returned without a writable-file inventory."
             )
         }
+        guard let rawTCPEndpoints = resourceBox.tcpEndpoints else {
+            continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+            throw ContinuumError.runtimeUnsupported(
+                "The coherent resource callback returned without a TCP endpoint inventory."
+            )
+        }
+        guard let rawPTYDescriptors = resourceBox.ptyDescriptors else {
+            continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+            throw ContinuumError.runtimeUnsupported(
+                "The coherent resource callback returned without a PTY descriptor inventory."
+            )
+        }
+        guard let rawDescriptorGraph = resourceBox.descriptorGraph else {
+            continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+            throw ContinuumError.runtimeUnsupported(
+                "The coherent resource callback returned without a descriptor graph."
+            )
+        }
+        let establishedTCPEndpoints: [DurableTCPEndpoint]
+        let ptyDescriptors: [DurablePTYDescriptor]
+        let descriptorGraph: DurableDescriptorGraph
+        do {
+            establishedTCPEndpoints = try durableTCPEndpoints(
+                from: rawTCPEndpoints
+            )
+            ptyDescriptors = try durablePTYDescriptors(
+                from: rawPTYDescriptors,
+                queuesCertifiedEmpty: ptySafepointStatus?.all_queues_zero != 0
+            )
+            descriptorGraph = try durableDescriptorGraph(from: rawDescriptorGraph)
+        } catch {
+            continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+            throw error
+        }
+        let members: [HotProcessMember]
+        do {
+            members = try groupMembers(in: rawSnapshot)
+        } catch {
+            continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+            throw error
+        }
+        guard !members.isEmpty,
+              members.contains(where: { $0.processIdentifier == rootProcessIdentifier }) else {
+            continuum_remote_process_group_snapshot_destroy(rawSnapshot)
+            throw ContinuumError.runtimeUnsupported(
+                "The runtime did not capture the selected app's root process."
+            )
+        }
         let handle = HotProcessSnapshotHandle(
             pointer: rawSnapshot,
             rootProcessIdentifier: rootProcessIdentifier,
+            processIdentifiers: members.map(\.processIdentifier),
             writableVnodes: writableVnodes,
             snapshotID: snapshotID,
             appID: app.id,
@@ -144,13 +233,6 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             fileCheckpointStore: fileCheckpointStore
         )
         do {
-            let members = try groupMembers(in: rawSnapshot)
-            guard !members.isEmpty,
-                  members.contains(where: { $0.processIdentifier == rootProcessIdentifier }) else {
-                throw ContinuumError.runtimeUnsupported(
-                    "The runtime did not capture the selected app's root process."
-                )
-            }
 
             let capturedAt = Date.now
             let checkpoint = CheckpointRecord(
@@ -185,7 +267,9 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 ),
                 coldRestoreCertified: coldRestoreCertified(
                     in: rawSnapshot,
-                    rootProcessIdentifier: rootProcessIdentifier
+                    endpoints: establishedTCPEndpoints,
+                    ptyDescriptors: ptyDescriptors,
+                    descriptorGraph: descriptorGraph
                 )
             )
 
@@ -210,9 +294,14 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             var artifacts = try durableArtifacts(
                 snapshot: rawSnapshot,
                 checkpoint: checkpoint,
+                rootProcessIdentifier: rootProcessIdentifier,
+                rootProcessIdentifiers: processIdentifiers,
                 app: app,
                 snapshotID: snapshotID,
-                writableVnodes: writableVnodes
+                writableVnodes: writableVnodes,
+                establishedTCPEndpoints: establishedTCPEndpoints,
+                ptyDescriptors: ptyDescriptors,
+                descriptorGraph: descriptorGraph
             )
             artifacts.append(
                 CapturedArtifact(
@@ -273,8 +362,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             // Release a main-thread capture safepoint and any temporary
             // job-control stop left by the controller.
             for _ in 0..<3 {
-                _ = kill(handle.rootProcessIdentifier, SIGUSR1)
-                _ = kill(handle.rootProcessIdentifier, SIGCONT)
+                for processIdentifier in handle.processIdentifiers {
+                    _ = kill(processIdentifier, SIGUSR1)
+                    _ = kill(processIdentifier, SIGCONT)
+                }
                 usleep(10_000)
             }
         }
@@ -309,8 +400,13 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
 
     private func coldRestoreCertified(
         in snapshot: OpaquePointer,
-        rootProcessIdentifier: Int32
+        endpoints: [DurableTCPEndpoint],
+        ptyDescriptors: [DurablePTYDescriptor],
+        descriptorGraph: DurableDescriptorGraph
     ) -> Bool {
+        guard continuum_remote_process_group_member_count(snapshot) > 0 else {
+            return false
+        }
         for memberIndex in 0..<continuum_remote_process_group_member_count(snapshot) {
             var member = continuum_remote_process_group_member_info()
             guard continuum_remote_process_group_copy_member_info(
@@ -320,11 +416,17 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             ) == CONTINUUM_STATUS_OK else {
                 return false
             }
-            guard member.process_id == rootProcessIdentifier else { continue }
+            guard let launch = try? launchContract(
+                snapshot: snapshot,
+                memberIndex: memberIndex
+            ), launch.addressSpacePolicy == .continuumDeterministic else {
+                return false
+            }
             let regionCount = continuum_remote_process_group_member_region_count(
                 snapshot,
                 memberIndex
             )
+            var hasReconstructableMemory = false
             for regionIndex in 0..<regionCount {
                 var region = continuum_remote_process_region_info()
                 guard continuum_remote_process_group_copy_member_region_info(
@@ -335,15 +437,80 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 ) == CONTINUUM_STATUS_OK else {
                     return false
                 }
-                if region.length > 0,
-                   region.is_app_owned_state != 0,
-                   region.preserves_live_derived_graphics == 0 {
-                    return true
+                guard region.preserves_live_derived_graphics == 0 else {
+                    return false
+                }
+                hasReconstructableMemory = hasReconstructableMemory
+                    || region.length > 0
+            }
+            guard hasReconstructableMemory else { return false }
+
+            let threadCount = continuum_remote_process_group_member_thread_count(
+                snapshot,
+                memberIndex
+            )
+            var pthreadCount = 0
+            for threadIndex in 0..<threadCount {
+                var thread = continuum_remote_thread_state_info()
+                guard continuum_remote_process_group_copy_member_thread_info(
+                    snapshot,
+                    memberIndex,
+                    threadIndex,
+                    &thread
+                ) == CONTINUUM_STATUS_OK else {
+                    return false
+                }
+                switch thread.origin {
+                case CONTINUUM_REMOTE_THREAD_ORIGIN_PTHREAD:
+                    pthreadCount += 1
+                    guard thread.pthread_object_address != 0,
+                          thread.stack_pointer != 0 else {
+                        return false
+                    }
+                case CONTINUUM_REMOTE_THREAD_ORIGIN_WORKQUEUE:
+                    guard thread.preserves_kernel_continuation != 0 else {
+                        return false
+                    }
+                case CONTINUUM_REMOTE_THREAD_ORIGIN_RAW_MACH:
+                    break
+                default:
+                    return false
                 }
             }
+            guard pthreadCount > 0 else { return false }
+        }
+        for endpoint in endpoints {
+            guard endpoint.receiveQueueBytes == 0,
+                  endpoint.sendQueueBytes == 0 else {
+                return false
+            }
+            let reverseMatches = endpoints.filter { candidate in
+                candidate.processIdentifier != endpoint.processIdentifier
+                    || candidate.fileDescriptor != endpoint.fileDescriptor
+            }.filter { candidate in
+                candidate.domain == endpoint.domain
+                    && candidate.socketType == endpoint.socketType
+                    && candidate.socketProtocol == endpoint.socketProtocol
+                    && candidate.localAddress == endpoint.remoteAddress
+                    && candidate.remoteAddress == endpoint.localAddress
+            }
+            // Zero matches means a remote peer that cannot be rewound. More
+            // than one means aliased descriptors whose shared kernel identity
+            // is not represented by the durable format yet.
+            guard reverseMatches.count == 1 else { return false }
+        }
+        guard ptyDescriptors.allSatisfy({ descriptor in
+            descriptor.inputQueueBytes == 0
+                && descriptor.outputQueueBytes == 0
+        }) else {
             return false
         }
-        return false
+        guard descriptorGraph.handles.allSatisfy({
+            $0.descriptorFlags >= 0
+        }) else {
+            return false
+        }
+        return true
     }
 
     private func retain(_ handle: HotProcessSnapshotHandle, for snapshotID: SnapshotID) {
@@ -360,9 +527,14 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
     private func durableArtifacts(
         snapshot: OpaquePointer,
         checkpoint: CheckpointRecord,
+        rootProcessIdentifier: Int32,
+        rootProcessIdentifiers: [Int32],
         app: AppIdentity,
         snapshotID: SnapshotID,
-        writableVnodes: [HotWritableVnode]
+        writableVnodes: [HotWritableVnode],
+        establishedTCPEndpoints: [DurableTCPEndpoint],
+        ptyDescriptors: [DurablePTYDescriptor],
+        descriptorGraph: DurableDescriptorGraph
     ) throws -> [CapturedArtifact] {
         let chunkSize = 1_024 * 1_024
         var artifacts: [CapturedArtifact] = []
@@ -564,6 +736,9 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     snapshot: snapshot,
                     memberIndex: memberIndex
                 ),
+                topology: Self.processTopology(
+                    processIdentifier: member.process_id
+                ),
                 regions: regions,
                 threads: threads
             ))
@@ -622,18 +797,21 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 originalPath: vnode.path
             )
         }
-
         let image = DurableCheckpointImage(
             checkpointID: checkpoint.id,
             createdAt: checkpoint.capturedAt,
             architecture: "arm64",
             operatingSystemBuild: try currentOperatingSystemBuild(),
             pageSize: UInt64(getpagesize()),
-            rootProcessIdentifier: checkpoint.processIdentifiers.first ?? 0,
+            rootProcessIdentifier: rootProcessIdentifier,
+            rootProcessIdentifiers: rootProcessIdentifiers,
             app: app,
             members: processImages,
             writableFiles: writableFiles,
-            writableFileDescriptors: writableFileDescriptors
+            writableFileDescriptors: writableFileDescriptors,
+            establishedTCPEndpoints: establishedTCPEndpoints,
+            ptyDescriptors: ptyDescriptors,
+            descriptorGraph: descriptorGraph
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -643,6 +821,288 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             data: try encoder.encode(image)
         ))
         return artifacts
+    }
+
+    private func durableTCPEndpoints(
+        from endpoints: [continuum_remote_tcp_endpoint_info]
+    ) throws -> [DurableTCPEndpoint] {
+        return try endpoints.map { endpoint in
+            var localAddress = endpoint.local_address
+            var remoteAddress = endpoint.remote_address
+            let localCapacity = MemoryLayout.size(ofValue: localAddress)
+            let remoteCapacity = MemoryLayout.size(ofValue: remoteAddress)
+            guard endpoint.local_address_length <= localCapacity,
+                  endpoint.remote_address_length <= remoteCapacity else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported an invalid native TCP address length."
+                )
+            }
+            let localBytes = withUnsafeBytes(of: &localAddress) { bytes in
+                Array(bytes.prefix(Int(endpoint.local_address_length)))
+            }
+            let remoteBytes = withUnsafeBytes(of: &remoteAddress) { bytes in
+                Array(bytes.prefix(Int(endpoint.remote_address_length)))
+            }
+            return DurableTCPEndpoint(
+                processIdentifier: endpoint.process_id,
+                fileDescriptor: endpoint.file_descriptor,
+                domain: endpoint.domain,
+                socketType: endpoint.socket_type,
+                socketProtocol: endpoint.protocol,
+                tcpState: endpoint.tcp_state,
+                socketState: endpoint.socket_state,
+                localAddressLength: endpoint.local_address_length,
+                remoteAddressLength: endpoint.remote_address_length,
+                localAddress: localBytes,
+                remoteAddress: remoteBytes,
+                receiveQueueBytes: endpoint.receive_queue_bytes,
+                sendQueueBytes: endpoint.send_queue_bytes,
+                receiveShutdown: endpoint.receive_shutdown != 0,
+                sendShutdown: endpoint.send_shutdown != 0
+            )
+        }
+    }
+
+    private func durableDescriptorGraph(
+        from graph: HotRawDescriptorGraph
+    ) throws -> DurableDescriptorGraph {
+        let socketIDs = Dictionary(
+            uniqueKeysWithValues: graph.sockets.map {
+                ($0.resource_identity, UUID())
+            }
+        )
+        let pipeIDs = Dictionary(
+            uniqueKeysWithValues: graph.pipes.map {
+                ($0.resource_identity, UUID())
+            }
+        )
+        let kqueueIDs = Dictionary(
+            uniqueKeysWithValues: graph.kqueues.map {
+                ($0.resource_identity, UUID())
+            }
+        )
+
+        let handles = try graph.handles.map { handle in
+            let resourceID: UUID?
+            switch handle.resource_kind {
+            case CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_SOCKET:
+                resourceID = socketIDs[handle.resource_identity]
+            case CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_PIPE:
+                resourceID = pipeIDs[handle.resource_identity]
+            case CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_KQUEUE:
+                resourceID = kqueueIDs[handle.resource_identity]
+            default:
+                resourceID = nil
+            }
+            guard let resourceID else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported a descriptor with no matching resource."
+                )
+            }
+            return DurableDescriptorHandle(
+                resourceID: resourceID,
+                processIdentifier: handle.process_id,
+                fileDescriptor: handle.file_descriptor,
+                descriptorFlags: handle.descriptor_flags,
+                statusFlags: handle.status_flags
+            )
+        }
+
+        let sockets = try graph.sockets.map { socket in
+            guard let id = socketIDs[socket.resource_identity] else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported an unidentified socket resource."
+                )
+            }
+            let kind: DurableSocketKind
+            switch socket.kind {
+            case CONTINUUM_REMOTE_SOCKET_TCP_LISTENER:
+                kind = .tcpListener
+            case CONTINUUM_REMOTE_SOCKET_TCP_CONNECTED:
+                kind = .tcpConnected
+            case CONTINUUM_REMOTE_SOCKET_UNIX_LISTENER:
+                kind = .unixListener
+            case CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED:
+                kind = .unixConnected
+            default:
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported an unsupported socket kind."
+                )
+            }
+            var local = socket.local_address
+            var remote = socket.remote_address
+            let localCapacity = MemoryLayout.size(ofValue: local)
+            let remoteCapacity = MemoryLayout.size(ofValue: remote)
+            guard socket.local_address_length <= localCapacity,
+                  socket.remote_address_length <= remoteCapacity else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported an invalid socket address length."
+                )
+            }
+            let localData = withUnsafeBytes(of: &local) {
+                Data($0.prefix(Int(socket.local_address_length)))
+            }
+            let remoteData = withUnsafeBytes(of: &remote) {
+                Data($0.prefix(Int(socket.remote_address_length)))
+            }
+            let externalPath: String?
+            if kind == .unixConnected, socket.peer_identity == 0,
+               remoteData.count > 2 {
+                externalPath = String(
+                    decoding: remoteData.dropFirst(2).prefix { $0 != 0 },
+                    as: UTF8.self
+                )
+            } else {
+                externalPath = nil
+            }
+            return DurableSocketResource(
+                id: id,
+                kind: kind,
+                domain: socket.domain,
+                type: socket.socket_type,
+                protocol: socket.protocol,
+                localAddress: localData.isEmpty ? nil : localData,
+                remoteAddress: remoteData.isEmpty ? nil : remoteData,
+                backlog: kind == .tcpListener || kind == .unixListener
+                    ? socket.backlog
+                    : nil,
+                receiveQueueBytes: socket.receive_queue_bytes,
+                sendQueueBytes: socket.send_queue_bytes,
+                receiveShutdown: socket.receive_shutdown != 0,
+                sendShutdown: socket.send_shutdown != 0,
+                peerResourceID: socket.peer_identity == 0
+                    ? nil
+                    : socketIDs[socket.peer_identity],
+                listenerResourceID: socket.listener_identity == 0
+                    ? nil
+                    : socketIDs[socket.listener_identity],
+                externalPath: externalPath
+            )
+        }
+
+        let pipes = try graph.pipes.map { pipe in
+            guard let id = pipeIDs[pipe.resource_identity],
+                  let peerID = pipeIDs[pipe.peer_identity] else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported a pipe with no captured peer."
+                )
+            }
+            return DurablePipeResource(
+                id: id,
+                peerResourceID: peerID,
+                capacity: pipe.capacity,
+                queuedBytes: pipe.queued_bytes,
+                status: pipe.status
+            )
+        }
+
+        let kqueues = try graph.kqueues.map { kqueue in
+            guard let id = kqueueIDs[kqueue.resource_identity],
+                  kqueue.registration_start <= graph.registrations.count,
+                  kqueue.registration_count
+                    <= graph.registrations.count - Int(kqueue.registration_start)
+            else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported an invalid kqueue registration range."
+                )
+            }
+            let start = Int(kqueue.registration_start)
+            let end = start + Int(kqueue.registration_count)
+            let registrations = graph.registrations[start..<end].map {
+                DurableKqueueRegistration(
+                    ident: $0.ident,
+                    filter: $0.filter,
+                    flags: $0.flags,
+                    fflags: $0.fflags,
+                    data: $0.data,
+                    udata: $0.udata,
+                    qos: $0.qos,
+                    savedData: $0.saved_data,
+                    status: $0.status
+                )
+            }
+            return DurableKqueueResource(
+                id: id,
+                processIdentifier: kqueue.process_id,
+                registrations: registrations
+            )
+        }
+        return DurableDescriptorGraph(
+            handles: handles,
+            sockets: sockets,
+            pipes: pipes,
+            kqueues: kqueues
+        )
+    }
+
+    private func durablePTYDescriptors(
+        from descriptors: [continuum_remote_pty_descriptor_info],
+        queuesCertifiedEmpty: Bool
+    ) throws -> [DurablePTYDescriptor] {
+        try descriptors.map { descriptor in
+            let role: DurablePTYRole
+            switch descriptor.role {
+            case CONTINUUM_REMOTE_PTY_ROLE_MASTER:
+                role = .master
+            case CONTINUUM_REMOTE_PTY_ROLE_SLAVE:
+                role = .slave
+            default:
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported a PTY descriptor with no endpoint role."
+                )
+            }
+            var attributes = descriptor.terminal_attributes
+            var windowSize = descriptor.window_size
+            return DurablePTYDescriptor(
+                processIdentifier: descriptor.process_id,
+                fileDescriptor: descriptor.file_descriptor,
+                openFlags: descriptor.open_flags,
+                role: role,
+                device: descriptor.device,
+                inode: descriptor.inode,
+                rawDevice: descriptor.raw_device,
+                deviceMajor: descriptor.device_major,
+                deviceMinor: descriptor.device_minor,
+                ttyIndex: descriptor.tty_index,
+                aliasIdentity: descriptor.alias_identity,
+                inputQueueBytes: queuesCertifiedEmpty
+                    ? 0
+                    : descriptor.input_queue_known == 0
+                        ? nil
+                        : descriptor.input_queue_bytes,
+                outputQueueBytes: queuesCertifiedEmpty
+                    ? 0
+                    : descriptor.output_queue_known == 0
+                        ? nil
+                        : descriptor.output_queue_bytes,
+                terminalAttributes: descriptor.terminal_attributes_known == 0
+                    ? nil
+                    : withUnsafeBytes(of: &attributes) { Array($0) },
+                windowSize: descriptor.window_size_known == 0
+                    ? nil
+                    : withUnsafeBytes(of: &windowSize) { Array($0) }
+            )
+        }
+    }
+
+    private static func processTopology(
+        processIdentifier: Int32
+    ) -> DurableProcessTopology? {
+        var info = proc_bsdinfo()
+        let byteCount = proc_pidinfo(
+            processIdentifier,
+            PROC_PIDTBSDINFO,
+            0,
+            &info,
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        guard byteCount == MemoryLayout<proc_bsdinfo>.size else { return nil }
+        return DurableProcessTopology(
+            processGroupIdentifier: Int32(bitPattern: info.pbi_pgid),
+            sessionIdentifier: getsid(processIdentifier),
+            controllingTerminalDevice: info.e_tdev,
+            foregroundProcessGroupIdentifier: Int32(bitPattern: info.e_tpgid)
+        )
     }
 
     private func launchContract(
@@ -841,40 +1301,54 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         return members
     }
 
-    private func capturedSafepointCount(
-        in snapshot: OpaquePointer,
-        rootProcessIdentifier: Int32
-    ) -> Int {
-        for memberIndex in 0..<continuum_remote_process_group_member_count(snapshot) {
-            var member = continuum_remote_process_group_member_info()
-            guard continuum_remote_process_group_copy_member_info(
-                snapshot,
-                memberIndex,
-                &member
-            ) == CONTINUUM_STATUS_OK else {
-                return 0
-            }
-            guard member.process_id == rootProcessIdentifier else { continue }
-            var count = 0
-            let threadCount = continuum_remote_process_group_member_thread_count(
-                snapshot,
-                memberIndex
-            )
-            for threadIndex in 0..<threadCount {
-                var info = continuum_remote_thread_state_info()
-                guard continuum_remote_process_group_copy_member_thread_info(
-                    snapshot,
-                    memberIndex,
-                    threadIndex,
-                    &info
-                ) == CONTINUUM_STATUS_OK else {
-                    return 0
-                }
-                count += info.is_userspace_safepoint == 0 ? 0 : 1
-            }
-            return count
+    private static func captureMembers(rootedAt roots: Set<Int32>) -> [Int32] {
+        guard !roots.isEmpty else { return [] }
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+        var byteCount = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &byteCount, nil, 0) == 0,
+              byteCount >= MemoryLayout<kinfo_proc>.stride else {
+            return []
         }
-        return 0
+
+        let capacity = byteCount / MemoryLayout<kinfo_proc>.stride
+        var processes = [kinfo_proc](repeating: kinfo_proc(), count: capacity)
+        guard sysctl(&mib, u_int(mib.count), &processes, &byteCount, nil, 0) == 0 else {
+            return []
+        }
+
+        let count = min(capacity, byteCount / MemoryLayout<kinfo_proc>.stride)
+        let parentByProcess = Dictionary(uniqueKeysWithValues: processes.prefix(count).map {
+            ($0.kp_proc.p_pid, $0.kp_eproc.e_ppid)
+        })
+        guard roots.allSatisfy({ parentByProcess[$0] != nil }) else { return [] }
+
+        var members = roots
+        var changed = true
+        while changed {
+            changed = false
+            for (processIdentifier, parentProcessIdentifier) in parentByProcess
+            where members.contains(parentProcessIdentifier) {
+                changed = members.insert(processIdentifier).inserted || changed
+            }
+        }
+
+        return members.sorted { lhs, rhs in
+            func depth(of processIdentifier: Int32) -> Int {
+                var current = processIdentifier
+                var visited: Set<Int32> = []
+                var result = 0
+                while let parent = parentByProcess[current],
+                      members.contains(parent),
+                      visited.insert(current).inserted {
+                    result += 1
+                    current = parent
+                }
+                return result
+            }
+            let lhsDepth = depth(of: lhs)
+            let rhsDepth = depth(of: rhs)
+            return lhsDepth == rhsDepth ? lhs < rhs : lhsDepth < rhsDepth
+        }
     }
 
     private func captureError(
@@ -992,6 +1466,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
 private final class HotProcessSnapshotHandle: @unchecked Sendable {
     let pointer: OpaquePointer
     let rootProcessIdentifier: Int32
+    let processIdentifiers: [Int32]
     let writableVnodes: [HotWritableVnode]
     let snapshotID: SnapshotID
     let appID: String
@@ -1001,6 +1476,7 @@ private final class HotProcessSnapshotHandle: @unchecked Sendable {
     init(
         pointer: OpaquePointer,
         rootProcessIdentifier: Int32,
+        processIdentifiers: [Int32],
         writableVnodes: [HotWritableVnode],
         snapshotID: SnapshotID,
         appID: String,
@@ -1009,6 +1485,7 @@ private final class HotProcessSnapshotHandle: @unchecked Sendable {
     ) {
         self.pointer = pointer
         self.rootProcessIdentifier = rootProcessIdentifier
+        self.processIdentifiers = processIdentifiers
         self.writableVnodes = writableVnodes
         self.snapshotID = snapshotID
         self.appID = appID
@@ -1061,6 +1538,14 @@ private struct HotWritableVnode: Codable, Hashable, Sendable, Comparable {
     }
 }
 
+private struct HotRawDescriptorGraph {
+    let handles: [continuum_remote_descriptor_handle_info]
+    let sockets: [continuum_remote_socket_resource_info]
+    let pipes: [continuum_remote_pipe_resource_info]
+    let kqueues: [continuum_remote_kqueue_resource_info]
+    let registrations: [continuum_remote_kqueue_registration_info]
+}
+
 private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
     let expectedInventory: [HotWritableVnode]?
     let fileCheckpointStore: APFSLocalFileCheckpointStore?
@@ -1068,6 +1553,9 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
     let restoreSnapshotID: SnapshotID?
     let rollbackSnapshotID: SnapshotID?
     var inventory: [HotWritableVnode]?
+    var tcpEndpoints: [continuum_remote_tcp_endpoint_info]?
+    var ptyDescriptors: [continuum_remote_pty_descriptor_info]?
+    var descriptorGraph: HotRawDescriptorGraph?
     var failureDescription: String?
 
     init(
@@ -1119,6 +1607,138 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
            !Self.hasMatchingStableIdentity(captured, expectedInventory) {
             return CONTINUUM_STATUS_DESCRIPTOR_TABLE_CHANGED
         }
+
+        var endpointCount = 0
+        status = continuum_remote_process_group_copy_tcp_endpoints(
+            snapshot,
+            nil,
+            0,
+            &endpointCount
+        )
+        guard status == CONTINUUM_STATUS_OK else { return status }
+        var capturedEndpoints = Array(
+            repeating: continuum_remote_tcp_endpoint_info(),
+            count: endpointCount
+        )
+        var returnedEndpointCount = endpointCount
+        status = capturedEndpoints.withUnsafeMutableBufferPointer { buffer in
+            continuum_remote_process_group_copy_tcp_endpoints(
+                snapshot,
+                buffer.baseAddress,
+                buffer.count,
+                &returnedEndpointCount
+            )
+        }
+        guard status == CONTINUUM_STATUS_OK,
+              returnedEndpointCount == endpointCount else {
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : status
+        }
+        tcpEndpoints = capturedEndpoints
+
+        var ptyDescriptorCount = 0
+        status = continuum_remote_process_group_copy_pty_descriptors(
+            snapshot,
+            nil,
+            0,
+            &ptyDescriptorCount
+        )
+        guard status == CONTINUUM_STATUS_OK else { return status }
+        var capturedPTYDescriptors = Array(
+            repeating: continuum_remote_pty_descriptor_info(),
+            count: ptyDescriptorCount
+        )
+        var returnedPTYDescriptorCount = ptyDescriptorCount
+        status = capturedPTYDescriptors.withUnsafeMutableBufferPointer { buffer in
+            continuum_remote_process_group_copy_pty_descriptors(
+                snapshot,
+                buffer.baseAddress,
+                buffer.count,
+                &returnedPTYDescriptorCount
+            )
+        }
+        guard status == CONTINUUM_STATUS_OK,
+              returnedPTYDescriptorCount == ptyDescriptorCount else {
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : status
+        }
+        ptyDescriptors = capturedPTYDescriptors
+
+        var rawGraph: OpaquePointer?
+        status = continuum_remote_process_group_capture_descriptor_graph(
+            snapshot,
+            &rawGraph
+        )
+        guard status == CONTINUUM_STATUS_OK, let rawGraph else {
+            return status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : status
+        }
+        defer { continuum_remote_descriptor_graph_destroy(rawGraph) }
+
+        var handles = Array(
+            repeating: continuum_remote_descriptor_handle_info(),
+            count: continuum_remote_descriptor_graph_handle_count(rawGraph)
+        )
+        var sockets = Array(
+            repeating: continuum_remote_socket_resource_info(),
+            count: continuum_remote_descriptor_graph_socket_count(rawGraph)
+        )
+        var pipes = Array(
+            repeating: continuum_remote_pipe_resource_info(),
+            count: continuum_remote_descriptor_graph_pipe_count(rawGraph)
+        )
+        var kqueues = Array(
+            repeating: continuum_remote_kqueue_resource_info(),
+            count: continuum_remote_descriptor_graph_kqueue_count(rawGraph)
+        )
+        var registrations = Array(
+            repeating: continuum_remote_kqueue_registration_info(),
+            count: continuum_remote_descriptor_graph_kqueue_registration_count(rawGraph)
+        )
+        status = handles.withUnsafeMutableBufferPointer {
+            continuum_remote_descriptor_graph_copy_handles(
+                rawGraph, $0.baseAddress, $0.count
+            )
+        }
+        if status == CONTINUUM_STATUS_OK {
+            status = sockets.withUnsafeMutableBufferPointer {
+                continuum_remote_descriptor_graph_copy_sockets(
+                    rawGraph, $0.baseAddress, $0.count
+                )
+            }
+        }
+        if status == CONTINUUM_STATUS_OK {
+            status = pipes.withUnsafeMutableBufferPointer {
+                continuum_remote_descriptor_graph_copy_pipes(
+                    rawGraph, $0.baseAddress, $0.count
+                )
+            }
+        }
+        if status == CONTINUUM_STATUS_OK {
+            status = kqueues.withUnsafeMutableBufferPointer {
+                continuum_remote_descriptor_graph_copy_kqueues(
+                    rawGraph, $0.baseAddress, $0.count
+                )
+            }
+        }
+        if status == CONTINUUM_STATUS_OK {
+            status = registrations.withUnsafeMutableBufferPointer {
+                continuum_remote_descriptor_graph_copy_kqueue_registrations(
+                    rawGraph, $0.baseAddress, $0.count
+                )
+            }
+        }
+        guard status == CONTINUUM_STATUS_OK else { return status }
+        descriptorGraph = HotRawDescriptorGraph(
+            handles: handles,
+            sockets: sockets,
+            pipes: pipes,
+            kqueues: kqueues,
+            registrations: registrations
+        )
 
         let files = Array(Set(captured.map(\.path)))
             .map { URL(fileURLWithPath: $0) }

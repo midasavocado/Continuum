@@ -1,10 +1,26 @@
 # Continuum
 
-Continuum is a native macOS research prototype for safe, branching app snapshots: save a moment, preserve the current future before rewinding, and never label a screenshot as restorable state.
+Continuum is a native macOS research app that checkpoints a GUI process, lets that process really exit, and reconstructs its saved RAM state in a different process without rolling local files backward. The product goal is deliberately simple: **Save Snapshot → quit normally → Restore**.
 
 > **Current status: v0.3 research build.** Continuum proves one real AppKit cold-restore path: ordinary direct app allocations made during startup and after the first run-loop idle boundary on both the main thread and a worker thread, plus app-defined Objective-C model objects with scalar-only ivars and standard allocation behavior, are captured with durable allocator metadata. The original GUI process fully exits, and a different PID relaunches with all saved values at the same addresses and a new functional WindowServer window. The replacement is fully prepared and validated before the live app is closed. Current files are deliberately left unchanged. The broader signed proof still validates 202 live/cold memory restores and guarded process resources. This is **not** arbitrary-app certification: reference-bearing Objective-C objects, Swift/framework-owned heaps, live background-thread execution state, sockets, Mach/XPC queues, GPU state, audio, devices, and full thread continuation remain outside the proven cold path.
 
 Continuum requires macOS 15 or later. The cooperative signed proof works through explicit development entitlements and verifies that it never changes SIP state. Testing unmodified third-party processes on this development Mac currently relies on the user's SIP-disabled configuration; that is not a consumer distribution plan or proof of universal compatibility.
+
+## OpenAI Build Week 2026
+
+Continuum is entered in **Apps for Your Life**. It addresses a familiar failure mode for people using creative tools, games, and productivity apps: the useful transient state was in memory, not in a saved file, when the app quit or crashed.
+
+The repository existed before the July 13 submission window, so the dated Git history is intentionally explicit about what is new. After the submission period opened at 9:00 AM PT on July 13, the project added process-only cold restore, deterministic address matching, cold thread-set reconstruction, GUI safepoints, reliable one-step quit and restore, allocator-state reconstruction, normal-launch arming, post-startup and worker-thread capture, and scalar Objective-C model restoration. Earlier UI, storage, and cold-restore scaffolding is not presented as Build Week work.
+
+The core implementation was developed interactively in one Codex task. The human set the product contract and made the key scope decisions—real process exit, RAM-only restore, files unchanged, general mechanisms instead of app-specific patches, and fail-closed compatibility. Codex translated those decisions into Swift, C, Objective-C, Mach runtime code, test harnesses, and repeated real-process validation. The `/feedback` session ID attached to the Devpost submission is the authoritative session record.
+
+Codex was most useful in three places:
+
+- keeping the Swift UI, SwiftPM targets, injected C runtime, and signed Mach controller synchronized while the design changed;
+- turning repeated runtime failures into narrow hypotheses, then adding proof output for PID replacement, address identity, thread ownership, and file invariants; and
+- rejecting convincing-looking shortcuts. Failed Swift-heap and broad Objective-C restore experiments were reverted when they could not pass the real quit-and-relaunch proof.
+
+See [docs/DEVPOST_SUBMISSION.md](docs/DEVPOST_SUBMISSION.md) for the judge checklist, copy-ready submission text, and demo outline.
 
 ## What v0.3 implements
 
@@ -50,6 +66,32 @@ The project is a SwiftPM macOS application. Xcode's command-line tools must be s
 ```
 
 The script stops an existing Continuum process, performs a clean build in an external per-user temporary SwiftPM scratch directory, stages the app, and signs it with the first available Apple Development identity (or ad-hoc as a fallback). It exposes the result at `dist/Continuum.app`, then launches that path through Launch Services. The `dist` path is a symlink to the externally staged bundle because this workspace is file-provider backed and can reattach forbidden Finder metadata to an in-place bundle during signing. The Codex workspace's **Run** action calls the same script.
+
+### Fastest judge path
+
+To launch the product UI:
+
+```bash
+./script/build_and_run.sh --verify
+```
+
+To verify the actual cold-restore claim on a controlled AppKit target:
+
+```bash
+./script/run_gui_cold_proof.sh
+```
+
+The second command is the decisive test. It requires an Apple Development signing identity, launches a signed GUI fixture, records its startup/main-thread/worker-thread/Objective-C scalar state, lets the original PID exit, restores into a different PID, verifies a fresh functional WindowServer window, mutates the restored app again, and checks that local files were not changed. It prints both PIDs and every restored value. It does not attach to or modify an unrelated app.
+
+The downloadable hackathon preview is a development build, not a notarized consumer release. This Mac has Apple Development identities but no Developer ID Application identity or notary profile, so Gatekeeper correctly rejects the current artifact for normal internet distribution. Judges can build from source with the one-step command above; a notarized download remains a release prerequisite, not a checkbox Continuum pretends has passed.
+
+Maintainers can create a certificate-independent, ad-hoc-signed judge archive with:
+
+```bash
+./script/package_judge_build.sh
+```
+
+The script builds v0.3.0, launches it once, archives the real app bundle, extracts and revalidates the archive, and writes a SHA-256 checksum under `dist/`. Because the archive is not notarized, it is a fallback test build; source build plus the signed proof remains the strongest judging path.
 
 Useful modes:
 
@@ -98,7 +140,7 @@ That script requires a local Apple Development signing identity, verifies the co
 
 On first launch, Continuum explains the preserve-before-rewind contract, lets the user explicitly invoke native permission prompts, runs a read-only compatibility scan, lets the user choose a future storage budget, and walks through an isolated text demo. Permission steps are optional. **Skip Prototype Setup** exits without granting anything; **Run Setup Again** in Settings restarts at Welcome.
 
-| Permission | Why it appears | v0.2 behavior |
+| Permission | Why it appears | v0.3 behavior |
 | --- | --- | --- |
 | Accessibility | Identify and coordinate selected app windows | **Allow Accessibility** invokes macOS's native request; Settings opens after an earlier denial |
 | Screen Recording | Future private visual timeline thumbnails | **Allow Screen Recording** invokes macOS's native request; no screenshot is treated as restorable state |
@@ -134,7 +176,7 @@ The store proves these transaction semantics using harness-owned artifacts. It d
 
 ### Planned capture and storage defaults
 
-These are product targets for a future validated capture runtime; v0.2 does not run this rolling checkpoint scheduler yet.
+These are product targets for a future validated capture runtime; v0.3 does not run this rolling checkpoint scheduler yet.
 
 - Active apps: one checkpoint epoch every 100 ms.
 - Game/high-motion mode: 50 ms only when measured frame-time and checkpoint-pause budgets remain healthy.
@@ -187,3 +229,7 @@ The proof harness creates only self-cleaning temporary directories. Full Disk Ac
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for module boundaries and the transaction invariants that must remain true while the runtime evolves.
 
 The next engineering gate is not “support KSP somehow.” The working memory/register cut and APFS file primitive must gain capture-group file attribution, VM-topology generations, descriptor/Mach/XPC virtualization, and graphics republication. Only measured end-to-end restoration can certify an app, with KSP serving as a demanding acceptance workload rather than a special-case illusion.
+
+## License
+
+Continuum is available under the [Apache License 2.0](LICENSE).

@@ -33,6 +33,11 @@ final class ModelRoundTripTests: XCTestCase {
             storedBytes: 1_024,
             compression: .lzfse
         )
+        let listenerID = UUID(uuidString: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")!
+        let connectedSocketID = UUID(uuidString: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")!
+        let pipeReadID = UUID(uuidString: "cccccccc-cccc-cccc-cccc-cccccccccccc")!
+        let pipeWriteID = UUID(uuidString: "dddddddd-dddd-dddd-dddd-dddddddddddd")!
+        let kqueueID = UUID(uuidString: "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")!
         let image = DurableCheckpointImage(
             checkpointID: UUID(),
             createdAt: Date(timeIntervalSince1970: 1_750_000_000),
@@ -40,6 +45,7 @@ final class ModelRoundTripTests: XCTestCase {
             operatingSystemBuild: "test-build",
             pageSize: 16_384,
             rootProcessIdentifier: 4242,
+            rootProcessIdentifiers: [4242, 5252],
             app: makeApp(),
             members: [
                 DurableProcessImage(
@@ -55,6 +61,12 @@ final class ModelRoundTripTests: XCTestCase {
                         environment: ["LANG=en_US.UTF-8", "CONTINUUM_TEST=1"],
                         workingDirectory: "/private/tmp",
                         addressSpacePolicy: .continuumDeterministic
+                    ),
+                    topology: DurableProcessTopology(
+                        processGroupIdentifier: 4242,
+                        sessionIdentifier: 4000,
+                        controllingTerminalDevice: 0x0100_0007,
+                        foregroundProcessGroupIdentifier: 4242
                     ),
                     regions: [
                         DurableMemoryRegion(
@@ -109,11 +121,197 @@ final class ModelRoundTripTests: XCTestCase {
                     mode: 0o100600,
                     originalPath: "/private/tmp/continuum-state.bin"
                 )
-            ]
+            ],
+            establishedTCPEndpoints: [
+                DurableTCPEndpoint(
+                    processIdentifier: 4242,
+                    fileDescriptor: 11,
+                    domain: 2,
+                    socketType: 1,
+                    socketProtocol: 6,
+                    tcpState: 4,
+                    socketState: 0x20,
+                    localAddressLength: 16,
+                    remoteAddressLength: 16,
+                    localAddress: Array(0..<16),
+                    remoteAddress: Array(16..<32),
+                    receiveQueueBytes: 128,
+                    sendQueueBytes: 64,
+                    receiveShutdown: false,
+                    sendShutdown: true
+                )
+            ],
+            ptyDescriptors: [
+                DurablePTYDescriptor(
+                    processIdentifier: 4242,
+                    fileDescriptor: 1,
+                    openFlags: 2,
+                    role: .slave,
+                    device: 16,
+                    inode: 3_163,
+                    rawDevice: 4_097,
+                    deviceMajor: 16,
+                    deviceMinor: 1,
+                    ttyIndex: 1,
+                    aliasIdentity: 0x10_0000_0001,
+                    terminalAttributes: [1, 2, 3, 4],
+                    windowSize: [40, 0, 120, 0]
+                )
+            ],
+            descriptorGraph: DurableDescriptorGraph(
+                handles: [
+                    DurableDescriptorHandle(
+                        resourceID: listenerID,
+                        processIdentifier: 4242,
+                        fileDescriptor: 5,
+                        descriptorFlags: 1,
+                        statusFlags: 4
+                    ),
+                    DurableDescriptorHandle(
+                        resourceID: connectedSocketID,
+                        processIdentifier: 4242,
+                        fileDescriptor: 6,
+                        descriptorFlags: 0,
+                        statusFlags: 4
+                    ),
+                    DurableDescriptorHandle(
+                        resourceID: connectedSocketID,
+                        processIdentifier: 5252,
+                        fileDescriptor: 8,
+                        descriptorFlags: 1,
+                        statusFlags: 4
+                    ),
+                    DurableDescriptorHandle(
+                        resourceID: pipeReadID,
+                        processIdentifier: 4242,
+                        fileDescriptor: 7,
+                        descriptorFlags: 0,
+                        statusFlags: 0
+                    ),
+                    DurableDescriptorHandle(
+                        resourceID: pipeWriteID,
+                        processIdentifier: 5252,
+                        fileDescriptor: 9,
+                        descriptorFlags: 0,
+                        statusFlags: 4
+                    ),
+                    DurableDescriptorHandle(
+                        resourceID: kqueueID,
+                        processIdentifier: 4242,
+                        fileDescriptor: 10,
+                        descriptorFlags: 1,
+                        statusFlags: 0
+                    ),
+                ],
+                sockets: [
+                    DurableSocketResource(
+                        id: listenerID,
+                        kind: .tcpListener,
+                        domain: 2,
+                        type: 1,
+                        protocol: 6,
+                        localAddress: Data([2, 0, 44, 204, 127, 0, 0, 1]),
+                        backlog: 128,
+                        receiveQueueBytes: 0,
+                        sendQueueBytes: 0,
+                        receiveShutdown: false,
+                        sendShutdown: false,
+                        options: [
+                            DurableSocketOption(level: 0xffff, name: 0x0004, value: Data([1, 0, 0, 0]))
+                        ]
+                    ),
+                    DurableSocketResource(
+                        id: connectedSocketID,
+                        kind: .unixConnected,
+                        domain: 1,
+                        type: 1,
+                        protocol: 0,
+                        localAddress: Data([1, 0]),
+                        remoteAddress: Data([1, 0, 47, 118, 97, 114, 47, 114, 117, 110]),
+                        receiveQueueBytes: 0,
+                        sendQueueBytes: 0,
+                        receiveShutdown: false,
+                        sendShutdown: false,
+                        externalPath: "/var/run/example.sock"
+                    ),
+                ],
+                pipes: [
+                    DurablePipeResource(
+                        id: pipeReadID,
+                        peerResourceID: pipeWriteID,
+                        capacity: 65_536,
+                        queuedBytes: 16_384,
+                        status: 1,
+                        payload: chunk
+                    ),
+                    DurablePipeResource(
+                        id: pipeWriteID,
+                        peerResourceID: pipeReadID,
+                        capacity: 65_536,
+                        queuedBytes: 0,
+                        status: 2
+                    ),
+                ],
+                kqueues: [
+                    DurableKqueueResource(
+                        id: kqueueID,
+                        processIdentifier: 4242,
+                        registrations: [
+                            DurableKqueueRegistration(
+                                ident: 6,
+                                filter: -1,
+                                flags: 0x0021,
+                                fflags: 0,
+                                data: 0,
+                                udata: 0x1234,
+                                qos: 4,
+                                savedData: 0,
+                                status: 1
+                            )
+                        ]
+                    )
+                ]
+            )
         )
 
         XCTAssertEqual(try roundTrip(image), image)
         XCTAssertEqual(image.formatVersion, DurableCheckpointImage.currentFormatVersion)
+        XCTAssertEqual(image.descriptorGraph?.handles.filter { $0.resourceID == connectedSocketID }.count, 2)
+    }
+
+    func testDurableCheckpointImageDecodesVersionFourWithoutDescriptorGraph() throws {
+        let checkpointID = UUID(uuidString: "ffffffff-ffff-ffff-ffff-ffffffffffff")!
+        let legacyJSON = """
+        {
+          "formatVersion": 4,
+          "checkpointID": "\(checkpointID.uuidString)",
+          "createdAt": 1750000000000,
+          "architecture": "arm64",
+          "operatingSystemBuild": "legacy-build",
+          "pageSize": 16384,
+          "rootProcessIdentifier": 4242,
+          "app": {
+            "bundleIdentifier": "com.example.legacy",
+            "displayName": "Legacy Fixture",
+            "bundleURL": "file:///Applications/Legacy.app",
+            "executableURL": "file:///Applications/Legacy.app/Contents/MacOS/Legacy",
+            "version": "1.0",
+            "signingIdentifier": "com.example.legacy",
+            "isApplePlatformBinary": false
+          },
+          "members": [],
+          "writableFiles": [],
+          "writableFileDescriptors": []
+        }
+        """
+
+        let decoded = try decoder.decode(DurableCheckpointImage.self, from: Data(legacyJSON.utf8))
+
+        XCTAssertEqual(decoded.formatVersion, 4)
+        XCTAssertEqual(decoded.checkpointID, checkpointID)
+        XCTAssertNil(decoded.descriptorGraph)
+        XCTAssertNil(decoded.establishedTCPEndpoints)
+        XCTAssertNil(decoded.ptyDescriptors)
     }
 
     func testStoreIndexRoundTripsNestedSnapshotBranchAndProvisionalRewind() throws {

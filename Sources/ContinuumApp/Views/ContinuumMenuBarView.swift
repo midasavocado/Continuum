@@ -54,6 +54,13 @@ struct ContinuumMenuBarView: View {
 
         Divider()
 
+        Button("Open Rewindable Terminal") {
+            Task { await model.openRewindableTerminal() }
+        }
+        .disabled(model.isPerformingAction)
+
+        Divider()
+
         SettingsLink {
             Text("Settings…")
         }

@@ -17,6 +17,8 @@ let package = Package(
             type: .dynamic,
             targets: ["ContinuumBootstrap"]
         ),
+        .executable(name: "ContinuumTerminalRelay", targets: ["ContinuumTerminalRelay"]),
+        .executable(name: "ContinuumManagedExec", targets: ["ContinuumManagedExec"]),
         .executable(name: "Continuum", targets: ["ContinuumApp"]),
         .executable(name: "ContinuumHarness", targets: ["ContinuumHarness"]),
         .executable(name: "ContinuumExternalTarget", targets: ["ContinuumExternalTarget"]),
@@ -42,9 +44,20 @@ let package = Package(
                 .linkedLibrary("objc")
             ]
         ),
+        .target(name: "ContinuumTerminalRelayCore", publicHeadersPath: "include"),
+        .executableTarget(
+            name: "ContinuumTerminalRelay",
+            dependencies: ["ContinuumTerminalRelayCore"]
+        ),
+        .executableTarget(name: "ContinuumManagedExec"),
         .target(
             name: "ContinuumSystem",
-            dependencies: ["ContinuumCore", "ContinuumRuntime", "ContinuumStore"],
+            dependencies: [
+                "ContinuumCore",
+                "ContinuumRuntime",
+                "ContinuumStore",
+                "ContinuumTerminalRelayCore"
+            ],
             linkerSettings: [
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Security")
@@ -70,10 +83,17 @@ let package = Package(
         ),
         .testTarget(name: "ContinuumCoreTests", dependencies: ["ContinuumCore"]),
         .testTarget(name: "ContinuumStoreTests", dependencies: ["ContinuumCore", "ContinuumStore"]),
-        .testTarget(name: "ContinuumSystemTests", dependencies: ["ContinuumCore", "ContinuumSystem"]),
+        .testTarget(
+            name: "ContinuumSystemTests",
+            dependencies: ["ContinuumCore", "ContinuumSystem", "ContinuumTerminalRelayCore"]
+        ),
         .testTarget(
             name: "ContinuumRuntimeTests",
             dependencies: ["ContinuumRuntime", "ContinuumBootstrap"]
+        ),
+        .testTarget(
+            name: "ContinuumManagedExecTests",
+            dependencies: ["ContinuumManagedExec"]
         ),
         .testTarget(name: "ContinuumAppTests", dependencies: ["ContinuumApp", "ContinuumSystem"])
     ]

@@ -11,10 +11,32 @@ extern "C" {
 enum { CONTINUUM_BOOTSTRAP_SAFEPOINT_REGISTER = 28 };
 #define CONTINUUM_BOOTSTRAP_SAFEPOINT_MAGIC UINT64_C(0x434F4E5453414645)
 #define CONTINUUM_BOOTSTRAP_APP_STATE_ZONE_NAME "ContinuumAppState"
+#define CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC UINT64_C(0x434F4E5450545951)
 
-/// Runs on AppKit's main queue until the controller sends the release signal.
-/// x28 carries a marker so an external capture can prove it stopped at this
-/// user-space continuation instead of inside a Mach syscall.
+typedef struct continuum_bootstrap_pty_safepoint_status {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t structure_size;
+    uint64_t generation;
+    uint64_t safepoint_thread_identifier;
+    uint32_t pty_descriptor_count;
+    uint8_t queue_state_known;
+    uint8_t all_queues_zero;
+    uint8_t safepoint_active;
+    uint8_t reserved;
+} continuum_bootstrap_pty_safepoint_status;
+
+/// Published immediately before either the AppKit run-loop thread or the
+/// generic CLI coordinator enters the safepoint spin. Queue depths are
+/// observed with FIONREAD/TIOCOUTQ only; Continuum never consumes PTY payload
+/// while producing this report.
+extern volatile continuum_bootstrap_pty_safepoint_status
+    continuum_bootstrap_pty_safepoint_report;
+
+/// Runs on AppKit's main queue or the generic CLI coordinator until the
+/// controller sends the release signal. x28 carries a marker so an external
+/// capture can prove it stopped at this user-space continuation instead of
+/// inside a Mach syscall.
 void continuum_bootstrap_safepoint_spin(void);
 
 /// Allocates durable model memory from Continuum's isolated app-state zone.

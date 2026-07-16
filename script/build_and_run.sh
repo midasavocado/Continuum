@@ -50,9 +50,13 @@ export CLANG_MODULE_CACHE_PATH="$SCRATCH_ROOT/ClangModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$SCRATCH_ROOT/SwiftPMModuleCache"
 swift build "${SWIFT_BUILD_OPTIONS[@]}" --product "$APP_NAME"
 swift build "${SWIFT_BUILD_OPTIONS[@]}" --product ContinuumBootstrap
+swift build "${SWIFT_BUILD_OPTIONS[@]}" --product ContinuumTerminalRelay
+swift build "${SWIFT_BUILD_OPTIONS[@]}" --product ContinuumManagedExec
 BUILD_DIR="$(swift build "${SWIFTPM_OPTIONS[@]}" --show-bin-path)"
 BUILD_BINARY="$BUILD_DIR/$APP_NAME"
 BUILD_BOOTSTRAP="$BUILD_DIR/libContinuumBootstrap.dylib"
+BUILD_TERMINAL_RELAY="$BUILD_DIR/ContinuumTerminalRelay"
+BUILD_MANAGED_EXEC="$BUILD_DIR/ContinuumManagedExec"
 
 if [[ ! -x "$BUILD_BINARY" ]]; then
   echo "error: SwiftPM did not produce $BUILD_BINARY" >&2
@@ -62,14 +66,27 @@ if [[ ! -f "$BUILD_BOOTSTRAP" ]]; then
   echo "error: SwiftPM did not produce $BUILD_BOOTSTRAP" >&2
   exit 1
 fi
+if [[ ! -x "$BUILD_TERMINAL_RELAY" ]]; then
+  echo "error: SwiftPM did not produce $BUILD_TERMINAL_RELAY" >&2
+  exit 1
+fi
+if [[ ! -x "$BUILD_MANAGED_EXEC" ]]; then
+  echo "error: SwiftPM did not produce $BUILD_MANAGED_EXEC" >&2
+  exit 1
+fi
 
 STAGED_BUNDLE="$SCRATCH_ROOT/Staged/$APP_NAME.app"
 STAGED_CONTENTS="$STAGED_BUNDLE/Contents"
 STAGED_MACOS="$STAGED_CONTENTS/MacOS"
 STAGED_RESOURCES="$STAGED_CONTENTS/Resources"
 STAGED_FRAMEWORKS="$STAGED_CONTENTS/Frameworks"
+STAGED_HELPERS="$STAGED_CONTENTS/Helpers"
 STAGED_BINARY="$STAGED_MACOS/$APP_NAME"
 STAGED_BOOTSTRAP="$STAGED_FRAMEWORKS/libContinuumBootstrap.dylib"
+ARM64E_BOOTSTRAP="$SCRATCH_ROOT/libContinuumBootstrap-arm64e.dylib"
+UNIVERSAL_BOOTSTRAP="$SCRATCH_ROOT/libContinuumBootstrap-universal.dylib"
+STAGED_TERMINAL_RELAY="$STAGED_HELPERS/ContinuumTerminalRelay"
+STAGED_MANAGED_EXEC="$STAGED_HELPERS/ContinuumManagedExec"
 INFO_PLIST="$STAGED_CONTENTS/Info.plist"
 APP_ICON="$ROOT_DIR/Assets/Continuum.icns"
 APP_ENTITLEMENTS="$ROOT_DIR/Configuration/Continuum.entitlements"
@@ -84,11 +101,29 @@ if [[ ! -f "$APP_ENTITLEMENTS" ]]; then
   exit 1
 fi
 
-mkdir -p "$STAGED_MACOS" "$STAGED_RESOURCES" "$STAGED_FRAMEWORKS"
+mkdir -p "$STAGED_MACOS" "$STAGED_RESOURCES" "$STAGED_FRAMEWORKS" "$STAGED_HELPERS"
 cp "$BUILD_BINARY" "$STAGED_BINARY"
-cp "$BUILD_BOOTSTRAP" "$STAGED_BOOTSTRAP"
+# Apple's system shells are arm64e while ordinary third-party apps are arm64.
+# One signed fat bootstrap lets a managed Terminal session arm both without
+# modifying either original executable.
+xcrun clang \
+  -arch arm64e \
+  -mmacosx-version-min="$MIN_SYSTEM_VERSION" \
+  -O2 \
+  -dynamiclib \
+  -install_name @rpath/libContinuumBootstrap.dylib \
+  -include mach/mach_vm.h \
+  -I "$ROOT_DIR/Sources/ContinuumBootstrap/include" \
+  "$ROOT_DIR/Sources/ContinuumBootstrap/ContinuumBootstrap.c" \
+  -framework CoreFoundation \
+  -lobjc \
+  -o "$ARM64E_BOOTSTRAP"
+lipo -create "$BUILD_BOOTSTRAP" "$ARM64E_BOOTSTRAP" -output "$UNIVERSAL_BOOTSTRAP"
+cp "$UNIVERSAL_BOOTSTRAP" "$STAGED_BOOTSTRAP"
+cp "$BUILD_TERMINAL_RELAY" "$STAGED_TERMINAL_RELAY"
+cp "$BUILD_MANAGED_EXEC" "$STAGED_MANAGED_EXEC"
 cp "$APP_ICON" "$STAGED_RESOURCES/Continuum.icns"
-chmod +x "$STAGED_BINARY"
+chmod +x "$STAGED_BINARY" "$STAGED_TERMINAL_RELAY" "$STAGED_MANAGED_EXEC"
 
 /usr/libexec/PlistBuddy -c "Clear dict" "$INFO_PLIST" >/dev/null 2>&1 || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDevelopmentRegion string en" "$INFO_PLIST"
@@ -99,8 +134,8 @@ chmod +x "$STAGED_BINARY"
 /usr/libexec/PlistBuddy -c "Add :CFBundleInfoDictionaryVersion string 6.0" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundlePackageType string APPL" "$INFO_PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.2.0" "$INFO_PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 4" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 0.3.0" "$INFO_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 5" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string public.app-category.utilities" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MIN_SYSTEM_VERSION" "$INFO_PLIST"
 /usr/libexec/PlistBuddy -c "Add :NSAccessibilityUsageDescription string Continuum uses Accessibility only when you ask it to identify and coordinate the app you are capturing." "$INFO_PLIST"
@@ -135,6 +170,20 @@ fi
   --options runtime \
   --timestamp=none \
   "$STAGED_BOOTSTRAP"
+
+/usr/bin/codesign \
+  --force \
+  --sign "$SIGNING_IDENTITY" \
+  --options runtime \
+  --timestamp=none \
+  "$STAGED_TERMINAL_RELAY"
+
+/usr/bin/codesign \
+  --force \
+  --sign "$SIGNING_IDENTITY" \
+  --options runtime \
+  --timestamp=none \
+  "$STAGED_MANAGED_EXEC"
 
 /usr/bin/codesign \
   --force \

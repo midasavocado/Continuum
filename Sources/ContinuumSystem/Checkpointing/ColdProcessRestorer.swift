@@ -21,11 +21,130 @@ public struct ColdProcessPreparation: Hashable, Sendable {
     public let reconstructedFileBytes: UInt64
 }
 
+private struct ManifestOverlayRepository: SnapshotRepository {
+    let base: any SnapshotRepository
+    let snapshotID: SnapshotID
+    let manifestData: Data
+
+    func loadIndex() async throws -> StoreIndex {
+        try await base.loadIndex()
+    }
+
+    func save(_ capture: SnapshotCapture) async throws -> SnapshotRecord {
+        try await base.save(capture)
+    }
+
+    func beginRewind(
+        safetyCapture: SnapshotCapture,
+        sourceBranchID: BranchID
+    ) async throws -> ProvisionalRewind {
+        try await base.beginRewind(
+            safetyCapture: safetyCapture,
+            sourceBranchID: sourceBranchID
+        )
+    }
+
+    func commitRewind(
+        _ provisionalID: ProvisionalRewindID,
+        targetSnapshotID: SnapshotID
+    ) async throws -> RewindCommit {
+        try await base.commitRewind(
+            provisionalID,
+            targetSnapshotID: targetSnapshotID
+        )
+    }
+
+    func cancelRewind(_ provisionalID: ProvisionalRewindID) async throws {
+        try await base.cancelRewind(provisionalID)
+    }
+
+    func renameSnapshot(_ snapshotID: SnapshotID, to name: String) async throws {
+        try await base.renameSnapshot(snapshotID, to: name)
+    }
+
+    func updateNote(_ snapshotID: SnapshotID, note: String) async throws {
+        try await base.updateNote(snapshotID, note: note)
+    }
+
+    func deleteSnapshot(_ snapshotID: SnapshotID) async throws {
+        try await base.deleteSnapshot(snapshotID)
+    }
+
+    func deleteAllSnapshots() async throws {
+        try await base.deleteAllSnapshots()
+    }
+
+    func artifacts(for requestedSnapshotID: SnapshotID) async throws -> [CapturedArtifact] {
+        var artifacts = try await base.artifacts(for: requestedSnapshotID)
+        guard requestedSnapshotID == snapshotID else { return artifacts }
+        let manifest = CapturedArtifact(
+            kind: .metadata,
+            logicalName: "durable-checkpoint-v3.json",
+            data: manifestData
+        )
+        if let index = artifacts.firstIndex(where: {
+            $0.logicalName == manifest.logicalName
+        }) {
+            artifacts[index] = manifest
+        } else {
+            artifacts.append(manifest)
+        }
+        return artifacts
+    }
+
+    func artifact(
+        for requestedSnapshotID: SnapshotID,
+        logicalName: String
+    ) async throws -> CapturedArtifact {
+        if requestedSnapshotID == snapshotID,
+           logicalName == "durable-checkpoint-v3.json" {
+            return CapturedArtifact(
+                kind: .metadata,
+                logicalName: logicalName,
+                data: manifestData
+            )
+        }
+        return try await base.artifact(
+            for: requestedSnapshotID,
+            logicalName: logicalName
+        )
+    }
+
+    func switchBranch(to branchID: BranchID) async throws {
+        try await base.switchBranch(to: branchID)
+    }
+}
+
 public struct ColdProcessCommit: Hashable, Sendable {
     public let processIdentifier: Int32
     public let safetyTransactionRootURL: URL?
     public let retainedFileCount: Int
     public let retainedFileBytes: UInt64
+}
+
+public struct ColdProcessForestMember: Hashable, Sendable {
+    public let capturedProcessIdentifier: Int32
+    public let capturedParentProcessIdentifier: Int32
+    public let replacementProcessIdentifier: Int32
+    public let replacementParentProcessIdentifier: Int32?
+}
+
+public struct ColdProcessForestPreparation: Hashable, Sendable {
+    public let id: UUID
+    public let rootReplacementProcessIdentifier: Int32
+    public let members: [ColdProcessForestMember]
+    public let terminalPresentations: [ColdTerminalPresentation]
+}
+
+public struct ColdTerminalPresentation: Hashable, Sendable {
+    public let sessionIdentifier: UUID
+    public let socketPath: String
+    public let ttyIndex: UInt32
+}
+
+public struct ColdProcessForestCommit: Hashable, Sendable {
+    public let rootProcessIdentifier: Int32
+    public let processIdentifiers: [Int32]
 }
 
 public struct ColdFileSafetySnapshot: Hashable, Sendable {
@@ -74,6 +193,36 @@ public actor ColdProcessRestorer {
         let installedFiles: [LocalFileReplacement]
     }
 
+    private struct PreparedForest: @unchecked Sendable {
+        let rootCapturedProcessIdentifier: Int32
+        let preparationIdentifiers: [UUID]
+        let members: [ColdProcessForestMember]
+        let terminalPresentationSessionIdentifiers: [UUID]
+        let brokeredPair: OpaquePointer?
+    }
+
+    private struct PreparedPresentationMaster {
+        let ttyIndex: UInt32
+        let descriptor: Int32
+    }
+
+    private struct PreparedDescriptorGraph {
+        let remapsByCapturedProcess: [Int32: [continuum_spawn_descriptor_remap]]
+        let controllerDescriptors: [Int32]
+        let presentationMasters: [PreparedPresentationMaster]
+    }
+
+    private struct BrokerLaunchPreparation {
+        let descriptor: Int32
+        let remaps: [continuum_spawn_descriptor_remap]
+        let environment: [String]
+    }
+
+    private struct BrokerSessionAuthorization: @unchecked Sendable {
+        let pair: OpaquePointer
+        let role: continuum_brokered_process_role
+    }
+
     private struct ColdFileTransactionJournal: Codable, Sendable {
         struct Entry: Codable, Sendable {
             let originalPath: String
@@ -93,7 +242,9 @@ public actor ColdProcessRestorer {
 
     private let bootstrapLibraryPath: String?
     private let fileSafetyRootURL: URL
+    private let terminalPresentationRegistry: TerminalPresentationSessionRegistry?
     private var preparedReplacements: [UUID: PreparedReplacement] = [:]
+    private var preparedForests: [UUID: PreparedForest] = [:]
 
     public init(
         bootstrapLibraryURL: URL? = nil,
@@ -113,20 +264,738 @@ public actor ColdProcessRestorer {
                 .appendingPathComponent("libContinuumBootstrap.dylib")
                 .path
         }
+        self.terminalPresentationRegistry = try? TerminalPresentationSessionRegistry()
     }
 
     deinit {
-        for replacement in preparedReplacements.values {
-            _ = Self.killAndReap(replacement.processIdentifier)
+        let brokeredPreparationIdentifiers = Set(
+            preparedForests.values
+                .filter { $0.brokeredPair != nil }
+                .flatMap(\.preparationIdentifiers)
+        )
+        for pair in preparedForests.values.compactMap(\.brokeredPair) {
+            _ = continuum_brokered_pair_abort(pair, 5_000)
+        }
+        for (identifier, replacement) in preparedReplacements {
+            if !brokeredPreparationIdentifiers.contains(identifier) {
+                _ = Self.killAndReap(replacement.processIdentifier)
+            }
             continuum_remote_session_destroy(replacement.session)
             try? Self.rollbackFiles(replacement.fileRollback)
         }
+    }
+
+    public func prepareProcessForest(
+        from snapshotID: SnapshotID,
+        repository: any SnapshotRepository
+    ) async throws -> ColdProcessForestPreparation {
+        let manifest = try await repository.artifact(
+            for: snapshotID,
+            logicalName: "durable-checkpoint-v3.json"
+        )
+        let image: DurableCheckpointImage
+        do {
+            image = try JSONDecoder().decode(
+                DurableCheckpointImage.self,
+                from: manifest.data
+            )
+        } catch {
+            throw ContinuumError.integrityFailure(
+                "The durable checkpoint manifest is invalid."
+            )
+        }
+        try validate(image)
+        guard !image.members.isEmpty,
+              image.members.contains(where: {
+                  $0.processIdentifier == image.rootProcessIdentifier
+              }) else {
+            throw ContinuumError.integrityFailure(
+                "The durable process forest has no valid root member."
+            )
+        }
+        guard image.members.allSatisfy({ Self.processIsAbsent($0.processIdentifier) }) else {
+            throw ContinuumError.restoreUnavailable(
+                "Cold restoration requires every captured process to be fully exited."
+            )
+        }
+
+        let forestID = UUID()
+        let descriptorGraph = try prepareDescriptorGraph(for: image)
+        defer {
+            for descriptor in descriptorGraph.controllerDescriptors {
+                Darwin.close(descriptor)
+            }
+        }
+        var terminalPresentations: [ColdTerminalPresentation] = []
+        do {
+            if !descriptorGraph.presentationMasters.isEmpty,
+               terminalPresentationRegistry == nil {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not create its private terminal presentation service."
+                )
+            }
+            for presentation in descriptorGraph.presentationMasters {
+                guard let terminalPresentationRegistry else { continue }
+                let endpoint = try await terminalPresentationRegistry.stage(
+                    workloadPTYMaster: presentation.descriptor,
+                    forestIdentifier: forestID
+                )
+                terminalPresentations.append(ColdTerminalPresentation(
+                    sessionIdentifier: endpoint.sessionIdentifier,
+                    socketPath: endpoint.socketPath,
+                    ttyIndex: presentation.ttyIndex
+                ))
+            }
+        } catch {
+            for presentation in terminalPresentations {
+                try? await terminalPresentationRegistry?.discard(
+                    presentation.sessionIdentifier
+                )
+            }
+            throw error
+        }
+
+        var preparationIdentifiers: [UUID] = []
+        var members: [ColdProcessForestMember] = []
+        var brokeredPair: OpaquePointer?
+        do {
+            let orderedMembers = try Self.parentFirstMembers(image.members)
+            if orderedMembers.count == 2 {
+                let root = orderedMembers[0]
+                let child = orderedMembers[1]
+                guard root.processIdentifier == image.rootProcessIdentifier,
+                      child.parentProcessIdentifier == root.processIdentifier else {
+                    throw ContinuumError.restoreUnavailable(
+                        "The two-process restore component is not one root with one direct child."
+                    )
+                }
+                let prepared = try await prepareBrokeredPair(
+                    root: root,
+                    child: child,
+                    image: image,
+                    snapshotID: snapshotID,
+                    repository: repository,
+                    descriptorGraph: descriptorGraph
+                )
+                preparationIdentifiers = prepared.preparationIdentifiers
+                members = prepared.members
+                brokeredPair = prepared.pair
+            } else if orderedMembers.count == 1 {
+                let process = orderedMembers[0]
+                guard process.launchContract != nil else {
+                    throw ContinuumError.restoreUnavailable(
+                        "The captured process has no relaunch contract."
+                    )
+                }
+                let memberImage = DurableCheckpointImage(
+                    checkpointID: image.checkpointID,
+                    createdAt: image.createdAt,
+                    architecture: image.architecture,
+                    operatingSystemBuild: image.operatingSystemBuild,
+                    pageSize: image.pageSize,
+                    rootProcessIdentifier: process.processIdentifier,
+                    app: image.app,
+                    members: [process],
+                    writableFiles: image.writableFiles,
+                    writableFileDescriptors: image.writableFileDescriptors.filter {
+                        $0.processIdentifier == process.processIdentifier
+                    }
+                )
+                let encoded = try JSONEncoder().encode(memberImage)
+                let overlay = ManifestOverlayRepository(
+                    base: repository,
+                    snapshotID: snapshotID,
+                    manifestData: encoded
+                )
+                let preparation = try await prepareRootProcess(
+                    from: snapshotID,
+                    repository: overlay,
+                    descriptorRemaps: descriptorGraph.remapsByCapturedProcess[
+                        process.processIdentifier
+                    ] ?? []
+                )
+                preparationIdentifiers.append(preparation.id)
+                members.append(ColdProcessForestMember(
+                    capturedProcessIdentifier: process.processIdentifier,
+                    capturedParentProcessIdentifier: process.parentProcessIdentifier,
+                    replacementProcessIdentifier: preparation.replacementProcessIdentifier,
+                    replacementParentProcessIdentifier: Self.parentProcessIdentifier(
+                        for: preparation.replacementProcessIdentifier
+                    )
+                ))
+            } else {
+                throw ContinuumError.restoreUnavailable(
+                    "Cold restore currently preserves exact parentage for one root and one direct child. Deeper process forests are not certified yet."
+                )
+            }
+        } catch {
+            for preparationIdentifier in preparationIdentifiers.reversed() {
+                try? discard(preparationIdentifier)
+            }
+            for presentation in terminalPresentations {
+                try? await terminalPresentationRegistry?.discard(
+                    presentation.sessionIdentifier
+                )
+            }
+            throw error
+        }
+
+        guard let rootReplacement = members.first(where: {
+            $0.capturedProcessIdentifier == image.rootProcessIdentifier
+        })?.replacementProcessIdentifier else {
+            if let brokeredPair {
+                _ = continuum_brokered_pair_abort(brokeredPair, 5_000)
+            }
+            for preparationIdentifier in preparationIdentifiers.reversed() {
+                if brokeredPair == nil {
+                    try? discard(preparationIdentifier)
+                } else {
+                    try? discardBrokerAbortedReplacement(preparationIdentifier)
+                }
+            }
+            for presentation in terminalPresentations {
+                try? await terminalPresentationRegistry?.discard(
+                    presentation.sessionIdentifier
+                )
+            }
+            throw ContinuumError.integrityFailure(
+                "The durable process forest root was not prepared."
+            )
+        }
+        preparedForests[forestID] = PreparedForest(
+            rootCapturedProcessIdentifier: image.rootProcessIdentifier,
+            preparationIdentifiers: preparationIdentifiers,
+            members: members,
+            terminalPresentationSessionIdentifiers: terminalPresentations.map(
+                \.sessionIdentifier
+            ),
+            brokeredPair: brokeredPair
+        )
+        return ColdProcessForestPreparation(
+            id: forestID,
+            rootReplacementProcessIdentifier: rootReplacement,
+            members: members,
+            terminalPresentations: terminalPresentations
+        )
+    }
+
+    private func prepareBrokeredPair(
+        root: DurableProcessImage,
+        child: DurableProcessImage,
+        image: DurableCheckpointImage,
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository,
+        descriptorGraph: PreparedDescriptorGraph
+    ) async throws -> (
+        preparationIdentifiers: [UUID],
+        members: [ColdProcessForestMember],
+        pair: OpaquePointer
+    ) {
+        guard let bootstrapLibraryPath,
+              let rootLaunch = root.launchContract,
+              let childLaunch = child.launchContract,
+              let rootTopology = root.topology,
+              let childTopology = child.topology else {
+            throw ContinuumError.restoreUnavailable(
+                "The two-process restore component is missing launch or kernel-topology state."
+            )
+        }
+        guard rootTopology.sessionIdentifier == root.processIdentifier,
+              rootTopology.processGroupIdentifier == root.processIdentifier,
+              childTopology.sessionIdentifier == root.processIdentifier,
+              childTopology.processGroupIdentifier == root.processIdentifier
+                || childTopology.processGroupIdentifier == child.processIdentifier,
+              rootTopology.foregroundProcessGroupIdentifier
+                == childTopology.foregroundProcessGroupIdentifier,
+              rootTopology.foregroundProcessGroupIdentifier
+                == root.processIdentifier
+                || rootTopology.foregroundProcessGroupIdentifier
+                    == child.processIdentifier else {
+            throw ContinuumError.restoreUnavailable(
+                "The captured two-process session cannot be mapped exactly by the current launch broker."
+            )
+        }
+        let rootPTYSlaves = (image.ptyDescriptors ?? []).filter {
+            $0.processIdentifier == root.processIdentifier && $0.role == .slave
+        }
+        if !(image.ptyDescriptors ?? []).isEmpty, rootPTYSlaves.isEmpty {
+            throw ContinuumError.restoreUnavailable(
+                "The session leader has no captured PTY slave for controlling-terminal restoration."
+            )
+        }
+        let controllingTerminalDescriptor = rootPTYSlaves
+            .map(\.fileDescriptor)
+            .sorted()
+            .first ?? -1
+
+        let rootLaunchPreparation = try makeBrokerLaunchPreparation(
+            launch: rootLaunch,
+            remaps: descriptorGraph.remapsByCapturedProcess[
+                root.processIdentifier
+            ] ?? []
+        )
+        let childLaunchPreparation = try makeBrokerLaunchPreparation(
+            launch: childLaunch,
+            remaps: descriptorGraph.remapsByCapturedProcess[
+                child.processIdentifier
+            ] ?? []
+        )
+        var ownsRootDescriptor = true
+        var ownsChildDescriptor = true
+        defer {
+            if ownsRootDescriptor {
+                Darwin.close(rootLaunchPreparation.descriptor)
+            }
+            if ownsChildDescriptor {
+                Darwin.close(childLaunchPreparation.descriptor)
+            }
+        }
+
+        var pair: OpaquePointer?
+        let prepareStatus = rootLaunchPreparation.remaps.withUnsafeBufferPointer {
+            rootRemaps in
+            childLaunchPreparation.remaps.withUnsafeBufferPointer {
+                childRemaps in
+                Self.withCStringArray(rootLaunch.arguments) { rootArguments in
+                    Self.withCStringArray(rootLaunchPreparation.environment) {
+                        rootEnvironment in
+                        Self.withCStringArray(childLaunch.arguments) {
+                            childArguments in
+                            Self.withCStringArray(
+                                childLaunchPreparation.environment
+                            ) { childEnvironment in
+                                var rootSpec = continuum_brokered_process_spec()
+                                rootSpec.structure_size = UInt32(
+                                    MemoryLayout<continuum_brokered_process_spec>.size
+                                )
+                                rootSpec.captured_process_id = root.processIdentifier
+                                rootSpec.captured_process_group_id =
+                                    rootTopology.processGroupIdentifier
+                                rootSpec.foreground_process_group_id =
+                                    rootTopology.foregroundProcessGroupIdentifier
+                                rootSpec.arguments = rootArguments
+                                rootSpec.environment = rootEnvironment
+                                rootSpec.descriptor_remaps = rootRemaps.baseAddress
+                                rootSpec.descriptor_remap_count = rootRemaps.count
+                                rootSpec.topology = continuum_spawn_process_topology(
+                                    structure_size: UInt32(
+                                        MemoryLayout<continuum_spawn_process_topology>.size
+                                    ),
+                                    create_session: 1,
+                                    process_group_policy:
+                                        CONTINUUM_SPAWN_PROCESS_GROUP_CREATE,
+                                    process_group_id: 0,
+                                    controlling_terminal_descriptor:
+                                        controllingTerminalDescriptor
+                                )
+                                rootSpec.disable_aslr = rootLaunch.addressSpacePolicy
+                                        == .continuumDeterministic ? 1 : 0
+
+                                var childSpec = continuum_brokered_process_spec()
+                                childSpec.structure_size = rootSpec.structure_size
+                                childSpec.captured_process_id = child.processIdentifier
+                                childSpec.captured_process_group_id =
+                                    childTopology.processGroupIdentifier
+                                childSpec.foreground_process_group_id =
+                                    childTopology.foregroundProcessGroupIdentifier
+                                childSpec.arguments = childArguments
+                                childSpec.environment = childEnvironment
+                                childSpec.descriptor_remaps = childRemaps.baseAddress
+                                childSpec.descriptor_remap_count = childRemaps.count
+                                childSpec.topology = continuum_spawn_process_topology(
+                                    structure_size: UInt32(
+                                        MemoryLayout<continuum_spawn_process_topology>.size
+                                    ),
+                                    create_session: 0,
+                                    process_group_policy:
+                                        childTopology.processGroupIdentifier
+                                            == root.processIdentifier
+                                        ? CONTINUUM_SPAWN_PROCESS_GROUP_JOIN
+                                        : CONTINUUM_SPAWN_PROCESS_GROUP_CREATE,
+                                    process_group_id:
+                                        childTopology.processGroupIdentifier
+                                            == root.processIdentifier
+                                        ? root.processIdentifier : 0,
+                                    controlling_terminal_descriptor: -1
+                                )
+                                childSpec.disable_aslr =
+                                    childLaunch.addressSpacePolicy
+                                        == .continuumDeterministic ? 1 : 0
+                                return rootLaunch.executablePath.withCString {
+                                    rootExecutable in
+                                    rootLaunch.workingDirectory.withCString {
+                                        rootDirectory in
+                                        childLaunch.executablePath.withCString {
+                                            childExecutable in
+                                            childLaunch.workingDirectory.withCString {
+                                                childDirectory in
+                                                rootSpec.executable_path = rootExecutable
+                                                rootSpec.working_directory = rootDirectory
+                                                childSpec.executable_path = childExecutable
+                                                childSpec.working_directory = childDirectory
+                                                return bootstrapLibraryPath.withCString {
+                                                    continuum_brokered_pair_prepare(
+                                                        $0,
+                                                        &rootSpec,
+                                                        &childSpec,
+                                                        &pair
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try requireRuntimeOK(
+            prepareStatus,
+            operation: "prepare the exact parent/child launch broker"
+        )
+        guard let pair else {
+            throw ContinuumError.restoreUnavailable(
+                "The launch broker returned no prepared process pair."
+            )
+        }
+        var rootReplacement: Int32 = 0
+        var childReplacement: Int32 = 0
+        let identifierStatus = continuum_brokered_pair_process_identifiers(
+            pair,
+            &rootReplacement,
+            &childReplacement
+        )
+        guard identifierStatus == CONTINUUM_STATUS_OK else {
+            _ = continuum_brokered_pair_abort(pair, 5_000)
+            try requireRuntimeOK(
+                identifierStatus,
+                operation: "read the brokered process identities"
+            )
+            throw ContinuumError.restoreUnavailable(
+                "The launch broker returned invalid process identities."
+            )
+        }
+        let advanceStatus = continuum_brokered_pair_advance_to_entry_stops(
+            pair,
+            10_000
+        )
+        guard advanceStatus == CONTINUUM_STATUS_OK else {
+            _ = continuum_brokered_pair_abort(pair, 5_000)
+            try requireRuntimeOK(
+                advanceStatus,
+                operation: "advance the brokered process pair to entry stops"
+            )
+            throw ContinuumError.restoreUnavailable(
+                "The launch broker did not reach its entry stops."
+            )
+        }
+
+        var preparationIdentifiers: [UUID] = []
+        do {
+            let rootOverlay = try memberOverlay(
+                root,
+                image: image,
+                snapshotID: snapshotID,
+                repository: repository
+            )
+            ownsRootDescriptor = false
+            let rootPreparation = try await prepareRootProcess(
+                from: snapshotID,
+                repository: rootOverlay,
+                descriptorRemaps: rootLaunchPreparation.remaps,
+                prelaunchedProcessIdentifier: rootReplacement,
+                prelaunchedBootstrapDescriptor:
+                    rootLaunchPreparation.descriptor,
+                brokerAuthorization: BrokerSessionAuthorization(
+                    pair: pair,
+                    role: CONTINUUM_BROKERED_PROCESS_ROOT
+                )
+            )
+            preparationIdentifiers.append(rootPreparation.id)
+
+            let childOverlay = try memberOverlay(
+                child,
+                image: image,
+                snapshotID: snapshotID,
+                repository: repository
+            )
+            ownsChildDescriptor = false
+            let childPreparation = try await prepareRootProcess(
+                from: snapshotID,
+                repository: childOverlay,
+                descriptorRemaps: childLaunchPreparation.remaps,
+                prelaunchedProcessIdentifier: childReplacement,
+                prelaunchedBootstrapDescriptor:
+                    childLaunchPreparation.descriptor,
+                brokerAuthorization: BrokerSessionAuthorization(
+                    pair: pair,
+                    role: CONTINUUM_BROKERED_PROCESS_CHILD
+                )
+            )
+            preparationIdentifiers.append(childPreparation.id)
+            return (
+                preparationIdentifiers,
+                [
+                    ColdProcessForestMember(
+                        capturedProcessIdentifier: root.processIdentifier,
+                        capturedParentProcessIdentifier:
+                            root.parentProcessIdentifier,
+                        replacementProcessIdentifier: rootReplacement,
+                        replacementParentProcessIdentifier:
+                            Self.parentProcessIdentifier(for: rootReplacement)
+                    ),
+                    ColdProcessForestMember(
+                        capturedProcessIdentifier: child.processIdentifier,
+                        capturedParentProcessIdentifier:
+                            child.parentProcessIdentifier,
+                        replacementProcessIdentifier: childReplacement,
+                        replacementParentProcessIdentifier:
+                            Self.parentProcessIdentifier(for: childReplacement)
+                    ),
+                ],
+                pair
+            )
+        } catch {
+            _ = continuum_brokered_pair_abort(pair, 5_000)
+            for identifier in preparationIdentifiers.reversed() {
+                try? discardBrokerAbortedReplacement(identifier)
+            }
+            throw error
+        }
+    }
+
+    private func makeBrokerLaunchPreparation(
+        launch: DurableLaunchContract,
+        remaps: [continuum_spawn_descriptor_remap]
+    ) throws -> BrokerLaunchPreparation {
+        var template = Array(
+            "/private/tmp/com.midas.continuum-broker-XXXXXX".utf8CString
+        )
+        var descriptor = template.withUnsafeMutableBufferPointer { buffer in
+            mkstemp(buffer.baseAddress)
+        }
+        guard descriptor >= 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not create a private broker descriptor."
+            )
+        }
+        _ = template.withUnsafeBufferPointer { buffer in
+            unlink(buffer.baseAddress)
+        }
+        var retained = false
+        defer {
+            if !retained { Darwin.close(descriptor) }
+        }
+        let maximum = remaps.reduce(Int32(255)) {
+            max($0, $1.source_descriptor, $1.target_descriptor)
+        }
+        if remaps.contains(where: {
+            $0.source_descriptor == descriptor
+                || $0.target_descriptor == descriptor
+        }) {
+            let relocated = fcntl(descriptor, F_DUPFD_CLOEXEC, maximum + 1)
+            guard relocated >= 0 else {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not isolate its broker descriptor."
+                )
+            }
+            Darwin.close(descriptor)
+            descriptor = relocated
+        }
+        let plan = try Self.bootstrapDescriptorPlan([])
+        try Self.writeBootstrapDescriptorPlan(plan, to: descriptor)
+        var brokerRemaps = remaps
+        brokerRemaps.append(continuum_spawn_descriptor_remap(
+            source_descriptor: descriptor,
+            target_descriptor: descriptor
+        ))
+        var environment = launch.environment.filter {
+            !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
+                && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD=")
+                && !$0.hasPrefix("CONTINUUM_BROKER_")
+        }
+        environment.append("CONTINUUM_BOOTSTRAP_STOP=1")
+        environment.append("CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD=\(descriptor)")
+        retained = true
+        return BrokerLaunchPreparation(
+            descriptor: descriptor,
+            remaps: brokerRemaps,
+            environment: environment
+        )
+    }
+
+    private func memberOverlay(
+        _ process: DurableProcessImage,
+        image: DurableCheckpointImage,
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository
+    ) throws -> ManifestOverlayRepository {
+        let memberImage = DurableCheckpointImage(
+            checkpointID: image.checkpointID,
+            createdAt: image.createdAt,
+            architecture: image.architecture,
+            operatingSystemBuild: image.operatingSystemBuild,
+            pageSize: image.pageSize,
+            rootProcessIdentifier: process.processIdentifier,
+            app: image.app,
+            members: [process],
+            writableFiles: image.writableFiles,
+            writableFileDescriptors: image.writableFileDescriptors.filter {
+                $0.processIdentifier == process.processIdentifier
+            }
+        )
+        return ManifestOverlayRepository(
+            base: repository,
+            snapshotID: snapshotID,
+            manifestData: try JSONEncoder().encode(memberImage)
+        )
+    }
+
+    public func waitUntilTerminalPresentationReady(
+        _ sessionIdentifier: UUID,
+        timeout: Duration = .seconds(5)
+    ) async throws {
+        guard let terminalPresentationRegistry else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum's terminal presentation service is unavailable."
+            )
+        }
+        try await terminalPresentationRegistry.waitUntilReady(
+            sessionIdentifier,
+            timeout: timeout
+        )
+    }
+
+    public func discardProcessForest(_ forestID: UUID) async throws {
+        guard let forest = preparedForests.removeValue(forKey: forestID) else {
+            return
+        }
+        var firstError: Error?
+        if let pair = forest.brokeredPair {
+            let status = continuum_brokered_pair_abort(pair, 5_000)
+            if status != CONTINUUM_STATUS_OK {
+                firstError = ContinuumError.restoreUnavailable(
+                    "Continuum could not abort the brokered replacement forest."
+                )
+            }
+        }
+        for preparationIdentifier in forest.preparationIdentifiers.reversed() {
+            do {
+                if forest.brokeredPair == nil {
+                    try discard(preparationIdentifier)
+                } else {
+                    try discardBrokerAbortedReplacement(preparationIdentifier)
+                }
+            } catch where firstError == nil {
+                firstError = error
+            } catch {}
+        }
+        for sessionIdentifier in forest.terminalPresentationSessionIdentifiers {
+            do {
+                try await terminalPresentationRegistry?.discard(sessionIdentifier)
+            } catch where firstError == nil {
+                firstError = error
+            } catch {}
+        }
+        if let firstError { throw firstError }
+    }
+
+    public func commitProcessForest(
+        _ forestID: UUID
+    ) async throws -> ColdProcessForestCommit {
+        guard let forest = preparedForests[forestID] else {
+            throw ContinuumError.restoreUnavailable(
+                "The prepared process forest no longer exists."
+            )
+        }
+        var committedProcessIdentifiers: [Int32] = []
+        do {
+            for preparationIdentifier in forest.preparationIdentifiers.reversed() {
+                let committed = try commit(preparationIdentifier)
+                committedProcessIdentifiers.append(committed.processIdentifier)
+                if let pair = forest.brokeredPair {
+                    try requireRuntimeOK(
+                        continuum_brokered_pair_note_released_process(
+                            pair,
+                            committed.processIdentifier
+                        ),
+                        operation: "record the brokered replacement release"
+                    )
+                }
+            }
+            for sessionIdentifier in forest.terminalPresentationSessionIdentifiers {
+                try await terminalPresentationRegistry?.promote(sessionIdentifier)
+            }
+            if let pair = forest.brokeredPair {
+                try requireRuntimeOK(
+                    continuum_brokered_pair_finish(pair),
+                    operation: "finish the brokered replacement forest"
+                )
+            }
+        } catch {
+            if let pair = forest.brokeredPair {
+                _ = continuum_brokered_pair_abort(pair, 5_000)
+            } else {
+                for processIdentifier in committedProcessIdentifiers {
+                    _ = Self.killAndReap(processIdentifier)
+                }
+            }
+            for preparationIdentifier in forest.preparationIdentifiers.reversed() {
+                if forest.brokeredPair == nil {
+                    try? discard(preparationIdentifier)
+                } else {
+                    try? discardBrokerAbortedReplacement(preparationIdentifier)
+                }
+            }
+            for sessionIdentifier in forest.terminalPresentationSessionIdentifiers {
+                try? await terminalPresentationRegistry?.discard(sessionIdentifier)
+            }
+            preparedForests.removeValue(forKey: forestID)
+            throw error
+        }
+        preparedForests.removeValue(forKey: forestID)
+        guard let rootProcessIdentifier = forest.members.first(where: {
+            $0.capturedProcessIdentifier == forest.rootCapturedProcessIdentifier
+        })?.replacementProcessIdentifier else {
+            for processIdentifier in committedProcessIdentifiers {
+                _ = Self.killAndReap(processIdentifier)
+            }
+            throw ContinuumError.integrityFailure(
+                "The committed process forest lost its root mapping."
+            )
+        }
+        return ColdProcessForestCommit(
+            rootProcessIdentifier: rootProcessIdentifier,
+            processIdentifiers: committedProcessIdentifiers
+        )
     }
 
     public func prepareRootProcess(
         from snapshotID: SnapshotID,
         repository: any SnapshotRepository
     ) async throws -> ColdProcessPreparation {
+        try await prepareRootProcess(
+            from: snapshotID,
+            repository: repository,
+            descriptorRemaps: []
+        )
+    }
+
+    private func prepareRootProcess(
+        from snapshotID: SnapshotID,
+        repository: any SnapshotRepository,
+        descriptorRemaps: [continuum_spawn_descriptor_remap],
+        prelaunchedProcessIdentifier: Int32? = nil,
+        prelaunchedBootstrapDescriptor: Int32? = nil,
+        brokerAuthorization: BrokerSessionAuthorization? = nil
+    ) async throws -> ColdProcessPreparation {
+        defer {
+            if let prelaunchedBootstrapDescriptor {
+                Darwin.close(prelaunchedBootstrapDescriptor)
+            }
+        }
         let manifest = try await repository.artifact(
             for: snapshotID,
             logicalName: "durable-checkpoint-v3.json"
@@ -160,9 +1029,19 @@ public actor ColdProcessRestorer {
                 "Continuum's pre-main restore bootstrap is missing."
             )
         }
-        if process.threads.contains(where: {
-            $0.isUserspaceSafepoint == true
+        // A safepoint is required for every armed process, including command-
+        // line helpers. It does not by itself make a process a GUI. Only a
+        // process whose captured image contains derived graphics mappings must
+        // take the AppKit/WindowServer rehydration route; ordinary helpers use
+        // the full pre-main memory and thread reconstruction path.
+        if process.regions.contains(where: {
+            $0.preservesLiveDerivedGraphics == true
         }) {
+            guard descriptorRemaps.isEmpty else {
+                throw ContinuumError.restoreUnavailable(
+                    "A derived GUI process still owns a live stream that Continuum cannot reconnect yet."
+                )
+            }
             return try await prepareRehydratedRootProcess(
                 process: process,
                 launch: launch,
@@ -190,8 +1069,17 @@ public actor ColdProcessRestorer {
         defer {
             try? FileManager.default.removeItem(at: descriptorDirectory)
         }
-        let descriptor: Int32
-        do {
+        var descriptor: Int32
+        if let prelaunchedBootstrapDescriptor {
+            guard prelaunchedProcessIdentifier != nil,
+                  prelaunchedBootstrapDescriptor >= 0 else {
+                throw ContinuumError.restoreUnavailable(
+                    "The brokered replacement has no private bootstrap descriptor."
+                )
+            }
+            descriptor = prelaunchedBootstrapDescriptor
+        } else {
+            do {
             try FileManager.default.createDirectory(
                 at: descriptorDirectory,
                 withIntermediateDirectories: false,
@@ -213,26 +1101,55 @@ public actor ColdProcessRestorer {
                     "Continuum could not create its private bootstrap descriptor."
                 )
             }
-        } catch let error as ContinuumError {
-            throw error
-        } catch {
-            throw ContinuumError.restoreUnavailable(
-                "Continuum could not create its private bootstrap descriptor."
-            )
+            } catch let error as ContinuumError {
+                throw error
+            } catch {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not create its private bootstrap descriptor."
+                )
+            }
         }
-        defer { Darwin.close(descriptor) }
+        defer {
+            if prelaunchedBootstrapDescriptor == nil {
+                Darwin.close(descriptor)
+            }
+        }
+
+        if prelaunchedBootstrapDescriptor == nil,
+           descriptorRemaps.contains(where: {
+            $0.source_descriptor == descriptor
+                || $0.target_descriptor == descriptor
+        }) {
+            let maximumRemapDescriptor = descriptorRemaps.reduce(Int32(255)) {
+                max($0, $1.source_descriptor, $1.target_descriptor)
+            }
+            let relocated = fcntl(
+                descriptor,
+                F_DUPFD_CLOEXEC,
+                maximumRemapDescriptor + 1
+            )
+            guard relocated >= 0 else {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not isolate its private bootstrap descriptor from restored descriptors."
+                )
+            }
+            Darwin.close(descriptor)
+            descriptor = relocated
+        }
 
         // File state is intentionally outside the cold-rewind boundary.
         // Recreating captured writable descriptors would couple a process
         // restore to stale vnode identities and can mutate current files.
         let rootDescriptors: [DurableWritableFileDescriptor] = []
-        let descriptorPlan = try Self.bootstrapDescriptorPlan(
-            rootDescriptors
-        )
-        try Self.writeBootstrapDescriptorPlan(
-            descriptorPlan,
-            to: descriptor
-        )
+        if prelaunchedBootstrapDescriptor == nil {
+            let descriptorPlan = try Self.bootstrapDescriptorPlan(
+                rootDescriptors
+            )
+            try Self.writeBootstrapDescriptorPlan(
+                descriptorPlan,
+                to: descriptor
+            )
+        }
 
         var localBootstrapIdentity = continuum_bootstrap_identity()
         try requireRuntimeOK(
@@ -280,34 +1197,41 @@ public actor ColdProcessRestorer {
             "DYLD_INSERT_LIBRARIES=\(insertedLibraries.joined(separator: ":"))"
         )
 
-        var replacementProcessIdentifier: Int32 = 0
-        let spawnStatus = Self.withCStringArray(launch.arguments) { arguments in
-            Self.withCStringArray(environment) { environmentEntries in
-                launch.executablePath.withCString { executable in
-                    launch.workingDirectory.withCString { directory in
-                        if usesDeterministicAddressSpace {
-                            continuum_spawn_process_suspended_with_inherited_descriptor(
-                                executable,
-                                arguments,
-                                environmentEntries,
-                                directory,
-                                descriptor,
-                                &replacementProcessIdentifier
-                            )
-                        } else {
-                            continuum_spawn_process_suspended_with_inherited_descriptor_system_aslr(
-                                executable,
-                                arguments,
-                                environmentEntries,
-                                directory,
-                                descriptor,
-                                &replacementProcessIdentifier
-                            )
+        var replacementProcessIdentifier = prelaunchedProcessIdentifier ?? 0
+        let spawnStatus: continuum_status = prelaunchedProcessIdentifier == nil
+            ? descriptorRemaps.withUnsafeBufferPointer { remaps in
+            Self.withCStringArray(launch.arguments) { arguments in
+                Self.withCStringArray(environment) { environmentEntries in
+                    launch.executablePath.withCString { executable in
+                        launch.workingDirectory.withCString { directory in
+                            if usesDeterministicAddressSpace {
+                                continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps(
+                                    executable,
+                                    arguments,
+                                    environmentEntries,
+                                    directory,
+                                    descriptor,
+                                    remaps.baseAddress,
+                                    remaps.count,
+                                    &replacementProcessIdentifier
+                                )
+                            } else {
+                                continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps_system_aslr(
+                                    executable,
+                                    arguments,
+                                    environmentEntries,
+                                    directory,
+                                    descriptor,
+                                    remaps.baseAddress,
+                                    remaps.count,
+                                    &replacementProcessIdentifier
+                                )
+                            }
                         }
                     }
                 }
             }
-        }
+            } : CONTINUUM_STATUS_OK
         try requireRuntimeOK(spawnStatus, operation: "launch a cold replacement")
 
         var session: OpaquePointer?
@@ -320,13 +1244,15 @@ public actor ColdProcessRestorer {
                 }
             }
         }
-        try requireRuntimeOK(
-            continuum_advance_process_to_entry_stop(
-                replacementProcessIdentifier,
-                5_000
-            ),
-            operation: "reach Continuum's executable-entry restore boundary"
-        )
+        if prelaunchedProcessIdentifier == nil {
+            try requireRuntimeOK(
+                continuum_advance_process_to_entry_stop(
+                    replacementProcessIdentifier,
+                    5_000
+                ),
+                operation: "reach Continuum's executable-entry restore boundary"
+            )
+        }
         var bootstrapIdentity = try Self.bootstrapIdentity(
             from: descriptor,
             expectedProcessIdentifier: replacementProcessIdentifier,
@@ -340,6 +1266,16 @@ public actor ColdProcessRestorer {
         guard let session else {
             throw ContinuumError.restoreUnavailable(
                 "The replacement process did not expose a task session."
+            )
+        }
+        if let brokerAuthorization {
+            try requireRuntimeOK(
+                continuum_brokered_pair_authorize_remote_session(
+                    brokerAuthorization.pair,
+                    session,
+                    brokerAuthorization.role
+                ),
+                operation: "authorize the brokered replacement stop"
             )
         }
         try requireRuntimeOK(
@@ -780,7 +1716,8 @@ public actor ColdProcessRestorer {
             reconstructedThreadStateBytes: threadStateBytes,
             replacementThreadIdentifier:
                 threadReport.primary_replacement_thread_identifier,
-            reconstructedFileDescriptorCount: rootDescriptors.count,
+            reconstructedFileDescriptorCount:
+                rootDescriptors.count + descriptorRemaps.count,
             reconstructedFileCount: fileRollback?.replacedFileCount ?? 0,
             reconstructedFileBytes: fileRollback?.replacedBytes ?? 0
         )
@@ -1138,6 +2075,23 @@ public actor ColdProcessRestorer {
         } catch {
             throw ContinuumError.integrityFailure(
                 "Continuum stopped the replacement but could not restore the pre-restore files. The safety root remains at \(replacement.fileRollback?.rootURL.path ?? "no file transaction")."
+            )
+        }
+        continuum_remote_session_destroy(replacement.session)
+        preparedReplacements.removeValue(forKey: preparationID)
+    }
+
+    private func discardBrokerAbortedReplacement(
+        _ preparationID: UUID
+    ) throws {
+        guard let replacement = preparedReplacements[preparationID] else {
+            return
+        }
+        do {
+            try Self.rollbackFiles(replacement.fileRollback)
+        } catch {
+            throw ContinuumError.integrityFailure(
+                "Continuum aborted the replacement forest but could not restore its pre-restore files. The safety root remains at \(replacement.fileRollback?.rootURL.path ?? "no file transaction")."
             )
         }
         continuum_remote_session_destroy(replacement.session)
@@ -1515,6 +2469,367 @@ public actor ColdProcessRestorer {
         }
     }
 
+    private func prepareDescriptorGraph(
+        for image: DurableCheckpointImage
+    ) throws -> PreparedDescriptorGraph {
+        let endpoints = image.establishedTCPEndpoints ?? []
+        let ptyDescriptors = image.ptyDescriptors ?? []
+        guard !endpoints.isEmpty || !ptyDescriptors.isEmpty else {
+            return PreparedDescriptorGraph(
+                remapsByCapturedProcess: [:],
+                controllerDescriptors: [],
+                presentationMasters: []
+            )
+        }
+
+        let capturedProcesses = Set(image.members.map(\.processIdentifier))
+        var targetDescriptorsByProcess: [Int32: Set<Int32>] = [:]
+        for endpoint in endpoints {
+            guard capturedProcesses.contains(endpoint.processIdentifier),
+                  endpoint.fileDescriptor >= 0,
+                  targetDescriptorsByProcess[endpoint.processIdentifier,
+                    default: []].insert(endpoint.fileDescriptor).inserted else {
+                throw ContinuumError.integrityFailure(
+                    "The durable TCP graph contains an invalid or duplicate descriptor."
+                )
+            }
+        }
+        for descriptor in ptyDescriptors {
+            guard capturedProcesses.contains(descriptor.processIdentifier),
+                  descriptor.fileDescriptor >= 0,
+                  targetDescriptorsByProcess[descriptor.processIdentifier,
+                    default: []].insert(descriptor.fileDescriptor).inserted else {
+                throw ContinuumError.integrityFailure(
+                    "The durable PTY graph contains an invalid or duplicate descriptor."
+                )
+            }
+        }
+
+        let maximumTarget = (endpoints.map(\.fileDescriptor)
+            + ptyDescriptors.map(\.fileDescriptor)).max() ?? 255
+        let descriptorCount = endpoints.count + ptyDescriptors.count
+        guard maximumTarget < Int32.max - Int32(descriptorCount * 2 + 16) else {
+            throw ContinuumError.integrityFailure(
+                "The durable TCP descriptor numbers exceed process limits."
+            )
+        }
+        var nextControllerDescriptor = max(Int32(256), maximumTarget + 1)
+        var remaining = Set(endpoints.indices)
+        var remapsByProcess: [Int32: [continuum_spawn_descriptor_remap]] = [:]
+        var controllerDescriptors: [Int32] = []
+        var presentationMasters: [PreparedPresentationMaster] = []
+
+        func closeControllerDescriptors() {
+            for descriptor in controllerDescriptors {
+                Darwin.close(descriptor)
+            }
+        }
+
+        do {
+            while let firstIndex = remaining.min() {
+                let first = endpoints[firstIndex]
+                let matches = remaining.filter { candidateIndex in
+                    guard candidateIndex != firstIndex else { return false }
+                    let candidate = endpoints[candidateIndex]
+                    return candidate.domain == first.domain
+                        && candidate.socketType == first.socketType
+                        && candidate.socketProtocol == first.socketProtocol
+                        && candidate.localAddress == first.remoteAddress
+                        && candidate.remoteAddress == first.localAddress
+                }
+                guard matches.count == 1, let secondIndex = matches.first else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved TCP stream has no unique local peer in this snapshot."
+                    )
+                }
+                let second = endpoints[secondIndex]
+                var firstRuntime = try Self.runtimeTCPEndpoint(first)
+                var secondRuntime = try Self.runtimeTCPEndpoint(second)
+                var firstDescriptor: Int32 = -1
+                var secondDescriptor: Int32 = -1
+                let status = continuum_recreate_closed_loopback_tcp_pair(
+                    &firstRuntime,
+                    &secondRuntime,
+                    &firstDescriptor,
+                    &secondDescriptor
+                )
+                guard status == CONTINUUM_STATUS_OK,
+                      firstDescriptor >= 0,
+                      secondDescriptor >= 0 else {
+                    if firstDescriptor >= 0 { Darwin.close(firstDescriptor) }
+                    if secondDescriptor >= 0 { Darwin.close(secondDescriptor) }
+                    let detail = continuum_status_string(status).map {
+                        String(cString: $0)
+                    } ?? "status \(status.rawValue)"
+                    throw ContinuumError.restoreUnavailable(
+                        "Continuum could not recreate a closed local TCP stream: \(detail)."
+                    )
+                }
+
+                let promotedFirst = fcntl(
+                    firstDescriptor,
+                    F_DUPFD_CLOEXEC,
+                    nextControllerDescriptor
+                )
+                if promotedFirst >= 0 {
+                    nextControllerDescriptor = promotedFirst + 1
+                }
+                let promotedSecond = promotedFirst < 0 ? -1 : fcntl(
+                    secondDescriptor,
+                    F_DUPFD_CLOEXEC,
+                    nextControllerDescriptor
+                )
+                Darwin.close(firstDescriptor)
+                Darwin.close(secondDescriptor)
+                guard promotedFirst >= 0, promotedSecond >= 0 else {
+                    if promotedFirst >= 0 { Darwin.close(promotedFirst) }
+                    if promotedSecond >= 0 { Darwin.close(promotedSecond) }
+                    throw ContinuumError.restoreUnavailable(
+                        "Continuum could not isolate recreated TCP descriptors for relaunch."
+                    )
+                }
+                nextControllerDescriptor = promotedSecond + 1
+                controllerDescriptors.append(contentsOf: [
+                    promotedFirst, promotedSecond,
+                ])
+
+                var firstRemap = continuum_spawn_descriptor_remap()
+                firstRemap.source_descriptor = promotedFirst
+                firstRemap.target_descriptor = first.fileDescriptor
+                remapsByProcess[first.processIdentifier, default: []].append(
+                    firstRemap
+                )
+                var secondRemap = continuum_spawn_descriptor_remap()
+                secondRemap.source_descriptor = promotedSecond
+                secondRemap.target_descriptor = second.fileDescriptor
+                remapsByProcess[second.processIdentifier, default: []].append(
+                    secondRemap
+                )
+                remaining.remove(firstIndex)
+                remaining.remove(secondIndex)
+            }
+
+            let descriptorsByTTY = Dictionary(
+                grouping: ptyDescriptors,
+                by: \.ttyIndex
+            )
+            for ttyIndex in descriptorsByTTY.keys.sorted() {
+                guard let descriptors = descriptorsByTTY[ttyIndex],
+                      let slave = descriptors.first(where: { $0.role == .slave }) else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved PTY has no workload-side slave in this snapshot."
+                    )
+                }
+                var runtimeSlave = try Self.runtimePTYDescriptor(slave)
+                var masterDescriptor: Int32 = -1
+                var slaveDescriptor: Int32 = -1
+                let capturedMaster = descriptors.first(where: { $0.role == .master })
+                let status: continuum_status
+                if let capturedMaster {
+                    var runtimeMaster = try Self.runtimePTYDescriptor(capturedMaster)
+                    status = continuum_recreate_closed_pty_pair(
+                        &runtimeMaster,
+                        &runtimeSlave,
+                        &masterDescriptor,
+                        &slaveDescriptor
+                    )
+                } else {
+                    status = continuum_recreate_closed_pty_from_slave(
+                        &runtimeSlave,
+                        &masterDescriptor,
+                        &slaveDescriptor
+                    )
+                }
+                guard status == CONTINUUM_STATUS_OK,
+                      masterDescriptor >= 0,
+                      slaveDescriptor >= 0 else {
+                    if masterDescriptor >= 0 { Darwin.close(masterDescriptor) }
+                    if slaveDescriptor >= 0 { Darwin.close(slaveDescriptor) }
+                    let detail = continuum_status_string(status).map {
+                        String(cString: $0)
+                    } ?? "status \(status.rawValue)"
+                    throw ContinuumError.restoreUnavailable(
+                        "Continuum could not recreate a closed terminal stream: \(detail)."
+                    )
+                }
+
+                let promotedMaster = fcntl(
+                    masterDescriptor,
+                    F_DUPFD_CLOEXEC,
+                    nextControllerDescriptor
+                )
+                if promotedMaster >= 0 {
+                    nextControllerDescriptor = promotedMaster + 1
+                }
+                let promotedSlave = promotedMaster < 0 ? -1 : fcntl(
+                    slaveDescriptor,
+                    F_DUPFD_CLOEXEC,
+                    nextControllerDescriptor
+                )
+                Darwin.close(masterDescriptor)
+                Darwin.close(slaveDescriptor)
+                guard promotedMaster >= 0, promotedSlave >= 0 else {
+                    if promotedMaster >= 0 { Darwin.close(promotedMaster) }
+                    if promotedSlave >= 0 { Darwin.close(promotedSlave) }
+                    throw ContinuumError.restoreUnavailable(
+                        "Continuum could not isolate recreated PTY descriptors for relaunch."
+                    )
+                }
+                nextControllerDescriptor = promotedSlave + 1
+                controllerDescriptors.append(contentsOf: [
+                    promotedMaster, promotedSlave,
+                ])
+                if capturedMaster == nil {
+                    presentationMasters.append(PreparedPresentationMaster(
+                        ttyIndex: ttyIndex,
+                        descriptor: promotedMaster
+                    ))
+                }
+
+                for descriptor in descriptors {
+                    var remap = continuum_spawn_descriptor_remap()
+                    remap.source_descriptor = descriptor.role == .master
+                        ? promotedMaster
+                        : promotedSlave
+                    remap.target_descriptor = descriptor.fileDescriptor
+                    remapsByProcess[descriptor.processIdentifier, default: []]
+                        .append(remap)
+                }
+            }
+        } catch {
+            closeControllerDescriptors()
+            throw error
+        }
+
+        return PreparedDescriptorGraph(
+            remapsByCapturedProcess: remapsByProcess,
+            controllerDescriptors: controllerDescriptors,
+            presentationMasters: presentationMasters
+        )
+    }
+
+    private static func runtimeTCPEndpoint(
+        _ endpoint: DurableTCPEndpoint
+    ) throws -> continuum_remote_tcp_endpoint_info {
+        var result = continuum_remote_tcp_endpoint_info()
+        let addressCapacity = MemoryLayout.size(ofValue: result.local_address)
+        guard endpoint.localAddress.count == Int(endpoint.localAddressLength),
+              endpoint.remoteAddress.count == Int(endpoint.remoteAddressLength),
+              endpoint.localAddress.count <= addressCapacity,
+              endpoint.remoteAddress.count <= addressCapacity else {
+            throw ContinuumError.integrityFailure(
+                "A durable TCP endpoint contains invalid native address bytes."
+            )
+        }
+        result.process_id = endpoint.processIdentifier
+        result.file_descriptor = endpoint.fileDescriptor
+        result.domain = endpoint.domain
+        result.socket_type = endpoint.socketType
+        result.protocol = endpoint.socketProtocol
+        result.tcp_state = endpoint.tcpState
+        result.socket_state = endpoint.socketState
+        result.local_address_length = endpoint.localAddressLength
+        result.remote_address_length = endpoint.remoteAddressLength
+        result.receive_shutdown = endpoint.receiveShutdown ? 1 : 0
+        result.send_shutdown = endpoint.sendShutdown ? 1 : 0
+        result.receive_queue_bytes = endpoint.receiveQueueBytes
+        result.send_queue_bytes = endpoint.sendQueueBytes
+        withUnsafeMutableBytes(of: &result.local_address) { destination in
+            destination.copyBytes(from: endpoint.localAddress)
+        }
+        withUnsafeMutableBytes(of: &result.remote_address) { destination in
+            destination.copyBytes(from: endpoint.remoteAddress)
+        }
+        return result
+    }
+
+    private static func runtimePTYDescriptor(
+        _ descriptor: DurablePTYDescriptor
+    ) throws -> continuum_remote_pty_descriptor_info {
+        var result = continuum_remote_pty_descriptor_info()
+        result.process_id = descriptor.processIdentifier
+        result.file_descriptor = descriptor.fileDescriptor
+        result.open_flags = descriptor.openFlags
+        result.role = descriptor.role == .master
+            ? CONTINUUM_REMOTE_PTY_ROLE_MASTER
+            : CONTINUUM_REMOTE_PTY_ROLE_SLAVE
+        result.device = descriptor.device
+        result.inode = descriptor.inode
+        result.raw_device = descriptor.rawDevice
+        result.device_major = descriptor.deviceMajor
+        result.device_minor = descriptor.deviceMinor
+        result.tty_index = descriptor.ttyIndex
+        result.alias_identity = descriptor.aliasIdentity
+        if let inputQueueBytes = descriptor.inputQueueBytes {
+            result.input_queue_known = 1
+            result.input_queue_bytes = inputQueueBytes
+        }
+        if let outputQueueBytes = descriptor.outputQueueBytes {
+            result.output_queue_known = 1
+            result.output_queue_bytes = outputQueueBytes
+        }
+        if let attributes = descriptor.terminalAttributes {
+            guard attributes.count == MemoryLayout.size(
+                ofValue: result.terminal_attributes
+            ) else {
+                throw ContinuumError.integrityFailure(
+                    "A durable PTY record contains invalid terminal attributes."
+                )
+            }
+            withUnsafeMutableBytes(of: &result.terminal_attributes) {
+                $0.copyBytes(from: attributes)
+            }
+            result.terminal_attributes_known = 1
+        }
+        if let windowSize = descriptor.windowSize {
+            guard windowSize.count == MemoryLayout.size(
+                ofValue: result.window_size
+            ) else {
+                throw ContinuumError.integrityFailure(
+                    "A durable PTY record contains an invalid window size."
+                )
+            }
+            withUnsafeMutableBytes(of: &result.window_size) {
+                $0.copyBytes(from: windowSize)
+            }
+            result.window_size_known = 1
+        }
+        return result
+    }
+
+    private static func parentFirstMembers(
+        _ members: [DurableProcessImage]
+    ) throws -> [DurableProcessImage] {
+        var remaining: [Int32: DurableProcessImage] = [:]
+        for member in members {
+            guard member.processIdentifier > 1,
+                  remaining.updateValue(
+                      member,
+                      forKey: member.processIdentifier
+                  ) == nil else {
+                throw ContinuumError.integrityFailure(
+                    "The durable process forest contains an invalid or duplicate process identity."
+                )
+            }
+        }
+        var ordered: [DurableProcessImage] = []
+        while !remaining.isEmpty {
+            let ready = remaining.values.filter {
+                remaining[$0.parentProcessIdentifier] == nil
+            }.sorted { $0.processIdentifier < $1.processIdentifier }
+            if ready.isEmpty {
+                throw ContinuumError.integrityFailure(
+                    "The durable process forest contains a parent cycle."
+                )
+            }
+            for process in ready {
+                ordered.append(process)
+                remaining.removeValue(forKey: process.processIdentifier)
+            }
+        }
+        return ordered
+    }
+
     private func validateExecutable(
         process: DurableProcessImage,
         launch: DurableLaunchContract
@@ -1849,6 +3164,21 @@ public actor ColdProcessRestorer {
     private static func processIsAbsent(_ processIdentifier: Int32) -> Bool {
         errno = 0
         return kill(processIdentifier, 0) != 0 && errno == ESRCH
+    }
+
+    private static func parentProcessIdentifier(
+        for processIdentifier: Int32
+    ) -> Int32? {
+        var info = proc_bsdinfo()
+        let byteCount = proc_pidinfo(
+            processIdentifier,
+            PROC_PIDTBSDINFO,
+            0,
+            &info,
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        guard byteCount == MemoryLayout<proc_bsdinfo>.size else { return nil }
+        return Int32(bitPattern: info.pbi_ppid)
     }
 
     private static func fileReplacements(

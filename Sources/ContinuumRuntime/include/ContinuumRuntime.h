@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,6 +60,8 @@ typedef struct continuum_remote_thread_snapshot continuum_remote_thread_snapshot
 typedef struct continuum_remote_process_snapshot continuum_remote_process_snapshot;
 typedef struct continuum_remote_process_group_snapshot
     continuum_remote_process_group_snapshot;
+typedef struct continuum_remote_descriptor_graph
+    continuum_remote_descriptor_graph;
 
 typedef struct continuum_bootstrap_identity {
     uint64_t image_base;
@@ -65,12 +69,135 @@ typedef struct continuum_bootstrap_identity {
     uint64_t copy_offset;
     uint64_t pthread_prepare_address;
     uint64_t pthread_prepare_offset;
+    uint64_t pty_safepoint_status_address;
+    uint64_t pty_safepoint_status_offset;
     uint8_t image_uuid[16];
 } continuum_bootstrap_identity;
 
 typedef struct continuum_sha256_digest {
     uint8_t bytes[32];
 } continuum_sha256_digest;
+
+/// One launch-time descriptor relocation. The source descriptor belongs to
+/// the Continuum controller; the target descriptor is the exact number the
+/// replacement process must observe before its first instruction executes.
+typedef struct continuum_spawn_descriptor_remap {
+    int32_t source_descriptor;
+    int32_t target_descriptor;
+} continuum_spawn_descriptor_remap;
+
+enum { CONTINUUM_SPAWN_DESCRIPTOR_REMAP_LIMIT = 256 };
+
+typedef enum continuum_spawn_process_group_policy {
+    CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT = 0,
+    CONTINUUM_SPAWN_PROCESS_GROUP_CREATE = 1,
+    CONTINUUM_SPAWN_PROCESS_GROUP_JOIN = 2
+} continuum_spawn_process_group_policy;
+
+/// Kernel topology applied before the replacement executes target code.
+/// A new session necessarily creates a process group led by the child, so
+/// `create_session` requires `CONTINUUM_SPAWN_PROCESS_GROUP_CREATE`.
+///
+/// For the suspended-spawn APIs below, `controlling_terminal_descriptor` must
+/// be -1. Darwin applies posix_spawn file actions before POSIX_SPAWN_SETSID, so
+/// those calls fail closed with CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR. The
+/// brokered API accepts the field because its constructor calls `TIOCSCTTY`
+/// after creating the replacement session.
+typedef struct continuum_spawn_process_topology {
+    uint32_t structure_size;
+    uint32_t create_session;
+    continuum_spawn_process_group_policy process_group_policy;
+    int32_t process_group_id;
+    int32_t controlling_terminal_descriptor;
+} continuum_spawn_process_topology;
+
+typedef struct continuum_brokered_process_spec {
+    uint32_t structure_size;
+    int32_t captured_process_id;
+    int32_t captured_process_group_id;
+    int32_t foreground_process_group_id;
+    const char *executable_path;
+    const char *const *arguments;
+    const char *const *environment;
+    const char *working_directory;
+    const continuum_spawn_descriptor_remap *descriptor_remaps;
+    size_t descriptor_remap_count;
+    continuum_spawn_process_topology topology;
+    uint8_t disable_aslr;
+} continuum_brokered_process_spec;
+
+typedef struct continuum_brokered_pair continuum_brokered_pair;
+
+typedef enum continuum_brokered_process_role {
+    CONTINUUM_BROKERED_PROCESS_ROOT = 1,
+    CONTINUUM_BROKERED_PROCESS_CHILD = 2
+} continuum_brokered_process_role;
+
+/// Prepares a root and one direct child behind ContinuumBootstrap constructor
+/// gates. The root creates its requested session before receiving a PTY slave,
+/// establishes the controlling terminal, then launches the child itself. This
+/// preserves real PPID/SID/PGID topology without executing target `main`.
+///
+/// A child JOIN policy may name the root's captured process identifier; it is
+/// translated to the replacement root's process group. Descriptor sources are
+/// transferred only through an inherited, unguessable socketpair capability.
+continuum_status continuum_brokered_pair_prepare(
+    const char *bootstrap_library_path,
+    const continuum_brokered_process_spec *root,
+    const continuum_brokered_process_spec *child,
+    continuum_brokered_pair **out_pair
+);
+
+continuum_status continuum_brokered_pair_process_identifiers(
+    const continuum_brokered_pair *pair,
+    int32_t *out_root_process_id,
+    int32_t *out_child_process_id
+);
+
+/// Moves the child and then the root from their constructor broker gates to
+/// authenticated executable-entry stops. The child keeps its real root PPID;
+/// the opaque capability authorizes Continuum to attach to that non-child PID.
+/// Ownership remains with the caller on both success and failure. After a
+/// successful transition, authorize each replacement session through
+/// `continuum_brokered_pair_authorize_remote_session`, then either finish the
+/// fully released pair or abort it.
+continuum_status continuum_brokered_pair_advance_to_entry_stops(
+    continuum_brokered_pair *pair,
+    uint32_t timeout_milliseconds
+);
+
+/// Binds a stopped replacement session to the authenticated pair identity and
+/// records whether its stop is controller-ptrace-owned (root) or a brokered
+/// signal stop (child). This must precede remote reconstruction.
+continuum_status continuum_brokered_pair_authorize_remote_session(
+    continuum_brokered_pair *pair,
+    continuum_remote_session *session,
+    continuum_brokered_process_role role
+);
+
+/// Records a successful per-process remote-session release. `finish` refuses
+/// to consume the pair until both exact replacement identities were released.
+continuum_status continuum_brokered_pair_note_released_process(
+    continuum_brokered_pair *pair,
+    int32_t process_id
+);
+
+continuum_status continuum_brokered_pair_finish(
+    continuum_brokered_pair *pair
+);
+
+/// Releases both constructor gates child-first. Ownership of the now-running
+/// replacements transfers to the caller and the opaque pair is destroyed.
+continuum_status continuum_brokered_pair_release(
+    continuum_brokered_pair *pair
+);
+
+/// Aborts both gates, kills/reaps the direct child in the broker, then reaps
+/// the root in the controller. The opaque pair is always destroyed.
+continuum_status continuum_brokered_pair_abort(
+    continuum_brokered_pair *pair,
+    uint32_t timeout_milliseconds
+);
 
 /// Creates a clean replacement process from a captured launch contract and
 /// leaves it kernel-suspended before any target instruction executes.
@@ -112,6 +239,22 @@ continuum_status continuum_spawn_process_suspended_with_inherited_descriptor(
     int32_t *out_process_id
 );
 
+/// Inherits the private bootstrap descriptor and duplicates controller-owned
+/// socket, pipe, or PTY descriptors onto their captured descriptor numbers.
+/// Targets must be unique and must not collide with the bootstrap descriptor
+/// or another remap's source descriptor.
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    int32_t *out_process_id
+);
+
 /// Preserves normal macOS ASLR for a replacement captured from an app that
 /// was not launched under Continuum's deterministic address-space policy.
 continuum_status
@@ -121,6 +264,48 @@ continuum_spawn_process_suspended_with_inherited_descriptor_system_aslr(
     const char *const environment[],
     const char *working_directory,
     int32_t inherited_descriptor,
+    int32_t *out_process_id
+);
+
+/// System-ASLR form of the multi-descriptor suspended spawn contract.
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_and_remaps_system_aslr(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    int32_t *out_process_id
+);
+
+/// Topology-aware form of the deterministic-ASLR suspended spawn contract.
+/// Descriptor remaps remain exact and are installed before target code runs.
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_remaps_and_topology(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    const continuum_spawn_process_topology *topology,
+    int32_t *out_process_id
+);
+
+/// System-ASLR form of the topology-aware suspended spawn contract.
+continuum_status
+continuum_spawn_process_suspended_with_inherited_descriptor_remaps_and_topology_system_aslr(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    int32_t inherited_descriptor,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    const continuum_spawn_process_topology *topology,
     int32_t *out_process_id
 );
 
@@ -463,6 +648,182 @@ typedef struct continuum_remote_writable_vnode_info {
     char path[CONTINUUM_REMOTE_PATH_MAX];
 } continuum_remote_writable_vnode_info;
 
+#define CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX 32
+
+/// Stable metadata for one established IPv4 or IPv6 TCP descriptor. Address
+/// bytes contain a native `sockaddr_in` or `sockaddr_in6`; opaque kernel socket
+/// pointers are deliberately excluded so persisted records remain portable
+/// across replacement processes.
+typedef struct continuum_remote_tcp_endpoint_info {
+    int32_t process_id;
+    int32_t file_descriptor;
+    int32_t domain;
+    int32_t socket_type;
+    int32_t protocol;
+    int32_t tcp_state;
+    uint32_t socket_state;
+    uint32_t local_address_length;
+    uint32_t remote_address_length;
+    uint8_t receive_shutdown;
+    uint8_t send_shutdown;
+    uint8_t reserved[2];
+    uint64_t receive_queue_bytes;
+    uint64_t send_queue_bytes;
+    uint8_t local_address[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX];
+    uint8_t remote_address[CONTINUUM_REMOTE_SOCKET_ADDRESS_MAX];
+} continuum_remote_tcp_endpoint_info;
+
+typedef enum continuum_remote_descriptor_resource_kind {
+    CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_SOCKET = 1,
+    CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_PIPE = 2,
+    CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_KQUEUE = 3
+} continuum_remote_descriptor_resource_kind;
+
+typedef struct continuum_remote_descriptor_handle_info {
+    uint64_t resource_identity;
+    int32_t process_id;
+    int32_t file_descriptor;
+    int32_t descriptor_flags;
+    int32_t status_flags;
+    continuum_remote_descriptor_resource_kind resource_kind;
+} continuum_remote_descriptor_handle_info;
+
+typedef enum continuum_remote_socket_kind {
+    CONTINUUM_REMOTE_SOCKET_TCP_LISTENER = 1,
+    CONTINUUM_REMOTE_SOCKET_TCP_CONNECTED = 2,
+    CONTINUUM_REMOTE_SOCKET_UNIX_LISTENER = 3,
+    CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED = 4
+} continuum_remote_socket_kind;
+
+#define CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX 256
+
+typedef struct continuum_remote_socket_resource_info {
+    uint64_t resource_identity;
+    uint64_t peer_identity;
+    uint64_t listener_identity;
+    continuum_remote_socket_kind kind;
+    int32_t domain;
+    int32_t socket_type;
+    int32_t protocol;
+    uint32_t socket_state;
+    uint32_t local_address_length;
+    uint32_t remote_address_length;
+    uint8_t receive_shutdown;
+    uint8_t send_shutdown;
+    uint8_t reserved[2];
+    uint64_t receive_queue_bytes;
+    uint64_t send_queue_bytes;
+    int32_t backlog;
+    uint8_t local_address[CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX];
+    uint8_t remote_address[CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX];
+} continuum_remote_socket_resource_info;
+
+typedef struct continuum_remote_pipe_resource_info {
+    uint64_t resource_identity;
+    uint64_t peer_identity;
+    uint64_t capacity;
+    uint64_t queued_bytes;
+    uint32_t status;
+} continuum_remote_pipe_resource_info;
+
+typedef struct continuum_remote_kqueue_resource_info {
+    uint64_t resource_identity;
+    int32_t process_id;
+    uint32_t state;
+    uint64_t registration_start;
+    uint64_t registration_count;
+} continuum_remote_kqueue_resource_info;
+
+typedef struct continuum_remote_kqueue_registration_info {
+    uint64_t resource_identity;
+    uint64_t ident;
+    int16_t filter;
+    uint16_t flags;
+    uint32_t fflags;
+    int64_t data;
+    uint64_t udata;
+    uint32_t qos;
+    int64_t saved_data;
+    uint32_t status;
+} continuum_remote_kqueue_registration_info;
+
+typedef enum continuum_remote_pty_role {
+    CONTINUUM_REMOTE_PTY_ROLE_UNKNOWN = 0,
+    CONTINUUM_REMOTE_PTY_ROLE_MASTER = 1,
+    CONTINUUM_REMOTE_PTY_ROLE_SLAVE = 2
+} continuum_remote_pty_role;
+
+/// Stable userspace metadata for one descriptor backed by a real macOS PTY.
+/// `alias_identity` groups descriptors for the same PTY endpoint across
+/// captured processes; independent opens of that endpoint are intentionally
+/// grouped because libproc cannot distinguish them from dup/inherited aliases.
+/// It is not a reusable kernel object identifier. Queue counts are valid only
+/// when their corresponding `*_known` byte is nonzero.
+typedef struct continuum_remote_pty_descriptor_info {
+    int32_t process_id;
+    int32_t file_descriptor;
+    uint32_t open_flags;
+    continuum_remote_pty_role role;
+    uint64_t device;
+    uint64_t inode;
+    uint64_t raw_device;
+    uint32_t device_major;
+    uint32_t device_minor;
+    uint32_t tty_index;
+    uint64_t alias_identity;
+    uint64_t input_queue_bytes;
+    uint64_t output_queue_bytes;
+    uint8_t input_queue_known;
+    uint8_t output_queue_known;
+    uint8_t terminal_attributes_known;
+    uint8_t window_size_known;
+    struct termios terminal_attributes;
+    struct winsize window_size;
+} continuum_remote_pty_descriptor_info;
+
+/// Whole-forest result from the in-process PTY safepoint handshake. `known`
+/// is true only when every captured member published a current authenticated
+/// report and every FIONREAD/TIOCOUTQ query succeeded. No queue payload is
+/// read or consumed while producing this result.
+typedef struct continuum_remote_pty_safepoint_status {
+    uint64_t process_count;
+    uint64_t pty_descriptor_count;
+    uint8_t queue_state_known;
+    uint8_t all_queues_zero;
+} continuum_remote_pty_safepoint_status;
+
+/// Recreates one closed, reverse-matched loopback TCP pair for later remapping
+/// into replacement processes. Both captured processes must be absent and both
+/// queues must have been empty. Exact saved ports are attempted first; TIME_WAIT
+/// falls back to fresh loopback ports, so callers restoring observable socket
+/// identity must virtualize getsockname/getpeername. Success transfers two
+/// CLOEXEC descriptors to the caller in the same order as the endpoint records.
+continuum_status continuum_recreate_closed_loopback_tcp_pair(
+    const continuum_remote_tcp_endpoint_info *first_endpoint,
+    const continuum_remote_tcp_endpoint_info *second_endpoint,
+    int32_t *out_first_descriptor,
+    int32_t *out_second_descriptor
+);
+
+/// Creates a fresh PTY master/slave pair from matching saved endpoint records.
+/// Saved queued bytes are not replayed. Success transfers two owned CLOEXEC
+/// descriptors to the caller, master first and slave second.
+continuum_status continuum_recreate_closed_pty_pair(
+    const continuum_remote_pty_descriptor_info *master_descriptor,
+    const continuum_remote_pty_descriptor_info *slave_descriptor,
+    int32_t *out_master_descriptor,
+    int32_t *out_slave_descriptor
+);
+
+/// Recreates a PTY when the captured workload owns only slave descriptors and
+/// its terminal emulator (the derived presentation process) owned the master.
+/// The returned master stays controller-owned for attachment to a fresh UI.
+continuum_status continuum_recreate_closed_pty_from_slave(
+    const continuum_remote_pty_descriptor_info *slave_descriptor,
+    int32_t *out_master_descriptor,
+    int32_t *out_slave_descriptor
+);
+
 typedef enum continuum_resource_change {
     CONTINUUM_RESOURCE_CHANGE_NONE = 0,
     CONTINUUM_RESOURCE_CHANGE_DESCRIPTOR_TABLE = 1 << 0,
@@ -780,11 +1141,48 @@ continuum_status continuum_remote_process_group_capture(
     continuum_remote_process_group_snapshot_info *out_info
 );
 
+/// Captures the union of every explicit root and all of their descendants as
+/// one coherent hot group. Duplicate and overlapping roots are deduplicated;
+/// members are captured with parents before children. PID 1, the caller, and
+/// non-positive roots are rejected.
+continuum_status continuum_remote_process_group_capture_roots(
+    const int32_t root_process_ids[],
+    size_t root_process_count,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+);
+
+/// Authenticates ContinuumBootstrap in every captured member by canonical
+/// path and Mach-O UUID, then reads its image-relative PTY status export.
+/// Every member must still be inside the userspace safepoint represented by
+/// the snapshot. The authenticated report's pthread thread identifier must
+/// occur exactly once in the captured thread set; released or stale
+/// generations fail validation.
+continuum_status continuum_remote_process_group_copy_pty_safepoint_status(
+    const continuum_remote_process_group_snapshot *snapshot,
+    const char *bootstrap_library_path,
+    continuum_remote_pty_safepoint_status *out_status
+);
+
 /// Captures the process group and invokes `callback` during the same coherent
 /// suspension cut. This is the integration point for file, IPC, window, GPU,
 /// audio, and device checkpoint adapters.
 continuum_status continuum_remote_process_group_capture_with_resources(
     int32_t root_process_id,
+    uint64_t maximum_captured_bytes,
+    continuum_remote_resource_capture_callback callback,
+    void *callback_context,
+    continuum_remote_process_group_snapshot **out_snapshot,
+    continuum_remote_process_group_snapshot_info *out_info
+);
+
+/// Multi-root form of `continuum_remote_process_group_capture_with_resources`.
+/// The callback runs only after the entire process forest is open, suspended,
+/// and revalidated against a fresh process-table view.
+continuum_status continuum_remote_process_group_capture_roots_with_resources(
+    const int32_t root_process_ids[],
+    size_t root_process_count,
     uint64_t maximum_captured_bytes,
     continuum_remote_resource_capture_callback callback,
     void *callback_context,
@@ -884,6 +1282,94 @@ continuum_status continuum_find_writable_vnode_conflict(
 continuum_status continuum_remote_process_group_copy_writable_vnodes(
     const continuum_remote_process_group_snapshot *snapshot,
     continuum_remote_writable_vnode_info *entries,
+    size_t entry_capacity,
+    size_t *out_entry_count
+);
+
+/// Copies established IPv4/IPv6 TCP descriptors owned by captured members.
+/// A null `entries` with zero capacity measures the required count. Call only
+/// while the process forest is coherently suspended (for example from a
+/// resource callback); this function observes but never reads or mutates queue
+/// contents. Local peers can be paired by reverse-matching the two sockaddr
+/// byte sequences.
+continuum_status continuum_remote_process_group_copy_tcp_endpoints(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_tcp_endpoint_info *entries,
+    size_t entry_capacity,
+    size_t *out_entry_count
+);
+
+/// Captures the socket, pipe, and ordinary fd-backed kqueue graph while the
+/// process forest is coherently suspended. The opaque graph owns only copied
+/// metadata; it never reads queue payloads or retains kernel object pointers.
+/// Unsupported or ambiguous resources fail closed.
+continuum_status continuum_remote_process_group_capture_descriptor_graph(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_descriptor_graph **out_graph
+);
+
+size_t continuum_remote_descriptor_graph_handle_count(
+    const continuum_remote_descriptor_graph *graph
+);
+
+size_t continuum_remote_descriptor_graph_socket_count(
+    const continuum_remote_descriptor_graph *graph
+);
+
+size_t continuum_remote_descriptor_graph_pipe_count(
+    const continuum_remote_descriptor_graph *graph
+);
+
+size_t continuum_remote_descriptor_graph_kqueue_count(
+    const continuum_remote_descriptor_graph *graph
+);
+
+size_t continuum_remote_descriptor_graph_kqueue_registration_count(
+    const continuum_remote_descriptor_graph *graph
+);
+
+continuum_status continuum_remote_descriptor_graph_copy_handles(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_descriptor_handle_info *entries,
+    size_t entry_capacity
+);
+
+continuum_status continuum_remote_descriptor_graph_copy_sockets(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_socket_resource_info *entries,
+    size_t entry_capacity
+);
+
+continuum_status continuum_remote_descriptor_graph_copy_pipes(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_pipe_resource_info *entries,
+    size_t entry_capacity
+);
+
+continuum_status continuum_remote_descriptor_graph_copy_kqueues(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_kqueue_resource_info *entries,
+    size_t entry_capacity
+);
+
+continuum_status continuum_remote_descriptor_graph_copy_kqueue_registrations(
+    const continuum_remote_descriptor_graph *graph,
+    continuum_remote_kqueue_registration_info *entries,
+    size_t entry_capacity
+);
+
+void continuum_remote_descriptor_graph_destroy(
+    continuum_remote_descriptor_graph *graph
+);
+
+/// Copies every descriptor backed by a real macOS PTY master or slave. A null
+/// `entries` with zero capacity measures the required count. Call only while
+/// the process forest is coherently suspended. This function never consumes
+/// terminal data and marks queue counts unknown when they cannot be observed
+/// without changing the captured descriptor graph.
+continuum_status continuum_remote_process_group_copy_pty_descriptors(
+    const continuum_remote_process_group_snapshot *snapshot,
+    continuum_remote_pty_descriptor_info *entries,
     size_t entry_capacity,
     size_t *out_entry_count
 );
