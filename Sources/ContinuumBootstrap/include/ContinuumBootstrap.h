@@ -72,6 +72,15 @@ extern volatile continuum_bootstrap_pty_safepoint_status
 /// inside a Mach syscall.
 void continuum_bootstrap_safepoint_spin(void);
 
+/// Consumes one private, unlinked descriptor-plan file and applies it to the
+/// current process. Success returns the owned report descriptor. V2 replay
+/// validation failures return -2 so the pre-main constructor can exit before
+/// exposing a partially reconstructed process; other failures return -1.
+int continuum_bootstrap_apply_descriptor_plan(
+    int descriptor,
+    uint32_t *out_restored_count
+);
+
 /// Allocates durable model memory from Continuum's isolated app-state zone.
 /// The general malloc interposer uses call-site ownership; this explicit entry
 /// is also useful to adapters whose language runtime hides the app call site.

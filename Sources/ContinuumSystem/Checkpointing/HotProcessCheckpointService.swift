@@ -534,7 +534,8 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 && handlesByPipe[pipe.id]?.isEmpty == false
         }), pipeHandles.allSatisfy({ handle in
             capturedProcessIdentifiers.contains(handle.processIdentifier)
-                && handle.descriptorFlags == 0
+                && (handle.descriptorFlags == 0
+                    || handle.descriptorFlags == FD_CLOEXEC)
                 && handlesByPipe[handle.resourceID]?.allSatisfy({
                     $0.statusFlags == handle.statusFlags
                 }) == true

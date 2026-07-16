@@ -399,7 +399,8 @@ public actor ColdProcessRestorer {
                     writableFiles: image.writableFiles,
                     writableFileDescriptors: image.writableFileDescriptors.filter {
                         $0.processIdentifier == process.processIdentifier
-                    }
+                    },
+                    descriptorGraph: image.descriptorGraph
                 )
                 let encoded = try JSONEncoder().encode(memberImage)
                 let overlay = ManifestOverlayRepository(
@@ -532,13 +533,21 @@ public actor ColdProcessRestorer {
             launch: rootLaunch,
             remaps: descriptorGraph.remapsByCapturedProcess[
                 root.processIdentifier
-            ] ?? []
+            ] ?? [],
+            pipeHandles: Self.pipeDescriptorHandles(
+                in: image,
+                processIdentifier: root.processIdentifier
+            )
         )
         let childLaunchPreparation = try makeBrokerLaunchPreparation(
             launch: childLaunch,
             remaps: descriptorGraph.remapsByCapturedProcess[
                 child.processIdentifier
-            ] ?? []
+            ] ?? [],
+            pipeHandles: Self.pipeDescriptorHandles(
+                in: image,
+                processIdentifier: child.processIdentifier
+            )
         )
         var ownsRootDescriptor = true
         var ownsChildDescriptor = true
@@ -768,7 +777,8 @@ public actor ColdProcessRestorer {
 
     private func makeBrokerLaunchPreparation(
         launch: DurableLaunchContract,
-        remaps: [continuum_spawn_descriptor_remap]
+        remaps: [continuum_spawn_descriptor_remap],
+        pipeHandles: [DurableDescriptorHandle]
     ) throws -> BrokerLaunchPreparation {
         var template = Array(
             "/private/tmp/com.midas.continuum-broker-XXXXXX".utf8CString
@@ -804,7 +814,10 @@ public actor ColdProcessRestorer {
             Darwin.close(descriptor)
             descriptor = relocated
         }
-        let plan = try Self.bootstrapDescriptorPlan([])
+        let plan = try Self.bootstrapDescriptorPlan(
+            [],
+            pipeHandles: pipeHandles
+        )
         try Self.writeBootstrapDescriptorPlan(plan, to: descriptor)
         var brokerRemaps = remaps
         brokerRemaps.append(continuum_spawn_descriptor_remap(
@@ -1143,7 +1156,11 @@ public actor ColdProcessRestorer {
         let rootDescriptors: [DurableWritableFileDescriptor] = []
         if prelaunchedBootstrapDescriptor == nil {
             let descriptorPlan = try Self.bootstrapDescriptorPlan(
-                rootDescriptors
+                rootDescriptors,
+                pipeHandles: Self.pipeDescriptorHandles(
+                    in: image,
+                    processIdentifier: process.processIdentifier
+                )
             )
             try Self.writeBootstrapDescriptorPlan(
                 descriptorPlan,
@@ -2589,8 +2606,14 @@ public actor ColdProcessRestorer {
                           let secondStatus = secondHandles.first?.statusFlags,
                           firstHandles.allSatisfy({ $0.statusFlags == firstStatus }),
                           secondHandles.allSatisfy({ $0.statusFlags == secondStatus }),
-                          firstHandles.allSatisfy({ $0.descriptorFlags == 0 }),
-                          secondHandles.allSatisfy({ $0.descriptorFlags == 0 }) else {
+                          firstHandles.allSatisfy({
+                              $0.descriptorFlags == 0
+                                  || $0.descriptorFlags == FD_CLOEXEC
+                          }),
+                          secondHandles.allSatisfy({
+                              $0.descriptorFlags == 0
+                                  || $0.descriptorFlags == FD_CLOEXEC
+                          }) else {
                         throw ContinuumError.restoreUnavailable(
                             "A saved pipe has inconsistent aliases or per-descriptor flags that require bootstrap replay."
                         )
@@ -2624,7 +2647,7 @@ public actor ColdProcessRestorer {
                         )
                     }
 
-                    let mutableStatusMask = O_NONBLOCK | O_APPEND | O_ASYNC
+                    let mutableStatusMask = O_NONBLOCK | O_ASYNC
                     let supportedStatusMask = O_ACCMODE | mutableStatusMask
                     guard readStatus & ~supportedStatusMask == 0,
                           writeStatus & ~supportedStatusMask == 0 else {
@@ -3609,16 +3632,22 @@ public actor ColdProcessRestorer {
     }
 
     private static func bootstrapDescriptorPlan(
-        _ descriptors: [DurableWritableFileDescriptor]
+        _ descriptors: [DurableWritableFileDescriptor],
+        pipeHandles: [DurableDescriptorHandle] = []
     ) throws -> Data {
-        guard descriptors.count <= 1_024 else {
+        guard descriptors.count + pipeHandles.count <= 1_024 else {
             throw ContinuumError.restoreUnavailable(
-                "The root process owns too many writable descriptors for cold reconstruction."
+                "The root process owns too many descriptors for cold reconstruction."
             )
         }
         var seenDescriptors: Set<Int32> = []
-        var lines = ["CONTINUUM_FD_PLAN_V1 \(descriptors.count)"]
-        lines.reserveCapacity(descriptors.count + 1)
+        var lines = pipeHandles.isEmpty
+            ? ["CONTINUUM_FD_PLAN_V1 \(descriptors.count)"]
+            : [
+                "CONTINUUM_FD_PLAN_V2 \(descriptors.count) "
+                    + "\(pipeHandles.count)",
+            ]
+        lines.reserveCapacity(descriptors.count + pipeHandles.count + 1)
         for descriptor in descriptors {
             guard descriptor.fileDescriptor >= 0,
                   descriptor.offset >= 0,
@@ -3641,6 +3670,26 @@ public actor ColdProcessRestorer {
                     + "\(descriptor.inode) \(descriptor.mode) \(encodedPath)"
             )
         }
+        let supportedStatusMask = O_ACCMODE | O_NONBLOCK | O_ASYNC
+        for handle in pipeHandles.sorted(by: {
+            $0.fileDescriptor < $1.fileDescriptor
+        }) {
+            let accessMode = handle.statusFlags & O_ACCMODE
+            guard handle.fileDescriptor >= 0,
+                  seenDescriptors.insert(handle.fileDescriptor).inserted,
+                  handle.descriptorFlags == 0
+                    || handle.descriptorFlags == FD_CLOEXEC,
+                  accessMode == O_RDONLY || accessMode == O_WRONLY,
+                  handle.statusFlags & ~supportedStatusMask == 0 else {
+                throw ContinuumError.integrityFailure(
+                    "The durable pipe-descriptor plan is invalid."
+                )
+            }
+            lines.append(
+                "PIPE \(handle.fileDescriptor) \(handle.descriptorFlags) "
+                    + "\(handle.statusFlags)"
+            )
+        }
         guard let plan = (lines.joined(separator: "\n") + "\n")
                 .data(using: .utf8),
               plan.count <= 1_024 * 1_024 else {
@@ -3649,6 +3698,18 @@ public actor ColdProcessRestorer {
             )
         }
         return plan
+    }
+
+    private static func pipeDescriptorHandles(
+        in image: DurableCheckpointImage,
+        processIdentifier: Int32
+    ) -> [DurableDescriptorHandle] {
+        guard let graph = image.descriptorGraph else { return [] }
+        let pipeIDs = Set(graph.pipes.map(\.id))
+        return graph.handles.filter {
+            $0.processIdentifier == processIdentifier
+                && pipeIDs.contains($0.resourceID)
+        }
     }
 
     private static func writeBootstrapDescriptorPlan(

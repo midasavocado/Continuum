@@ -1396,6 +1396,69 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertEqual(kill(abortedChild, 0), -1)
     }
 
+    func testBootstrapV2ReplaysExactPipeFlagsAtExistingDescriptor() {
+        var endpoints: [Int32] = [-1, -1]
+        XCTAssertEqual(Darwin.pipe(&endpoints), 0)
+        guard endpoints[0] >= 0, endpoints[1] >= 0 else {
+            return XCTFail("Expected a pipe pair")
+        }
+        defer {
+            Darwin.close(endpoints[0])
+            Darwin.close(endpoints[1])
+        }
+
+        let target = fcntl(endpoints[0], F_DUPFD_CLOEXEC, 300)
+        XCTAssertGreaterThanOrEqual(target, 300)
+        guard target >= 300 else { return }
+        defer { Darwin.close(target) }
+        XCTAssertEqual(fcntl(target, F_SETFD, 0), 0)
+        let initialStatus = fcntl(target, F_GETFL)
+        XCTAssertGreaterThanOrEqual(initialStatus, 0)
+        guard initialStatus >= 0 else { return }
+        let desiredStatus = (initialStatus & O_ACCMODE) | O_NONBLOCK
+
+        var temporaryPath = Array(
+            "/private/tmp/continuum-v2-pipe-plan-XXXXXX\0".utf8
+        )
+        let planDescriptor = temporaryPath.withUnsafeMutableBufferPointer {
+            buffer in
+            mkstemp(
+                UnsafeMutablePointer<CChar>(OpaquePointer(buffer.baseAddress))
+            )
+        }
+        XCTAssertGreaterThanOrEqual(planDescriptor, 0)
+        guard planDescriptor >= 0 else { return }
+        temporaryPath.withUnsafeBufferPointer { buffer in
+            _ = unlink(UnsafePointer<CChar>(OpaquePointer(buffer.baseAddress)))
+        }
+        let plan = Array(
+            "CONTINUUM_FD_PLAN_V2 0 1\n"
+                .appending("PIPE \(target) \(FD_CLOEXEC) \(desiredStatus)\n")
+                .utf8
+        )
+        let written = plan.withUnsafeBytes { bytes in
+            Darwin.write(planDescriptor, bytes.baseAddress, bytes.count)
+        }
+        XCTAssertEqual(written, plan.count)
+        XCTAssertEqual(lseek(planDescriptor, 0, SEEK_SET), 0)
+
+        var restoredCount: UInt32 = 0
+        let reportDescriptor = continuum_bootstrap_apply_descriptor_plan(
+            planDescriptor,
+            &restoredCount
+        )
+        XCTAssertGreaterThanOrEqual(reportDescriptor, 0)
+        guard reportDescriptor >= 0 else { return }
+        defer { Darwin.close(reportDescriptor) }
+
+        XCTAssertEqual(restoredCount, 1)
+        var metadata = stat()
+        XCTAssertEqual(fstat(target, &metadata), 0)
+        XCTAssertEqual(metadata.st_mode & S_IFMT, S_IFIFO)
+        XCTAssertEqual(fcntl(target, F_GETFD), FD_CLOEXEC)
+        XCTAssertEqual(fcntl(target, F_GETFL), desiredStatus)
+    }
+
     func testRepeatedCreateCheckpointDestroy() {
         for value in UInt8(0)..<64 {
             let memory = UnsafeMutableRawPointer.allocate(byteCount: 512, alignment: 16)

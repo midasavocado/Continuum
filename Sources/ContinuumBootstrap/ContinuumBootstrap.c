@@ -2141,6 +2141,12 @@ typedef struct continuum_bootstrap_descriptor_record {
     char path[PATH_MAX];
 } continuum_bootstrap_descriptor_record;
 
+typedef struct continuum_bootstrap_pipe_descriptor_record {
+    int target_descriptor;
+    int descriptor_flags;
+    int status_flags;
+} continuum_bootstrap_pipe_descriptor_record;
+
 static int continuum_bootstrap_hex_value(char value) {
     if (value >= '0' && value <= '9') {
         return value - '0';
@@ -2174,10 +2180,15 @@ static int continuum_bootstrap_decode_path(
     return output[0] == '/';
 }
 
-static int continuum_bootstrap_prepare_descriptors(
+__attribute__((visibility("default")))
+int continuum_bootstrap_apply_descriptor_plan(
     int descriptor,
     uint32_t *out_restored_count
 ) {
+    if (out_restored_count == NULL) {
+        close(descriptor);
+        return -1;
+    }
     *out_restored_count = 0;
     struct stat metadata;
     if (fstat(descriptor, &metadata) != 0
@@ -2206,29 +2217,51 @@ static int continuum_bootstrap_prepare_descriptors(
     }
 
     uint32_t count = 0;
+    uint32_t pipe_count = 0;
+    int plan_version = 0;
     continuum_bootstrap_descriptor_record *records = NULL;
+    continuum_bootstrap_pipe_descriptor_record *pipe_records = NULL;
     int maximum_target = 63;
     if (plan_length > 0) {
         char *context = NULL;
         char *line = strtok_r(plan, "\n", &context);
         char trailing = '\0';
-        if (line == NULL
-            || sscanf(
+        if (line != NULL
+            && sscanf(
+                line,
+                "CONTINUUM_FD_PLAN_V2 %u %u %c",
+                &count,
+                &pipe_count,
+                &trailing
+            ) == 2) {
+            plan_version = 2;
+        } else if (line != NULL
+            && sscanf(
                 line,
                 "CONTINUUM_FD_PLAN_V1 %u %c",
                 &count,
                 &trailing
-            ) != 1
-            || count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS) {
+            ) == 1) {
+            plan_version = 1;
+            pipe_count = 0;
+        }
+        if (plan_version == 0
+            || count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS
+            || pipe_count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS
+            || count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS - pipe_count) {
             free(plan);
             close(descriptor);
-            return -1;
+            return plan_version == 2 ? -2 : -1;
         }
         records = calloc(count, sizeof(*records));
-        if (count > 0 && records == NULL) {
+        pipe_records = calloc(pipe_count, sizeof(*pipe_records));
+        if ((count > 0 && records == NULL)
+            || (pipe_count > 0 && pipe_records == NULL)) {
+            free(records);
+            free(pipe_records);
             free(plan);
             close(descriptor);
-            return -1;
+            return plan_version == 2 ? -2 : -1;
         }
         for (uint32_t index = 0; index < count; index += 1) {
             line = strtok_r(NULL, "\n", &context);
@@ -2256,9 +2289,10 @@ static int continuum_bootstrap_prepare_descriptors(
                     records[index].path
                 )) {
                 free(records);
+                free(pipe_records);
                 free(plan);
                 close(descriptor);
-                return -1;
+                return plan_version == 2 ? -2 : -1;
             }
             records[index].offset = offset;
             records[index].device = device;
@@ -2267,28 +2301,75 @@ static int continuum_bootstrap_prepare_descriptors(
                 if (records[prior].target_descriptor
                     == records[index].target_descriptor) {
                     free(records);
+                    free(pipe_records);
                     free(plan);
                     close(descriptor);
-                    return -1;
+                    return plan_version == 2 ? -2 : -1;
                 }
             }
             if (records[index].target_descriptor > maximum_target) {
                 maximum_target = records[index].target_descriptor;
             }
         }
+        for (uint32_t index = 0; index < pipe_count; index += 1) {
+            line = strtok_r(NULL, "\n", &context);
+            trailing = '\0';
+            int parsed = line == NULL ? 0 : sscanf(
+                line,
+                "PIPE %d %d %d %c",
+                &pipe_records[index].target_descriptor,
+                &pipe_records[index].descriptor_flags,
+                &pipe_records[index].status_flags,
+                &trailing
+            );
+            int target = pipe_records[index].target_descriptor;
+            int descriptor_flags = pipe_records[index].descriptor_flags;
+            int status_flags = pipe_records[index].status_flags;
+            const int mutable_status_flags = O_NONBLOCK | O_ASYNC;
+            if (parsed != 3 || target < 0
+                || (descriptor_flags & ~FD_CLOEXEC) != 0
+                || (status_flags & ~(O_ACCMODE | mutable_status_flags)) != 0) {
+                free(records);
+                free(pipe_records);
+                free(plan);
+                close(descriptor);
+                return -2;
+            }
+            for (uint32_t prior = 0; prior < count; prior += 1) {
+                if (records[prior].target_descriptor == target) {
+                    free(records);
+                    free(pipe_records);
+                    free(plan);
+                    close(descriptor);
+                    return -2;
+                }
+            }
+            for (uint32_t prior = 0; prior < index; prior += 1) {
+                if (pipe_records[prior].target_descriptor == target) {
+                    free(records);
+                    free(pipe_records);
+                    free(plan);
+                    close(descriptor);
+                    return -2;
+                }
+            }
+            if (target > maximum_target) maximum_target = target;
+        }
         if (strtok_r(NULL, "\n", &context) != NULL) {
             free(records);
+            free(pipe_records);
             free(plan);
             close(descriptor);
-            return -1;
+            return plan_version == 2 ? -2 : -1;
         }
     }
     free(plan);
 
     if (maximum_target == INT_MAX) {
         free(records);
+        free(pipe_records);
         close(descriptor);
-        return -1;
+        return plan_version == 2 ? -2 : -1;
     }
     int report_descriptor = fcntl(
         descriptor,
@@ -2298,15 +2379,17 @@ static int continuum_bootstrap_prepare_descriptors(
     close(descriptor);
     if (report_descriptor < 0) {
         free(records);
-        return -1;
+        free(pipe_records);
+        return plan_version == 2 ? -2 : -1;
     }
 
     for (uint32_t index = 0; index < count; index += 1) {
         int access_mode = records[index].open_flags & O_ACCMODE;
         if (access_mode != O_WRONLY && access_mode != O_RDWR) {
             free(records);
+            free(pipe_records);
             close(report_descriptor);
-            return -1;
+            return plan_version == 2 ? -2 : -1;
         }
         int safe_flags = access_mode | O_CLOEXEC | O_NOFOLLOW;
         if ((records[index].open_flags & O_APPEND) != 0) {
@@ -2328,8 +2411,9 @@ static int continuum_bootstrap_prepare_descriptors(
                 close(opened);
             }
             free(records);
+            free(pipe_records);
             close(report_descriptor);
-            return -1;
+            return plan_version == 2 ? -2 : -1;
         }
         if (opened != records[index].target_descriptor) {
             close(opened);
@@ -2337,10 +2421,41 @@ static int continuum_bootstrap_prepare_descriptors(
         *out_restored_count += 1;
     }
     free(records);
+    for (uint32_t index = 0; index < pipe_count; index += 1) {
+        const continuum_bootstrap_pipe_descriptor_record *record =
+            &pipe_records[index];
+        struct stat descriptor_metadata;
+        int current_status_flags = fcntl(record->target_descriptor, F_GETFL);
+        int desired_access_mode = record->status_flags & O_ACCMODE;
+        if (fstat(record->target_descriptor, &descriptor_metadata) != 0
+            || !S_ISFIFO(descriptor_metadata.st_mode)
+            || current_status_flags < 0
+            || (current_status_flags & O_ACCMODE) != desired_access_mode
+            || fcntl(
+                record->target_descriptor,
+                F_SETFL,
+                record->status_flags & (O_NONBLOCK | O_ASYNC)
+            ) != 0
+            || fcntl(
+                record->target_descriptor,
+                F_SETFD,
+                record->descriptor_flags
+            ) != 0
+            || fcntl(record->target_descriptor, F_GETFL)
+                != record->status_flags
+            || fcntl(record->target_descriptor, F_GETFD)
+                != record->descriptor_flags) {
+            free(pipe_records);
+            close(report_descriptor);
+            return -2;
+        }
+        *out_restored_count += 1;
+    }
+    free(pipe_records);
     if (ftruncate(report_descriptor, 0) != 0
         || lseek(report_descriptor, 0, SEEK_SET) != 0) {
         close(report_descriptor);
-        return -1;
+        return plan_version == 2 ? -2 : -1;
     }
     return report_descriptor;
 }
@@ -2358,10 +2473,13 @@ static void continuum_bootstrap_report_copy_address(void) {
         return;
     }
     uint32_t restored_descriptor_count = 0;
-    int descriptor = continuum_bootstrap_prepare_descriptors(
+    int descriptor = continuum_bootstrap_apply_descriptor_plan(
         (int)descriptor_value,
         &restored_descriptor_count
     );
+    if (descriptor == -2) {
+        _exit(EXIT_FAILURE);
+    }
     if (descriptor < 0) {
         return;
     }
