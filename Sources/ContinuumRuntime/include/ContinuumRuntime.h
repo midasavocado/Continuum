@@ -794,6 +794,19 @@ typedef struct continuum_remote_pty_safepoint_status {
     uint8_t all_queues_zero;
 } continuum_remote_pty_safepoint_status;
 
+/// Creates a fresh empty pipe from reciprocal saved resource records. The
+/// first record must describe the captured read handle and the second the
+/// captured write handle; access modes live on descriptor handles rather than
+/// these shared-resource records. Success transfers two owned CLOEXEC
+/// descriptors to the caller in that same order. Saved queue payload is never
+/// replayed, so both records must report an empty pipe.
+continuum_status continuum_recreate_closed_empty_pipe_pair(
+    const continuum_remote_pipe_resource_info *first_resource,
+    const continuum_remote_pipe_resource_info *second_resource,
+    int32_t *out_first_descriptor,
+    int32_t *out_second_descriptor
+);
+
 /// Recreates one closed, reverse-matched loopback TCP pair for later remapping
 /// into replacement processes. Both captured processes must be absent and both
 /// queues must have been empty. Exact saved ports are attempted first; TIME_WAIT

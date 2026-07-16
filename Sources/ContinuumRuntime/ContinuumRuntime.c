@@ -13448,6 +13448,71 @@ cleanup:
     return success;
 }
 
+continuum_status continuum_recreate_closed_empty_pipe_pair(
+    const continuum_remote_pipe_resource_info *first_resource,
+    const continuum_remote_pipe_resource_info *second_resource,
+    int32_t *out_first_descriptor,
+    int32_t *out_second_descriptor
+) {
+    if (first_resource == NULL || second_resource == NULL
+        || first_resource == second_resource
+        || out_first_descriptor == NULL || out_second_descriptor == NULL
+        || out_first_descriptor == out_second_descriptor) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_first_descriptor = -1;
+    *out_second_descriptor = -1;
+
+    if (first_resource->resource_identity == 0
+        || second_resource->resource_identity == 0
+        || first_resource->resource_identity
+            == second_resource->resource_identity
+        || first_resource->peer_identity
+            != second_resource->resource_identity
+        || second_resource->peer_identity
+            != first_resource->resource_identity
+        || first_resource->queued_bytes != 0
+        || second_resource->queued_bytes != 0
+        || first_resource->capacity == 0
+        || first_resource->capacity != second_resource->capacity) {
+        return CONTINUUM_STATUS_VALIDATION_FAILED;
+    }
+
+    int descriptors[2] = {-1, -1};
+    struct stat first_stat;
+    struct stat second_stat;
+    continuum_status status = CONTINUUM_STATUS_VALIDATION_FAILED;
+    if (pipe(descriptors) != 0
+        || fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) != 0
+        || fstat(descriptors[0], &first_stat) != 0
+        || fstat(descriptors[1], &second_stat) != 0) {
+        status = CONTINUUM_STATUS_MACH_ERROR;
+        goto cleanup;
+    }
+    if (!S_ISFIFO(first_stat.st_mode) || !S_ISFIFO(second_stat.st_mode)
+        || first_stat.st_blksize <= 0 || second_stat.st_blksize <= 0
+        || (uint64_t)first_stat.st_blksize != first_resource->capacity
+        || (uint64_t)second_stat.st_blksize != second_resource->capacity) {
+        goto cleanup;
+    }
+
+    *out_first_descriptor = descriptors[0];
+    *out_second_descriptor = descriptors[1];
+    descriptors[0] = -1;
+    descriptors[1] = -1;
+    status = CONTINUUM_STATUS_OK;
+
+cleanup:
+    if (descriptors[0] >= 0) {
+        close(descriptors[0]);
+    }
+    if (descriptors[1] >= 0) {
+        close(descriptors[1]);
+    }
+    return status;
+}
+
 continuum_status continuum_recreate_closed_loopback_tcp_pair(
     const continuum_remote_tcp_endpoint_info *first_endpoint,
     const continuum_remote_tcp_endpoint_info *second_endpoint,

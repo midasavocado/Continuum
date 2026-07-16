@@ -2449,6 +2449,176 @@ final class ContinuumRuntimeTests: XCTestCase {
         )
     }
 
+    func testRecreatesClosedEmptyReciprocalPipePair() {
+        var measuredDescriptors = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(
+            measuredDescriptors.withUnsafeMutableBufferPointer {
+                pipe($0.baseAddress!)
+            },
+            0
+        )
+        guard measuredDescriptors.allSatisfy({ $0 >= 0 }) else {
+            return XCTFail("Expected a pipe for measuring the host capacity")
+        }
+        var measuredStat = stat()
+        XCTAssertEqual(fstat(measuredDescriptors[0], &measuredStat), 0)
+        Darwin.close(measuredDescriptors[0])
+        Darwin.close(measuredDescriptors[1])
+        let capacity = UInt64(measuredStat.st_blksize)
+        XCTAssertGreaterThan(capacity, 0)
+
+        var first = continuum_remote_pipe_resource_info()
+        first.resource_identity = 0x1111
+        first.peer_identity = 0x2222
+        first.capacity = capacity
+        var second = continuum_remote_pipe_resource_info()
+        second.resource_identity = 0x2222
+        second.peer_identity = 0x1111
+        second.capacity = capacity
+
+        var recreatedRead: Int32 = -1
+        var recreatedWrite: Int32 = -1
+        XCTAssertEqual(
+            continuum_recreate_closed_empty_pipe_pair(
+                &first,
+                &second,
+                &recreatedRead,
+                &recreatedWrite
+            ),
+            CONTINUUM_STATUS_OK
+        )
+        guard recreatedRead >= 0, recreatedWrite >= 0 else {
+            return XCTFail("Expected a recreated pipe pair")
+        }
+        defer {
+            Darwin.close(recreatedRead)
+            Darwin.close(recreatedWrite)
+        }
+        XCTAssertNotEqual(recreatedRead, recreatedWrite)
+        XCTAssertNotEqual(fcntl(recreatedRead, F_GETFD) & FD_CLOEXEC, 0)
+        XCTAssertNotEqual(fcntl(recreatedWrite, F_GETFD) & FD_CLOEXEC, 0)
+
+        var readStat = stat()
+        var writeStat = stat()
+        XCTAssertEqual(fstat(recreatedRead, &readStat), 0)
+        XCTAssertEqual(fstat(recreatedWrite, &writeStat), 0)
+        XCTAssertEqual(readStat.st_mode & S_IFMT, S_IFIFO)
+        XCTAssertEqual(writeStat.st_mode & S_IFMT, S_IFIFO)
+        XCTAssertEqual(UInt64(readStat.st_blksize), capacity)
+        XCTAssertEqual(UInt64(writeStat.st_blksize), capacity)
+
+        var sent: UInt8 = 0xC7
+        XCTAssertEqual(Darwin.write(recreatedWrite, &sent, 1), 1)
+        var received: UInt8 = 0
+        XCTAssertEqual(Darwin.read(recreatedRead, &received, 1), 1)
+        XCTAssertEqual(received, sent)
+    }
+
+    func testClosedEmptyPipeRecreationRejectsStaleMetadataWithoutLeaks() {
+        func openDescriptors() -> Set<Int32> {
+            var descriptors = Array(repeating: proc_fdinfo(), count: 4096)
+            let bytes = descriptors.withUnsafeMutableBytes { buffer in
+                proc_pidinfo(
+                    getpid(),
+                    PROC_PIDLISTFDS,
+                    0,
+                    buffer.baseAddress,
+                    Int32(buffer.count)
+                )
+            }
+            XCTAssertGreaterThanOrEqual(bytes, 0)
+            let count = max(0, Int(bytes)) / MemoryLayout<proc_fdinfo>.stride
+            return Set(descriptors.prefix(count).map(\.proc_fd))
+        }
+
+        var measuredDescriptors = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(
+            measuredDescriptors.withUnsafeMutableBufferPointer {
+                pipe($0.baseAddress!)
+            },
+            0
+        )
+        guard measuredDescriptors.allSatisfy({ $0 >= 0 }) else {
+            return XCTFail("Expected a pipe for measuring the host capacity")
+        }
+        var measuredStat = stat()
+        XCTAssertEqual(fstat(measuredDescriptors[0], &measuredStat), 0)
+        Darwin.close(measuredDescriptors[0])
+        Darwin.close(measuredDescriptors[1])
+        let capacity = UInt64(measuredStat.st_blksize)
+
+        var first = continuum_remote_pipe_resource_info()
+        first.resource_identity = 0x3333
+        first.peer_identity = 0x4444
+        first.capacity = capacity
+        var second = continuum_remote_pipe_resource_info()
+        second.resource_identity = 0x4444
+        second.peer_identity = 0x3333
+        second.capacity = capacity
+
+        var rejectedFirst: Int32 = 123
+        var rejectedSecond: Int32 = 456
+        var nonreciprocal = second
+        nonreciprocal.peer_identity = 0x5555
+        let descriptorsBeforeMetadataRejection = openDescriptors()
+        XCTAssertEqual(
+            continuum_recreate_closed_empty_pipe_pair(
+                &first,
+                &nonreciprocal,
+                &rejectedFirst,
+                &rejectedSecond
+            ),
+            CONTINUUM_STATUS_VALIDATION_FAILED
+        )
+        XCTAssertEqual(rejectedFirst, -1)
+        XCTAssertEqual(rejectedSecond, -1)
+        XCTAssertEqual(openDescriptors(), descriptorsBeforeMetadataRejection)
+
+        var nonempty = first
+        nonempty.queued_bytes = 1
+        XCTAssertEqual(
+            continuum_recreate_closed_empty_pipe_pair(
+                &nonempty,
+                &second,
+                &rejectedFirst,
+                &rejectedSecond
+            ),
+            CONTINUUM_STATUS_VALIDATION_FAILED
+        )
+        XCTAssertEqual(rejectedFirst, -1)
+        XCTAssertEqual(rejectedSecond, -1)
+
+        var incompatible = second
+        incompatible.capacity &+= 1
+        XCTAssertEqual(
+            continuum_recreate_closed_empty_pipe_pair(
+                &first,
+                &incompatible,
+                &rejectedFirst,
+                &rejectedSecond
+            ),
+            CONTINUUM_STATUS_VALIDATION_FAILED
+        )
+        XCTAssertEqual(rejectedFirst, -1)
+        XCTAssertEqual(rejectedSecond, -1)
+
+        first.capacity &+= 1
+        second.capacity &+= 1
+        let descriptorsBeforeCapacityRejection = openDescriptors()
+        XCTAssertEqual(
+            continuum_recreate_closed_empty_pipe_pair(
+                &first,
+                &second,
+                &rejectedFirst,
+                &rejectedSecond
+            ),
+            CONTINUUM_STATUS_VALIDATION_FAILED
+        )
+        XCTAssertEqual(rejectedFirst, -1)
+        XCTAssertEqual(rejectedSecond, -1)
+        XCTAssertEqual(openDescriptors(), descriptorsBeforeCapacityRejection)
+    }
+
     func testProcessForestExportsAndRecreatesClosedPTYPair() throws {
         let targetURL = Bundle(for: ContinuumRuntimeTests.self).bundleURL
             .deletingLastPathComponent()
