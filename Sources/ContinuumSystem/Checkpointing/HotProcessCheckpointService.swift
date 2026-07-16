@@ -109,7 +109,10 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         var info = continuum_remote_process_group_snapshot_info()
         let resourceBox = HotResourceInventoryCallbackBox(
             fileCheckpointStore: fileCheckpointStore,
-            captureSnapshotID: snapshotID
+            captureSnapshotID: snapshotID,
+            descriptorBootstrapLibraryPath: usesInjectedSafepoints
+                ? bootstrapLibraryPath
+                : nil
         )
         let resourceContext = Unmanaged.passUnretained(resourceBox).toOpaque()
         let roots = UnsafeMutablePointer<Int32>.allocate(
@@ -1552,6 +1555,7 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
     let captureSnapshotID: SnapshotID?
     let restoreSnapshotID: SnapshotID?
     let rollbackSnapshotID: SnapshotID?
+    let descriptorBootstrapLibraryPath: String?
     var inventory: [HotWritableVnode]?
     var tcpEndpoints: [continuum_remote_tcp_endpoint_info]?
     var ptyDescriptors: [continuum_remote_pty_descriptor_info]?
@@ -1563,13 +1567,15 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
         fileCheckpointStore: APFSLocalFileCheckpointStore? = nil,
         captureSnapshotID: SnapshotID? = nil,
         restoreSnapshotID: SnapshotID? = nil,
-        rollbackSnapshotID: SnapshotID? = nil
+        rollbackSnapshotID: SnapshotID? = nil,
+        descriptorBootstrapLibraryPath: String? = nil
     ) {
         self.expectedInventory = expectedInventory
         self.fileCheckpointStore = fileCheckpointStore
         self.captureSnapshotID = captureSnapshotID
         self.restoreSnapshotID = restoreSnapshotID
         self.rollbackSnapshotID = rollbackSnapshotID
+        self.descriptorBootstrapLibraryPath = descriptorBootstrapLibraryPath
     }
 
     func capture(from snapshot: OpaquePointer) -> continuum_status {
@@ -1667,10 +1673,20 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
         ptyDescriptors = capturedPTYDescriptors
 
         var rawGraph: OpaquePointer?
-        status = continuum_remote_process_group_capture_descriptor_graph(
-            snapshot,
-            &rawGraph
-        )
+        if let descriptorBootstrapLibraryPath {
+            status = descriptorBootstrapLibraryPath.withCString {
+                continuum_remote_process_group_capture_descriptor_graph_authenticated(
+                    snapshot,
+                    $0,
+                    &rawGraph
+                )
+            }
+        } else {
+            status = continuum_remote_process_group_capture_descriptor_graph(
+                snapshot,
+                &rawGraph
+            )
+        }
         guard status == CONTINUUM_STATUS_OK, let rawGraph else {
             return status == CONTINUUM_STATUS_OK
                 ? CONTINUUM_STATUS_VALIDATION_FAILED
