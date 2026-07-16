@@ -2474,7 +2474,18 @@ public actor ColdProcessRestorer {
     ) throws -> PreparedDescriptorGraph {
         let endpoints = image.establishedTCPEndpoints ?? []
         let ptyDescriptors = image.ptyDescriptors ?? []
-        guard !endpoints.isEmpty || !ptyDescriptors.isEmpty else {
+        let durableGraph = image.descriptorGraph
+        let pipeHandles = durableGraph?.handles.filter { handle in
+            durableGraph?.pipes.contains(where: { $0.id == handle.resourceID })
+                == true
+        } ?? []
+        guard durableGraph?.kqueues.isEmpty != false else {
+            throw ContinuumError.restoreUnavailable(
+                "This snapshot contains kqueues that Continuum cannot rebuild yet."
+            )
+        }
+        guard !endpoints.isEmpty || !ptyDescriptors.isEmpty
+                || durableGraph?.pipes.isEmpty == false else {
             return PreparedDescriptorGraph(
                 remapsByCapturedProcess: [:],
                 controllerDescriptors: [],
@@ -2504,10 +2515,22 @@ public actor ColdProcessRestorer {
                 )
             }
         }
+        for handle in pipeHandles {
+            guard capturedProcesses.contains(handle.processIdentifier),
+                  handle.fileDescriptor >= 0,
+                  targetDescriptorsByProcess[handle.processIdentifier,
+                    default: []].insert(handle.fileDescriptor).inserted else {
+                throw ContinuumError.integrityFailure(
+                    "The durable pipe graph contains an invalid or duplicate descriptor."
+                )
+            }
+        }
 
         let maximumTarget = (endpoints.map(\.fileDescriptor)
-            + ptyDescriptors.map(\.fileDescriptor)).max() ?? 255
+            + ptyDescriptors.map(\.fileDescriptor)
+            + pipeHandles.map(\.fileDescriptor)).max() ?? 255
         let descriptorCount = endpoints.count + ptyDescriptors.count
+            + pipeHandles.count
         guard maximumTarget < Int32.max - Int32(descriptorCount * 2 + 16) else {
             throw ContinuumError.integrityFailure(
                 "The durable TCP descriptor numbers exceed process limits."
@@ -2526,6 +2549,181 @@ public actor ColdProcessRestorer {
         }
 
         do {
+            if let durableGraph, !durableGraph.pipes.isEmpty {
+                guard Set(durableGraph.pipes.map(\.id)).count
+                        == durableGraph.pipes.count else {
+                    throw ContinuumError.integrityFailure(
+                        "The durable pipe graph contains duplicate resource identities."
+                    )
+                }
+                let pipeByID = Dictionary(
+                    uniqueKeysWithValues: durableGraph.pipes.map { ($0.id, $0) }
+                )
+                let handlesByResource = Dictionary(
+                    grouping: pipeHandles,
+                    by: \.resourceID
+                )
+                guard handlesByResource.keys.allSatisfy({ pipeByID[$0] != nil }),
+                      pipeByID.keys.allSatisfy({ handlesByResource[$0]?.isEmpty == false })
+                else {
+                    throw ContinuumError.integrityFailure(
+                        "The durable pipe graph contains an unowned resource."
+                    )
+                }
+
+                var restoredPipeIDs: Set<UUID> = []
+                for first in durableGraph.pipes.sorted(by: {
+                    $0.id.uuidString < $1.id.uuidString
+                }) where !restoredPipeIDs.contains(first.id) {
+                    guard let second = pipeByID[first.peerResourceID],
+                          second.peerResourceID == first.id,
+                          second.id != first.id else {
+                        throw ContinuumError.integrityFailure(
+                            "The durable pipe graph contains a nonreciprocal peer."
+                        )
+                    }
+                    guard !restoredPipeIDs.contains(second.id),
+                          let firstHandles = handlesByResource[first.id],
+                          let secondHandles = handlesByResource[second.id],
+                          let firstStatus = firstHandles.first?.statusFlags,
+                          let secondStatus = secondHandles.first?.statusFlags,
+                          firstHandles.allSatisfy({ $0.statusFlags == firstStatus }),
+                          secondHandles.allSatisfy({ $0.statusFlags == secondStatus }),
+                          firstHandles.allSatisfy({ $0.descriptorFlags == 0 }),
+                          secondHandles.allSatisfy({ $0.descriptorFlags == 0 }) else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved pipe has inconsistent aliases or per-descriptor flags that require bootstrap replay."
+                        )
+                    }
+
+                    let firstAccess = firstStatus & O_ACCMODE
+                    let secondAccess = secondStatus & O_ACCMODE
+                    let readResource: DurablePipeResource
+                    let writeResource: DurablePipeResource
+                    let readHandles: [DurableDescriptorHandle]
+                    let writeHandles: [DurableDescriptorHandle]
+                    let readStatus: Int32
+                    let writeStatus: Int32
+                    if firstAccess == O_RDONLY, secondAccess == O_WRONLY {
+                        readResource = first
+                        writeResource = second
+                        readHandles = firstHandles
+                        writeHandles = secondHandles
+                        readStatus = firstStatus
+                        writeStatus = secondStatus
+                    } else if firstAccess == O_WRONLY, secondAccess == O_RDONLY {
+                        readResource = second
+                        writeResource = first
+                        readHandles = secondHandles
+                        writeHandles = firstHandles
+                        readStatus = secondStatus
+                        writeStatus = firstStatus
+                    } else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved pipe does not contain one read end and one write end."
+                        )
+                    }
+
+                    let mutableStatusMask = O_NONBLOCK | O_APPEND | O_ASYNC
+                    let supportedStatusMask = O_ACCMODE | mutableStatusMask
+                    guard readStatus & ~supportedStatusMask == 0,
+                          writeStatus & ~supportedStatusMask == 0 else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved pipe uses status flags Continuum cannot replay yet."
+                        )
+                    }
+
+                    var readRuntime = continuum_remote_pipe_resource_info()
+                    readRuntime.resource_identity = 1
+                    readRuntime.peer_identity = 2
+                    readRuntime.capacity = readResource.capacity
+                    readRuntime.queued_bytes = readResource.queuedBytes
+                    readRuntime.status = readResource.status
+                    var writeRuntime = continuum_remote_pipe_resource_info()
+                    writeRuntime.resource_identity = 2
+                    writeRuntime.peer_identity = 1
+                    writeRuntime.capacity = writeResource.capacity
+                    writeRuntime.queued_bytes = writeResource.queuedBytes
+                    writeRuntime.status = writeResource.status
+                    var recreatedRead: Int32 = -1
+                    var recreatedWrite: Int32 = -1
+                    let recreateStatus = continuum_recreate_closed_empty_pipe_pair(
+                        &readRuntime,
+                        &writeRuntime,
+                        &recreatedRead,
+                        &recreatedWrite
+                    )
+                    guard recreateStatus == CONTINUUM_STATUS_OK,
+                          recreatedRead >= 0,
+                          recreatedWrite >= 0 else {
+                        if recreatedRead >= 0 { Darwin.close(recreatedRead) }
+                        if recreatedWrite >= 0 { Darwin.close(recreatedWrite) }
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not recreate an empty local pipe."
+                        )
+                    }
+
+                    let promotedRead = fcntl(
+                        recreatedRead,
+                        F_DUPFD_CLOEXEC,
+                        nextControllerDescriptor
+                    )
+                    if promotedRead >= 0 {
+                        nextControllerDescriptor = promotedRead + 1
+                    }
+                    let promotedWrite = promotedRead < 0 ? -1 : fcntl(
+                        recreatedWrite,
+                        F_DUPFD_CLOEXEC,
+                        nextControllerDescriptor
+                    )
+                    Darwin.close(recreatedRead)
+                    Darwin.close(recreatedWrite)
+                    guard promotedRead >= 0, promotedWrite >= 0 else {
+                        if promotedRead >= 0 { Darwin.close(promotedRead) }
+                        if promotedWrite >= 0 { Darwin.close(promotedWrite) }
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not isolate recreated pipe descriptors for relaunch."
+                        )
+                    }
+                    nextControllerDescriptor = promotedWrite + 1
+                    controllerDescriptors.append(contentsOf: [
+                        promotedRead, promotedWrite,
+                    ])
+
+                    guard fcntl(
+                        promotedRead,
+                        F_SETFL,
+                        readStatus & mutableStatusMask
+                    ) == 0,
+                    fcntl(
+                        promotedWrite,
+                        F_SETFL,
+                        writeStatus & mutableStatusMask
+                    ) == 0 else {
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not replay saved pipe status flags."
+                        )
+                    }
+
+                    for handle in readHandles {
+                        remapsByProcess[handle.processIdentifier, default: []]
+                            .append(continuum_spawn_descriptor_remap(
+                                source_descriptor: promotedRead,
+                                target_descriptor: handle.fileDescriptor
+                            ))
+                    }
+                    for handle in writeHandles {
+                        remapsByProcess[handle.processIdentifier, default: []]
+                            .append(continuum_spawn_descriptor_remap(
+                                source_descriptor: promotedWrite,
+                                target_descriptor: handle.fileDescriptor
+                            ))
+                    }
+                    restoredPipeIDs.insert(readResource.id)
+                    restoredPipeIDs.insert(writeResource.id)
+                }
+            }
+
             while let firstIndex = remaining.min() {
                 let first = endpoints[firstIndex]
                 let matches = remaining.filter { candidateIndex in

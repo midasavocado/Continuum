@@ -410,6 +410,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         guard continuum_remote_process_group_member_count(snapshot) > 0 else {
             return false
         }
+        var capturedProcessIdentifiers: Set<Int32> = []
         for memberIndex in 0..<continuum_remote_process_group_member_count(snapshot) {
             var member = continuum_remote_process_group_member_info()
             guard continuum_remote_process_group_copy_member_info(
@@ -419,6 +420,7 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             ) == CONTINUUM_STATUS_OK else {
                 return false
             }
+            capturedProcessIdentifiers.insert(member.process_id)
             guard let launch = try? launchContract(
                 snapshot: snapshot,
                 memberIndex: memberIndex
@@ -510,6 +512,32 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         }
         guard descriptorGraph.handles.allSatisfy({
             $0.descriptorFlags >= 0
+        }) else {
+            return false
+        }
+        guard descriptorGraph.kqueues.isEmpty else { return false }
+        guard Set(descriptorGraph.pipes.map(\.id)).count
+                == descriptorGraph.pipes.count else {
+            return false
+        }
+        let pipeByID = Dictionary(
+            uniqueKeysWithValues: descriptorGraph.pipes.map { ($0.id, $0) }
+        )
+        let pipeHandles = descriptorGraph.handles.filter {
+            pipeByID[$0.resourceID] != nil
+        }
+        let handlesByPipe = Dictionary(grouping: pipeHandles, by: \.resourceID)
+        guard descriptorGraph.pipes.allSatisfy({ pipe in
+            pipe.queuedBytes == 0
+                && pipe.peerResourceID != pipe.id
+                && pipeByID[pipe.peerResourceID]?.peerResourceID == pipe.id
+                && handlesByPipe[pipe.id]?.isEmpty == false
+        }), pipeHandles.allSatisfy({ handle in
+            capturedProcessIdentifiers.contains(handle.processIdentifier)
+                && handle.descriptorFlags == 0
+                && handlesByPipe[handle.resourceID]?.allSatisfy({
+                    $0.statusFlags == handle.statusFlags
+                }) == true
         }) else {
             return false
         }
