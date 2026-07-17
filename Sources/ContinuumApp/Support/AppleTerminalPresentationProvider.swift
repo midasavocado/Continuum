@@ -23,16 +23,21 @@ enum AppleTerminalPresentationProvider {
                 "Continuum's managed command helper is missing."
             )
         }
-        let wrappers = try prepareCommandWrappers(managedExecURL: managedExecURL)
         let inheritedPath = ProcessInfo.processInfo.environment["PATH"]
             ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let originalPath = effectiveOriginalPath(inheritedPath: inheritedPath)
+        let wrappers = try prepareCommandWrappers(
+            managedExecURL: managedExecURL,
+            originalPath: originalPath,
+            fallbackDirectories: []
+        )
         let environment = [
             "CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=1",
             "CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1",
             "DYLD_SHARED_REGION=private",
             "MallocLargeCache=0",
-            "PROMPT=Continuum %~ %# ",
-            "PATH=\(wrappers.path):\(inheritedPath)",
+            "PROMPT=Continuum %~ %# "
+        ] + terminalPathEnvironment(wrappers: wrappers, originalPath: originalPath) + [
             "DYLD_INSERT_LIBRARIES=\(bootstrapURL.path)"
         ]
         let command = "exec /usr/bin/env "
@@ -160,8 +165,13 @@ enum AppleTerminalPresentationProvider {
         }
     }
 
-    private static func prepareCommandWrappers(managedExecURL: URL) throws -> URL {
-        let base = try FileManager.default.url(
+    static func prepareCommandWrappers(
+        managedExecURL: URL,
+        originalPath: String,
+        base providedBase: URL? = nil,
+        fallbackDirectories: [String] = ["/opt/homebrew/bin", "/usr/local/bin"]
+    ) throws -> URL {
+        let base = try providedBase ?? FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
@@ -175,15 +185,22 @@ enum AppleTerminalPresentationProvider {
             attributes: [.posixPermissions: NSNumber(value: 0o700)]
         )
 
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
         var searchDirectories: [String] = []
         var seenDirectories: Set<String> = []
-        for directory in path.split(separator: ":").map(String.init)
-            + ["/opt/homebrew/bin", "/usr/local/bin"]
+        for directory in originalPath.split(separator: ":").map(String.init)
+            + fallbackDirectories
         where seenDirectories.insert(directory).inserted {
             searchDirectories.append(directory)
         }
-        var installedNames: Set<String> = []
+        let serviceWrapper = wrappers.appendingPathComponent("continuum-with-service")
+        let serviceScript = "#!/bin/zsh\nexec \(shellQuote(managedExecURL.path)) --continuum-with-service \"$@\"\n"
+        try serviceScript.write(to: serviceWrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o700)],
+            ofItemAtPath: serviceWrapper.path
+        )
+
+        var installedNames: Set<String> = [serviceWrapper.lastPathComponent]
         for directory in searchDirectories {
             guard let entries = try? FileManager.default.contentsOfDirectory(
                 at: URL(fileURLWithPath: directory, isDirectory: true),
@@ -210,6 +227,23 @@ enum AppleTerminalPresentationProvider {
             }
         }
         return wrappers
+    }
+
+    static func effectiveOriginalPath(
+        inheritedPath: String,
+        fallbackDirectories: [String] = ["/opt/homebrew/bin", "/usr/local/bin"]
+    ) -> String {
+        var seen: Set<String> = []
+        return (inheritedPath.split(separator: ":").map(String.init) + fallbackDirectories)
+            .filter { $0.hasPrefix("/") && seen.insert($0).inserted }
+            .joined(separator: ":")
+    }
+
+    static func terminalPathEnvironment(wrappers: URL, originalPath: String) -> [String] {
+        [
+            "CONTINUUM_ORIGINAL_PATH=\(originalPath)",
+            "PATH=\(wrappers.path):\(originalPath)"
+        ]
     }
 
     private static func isMachOExecutable(_ url: URL) -> Bool {

@@ -206,12 +206,12 @@ public actor ColdProcessRestorer {
         let handle: OpaquePointer
     }
 
-    private struct PreparedPresentationMaster {
+    struct PreparedPresentationMaster {
         let ttyIndex: UInt32
         let descriptor: Int32
     }
 
-    private struct PreparedDescriptorGraph {
+    struct PreparedDescriptorGraph {
         let remapsByCapturedProcess: [Int32: [continuum_spawn_descriptor_remap]]
         let controllerDescriptors: [Int32]
         let presentationMasters: [PreparedPresentationMaster]
@@ -223,7 +223,7 @@ public actor ColdProcessRestorer {
         let kqueues: [BootstrapKqueue]
     }
 
-    private struct BootstrapKqueue {
+    struct BootstrapKqueue {
         let resource: DurableKqueueResource
         let handle: DurableDescriptorHandle
     }
@@ -2905,7 +2905,7 @@ public actor ColdProcessRestorer {
         }
     }
 
-    private func prepareDescriptorGraph(
+    func prepareDescriptorGraph(
         for image: DurableCheckpointImage
     ) throws -> PreparedDescriptorGraph {
         // Format-seven images use the normalized graph as the sole socket source
@@ -3283,6 +3283,95 @@ public actor ColdProcessRestorer {
                 }
 
                 var restoredSocketIDs = Set(listenerDescriptors.keys)
+                for first in durableGraph.sockets.filter({
+                    $0.kind == .unixConnected
+                }).sorted(by: {
+                    $0.id.uuidString < $1.id.uuidString
+                }) where !restoredSocketIDs.contains(first.id) {
+                    guard let peerID = first.peerResourceID,
+                          let second = socketByID[peerID],
+                          second.peerResourceID == first.id,
+                          second.id != first.id,
+                          first.domain == second.domain,
+                          first.type == second.type,
+                          first.protocol == second.protocol,
+                          first.localAddress == second.remoteAddress,
+                          first.remoteAddress == second.localAddress,
+                          let firstHandles = handlesByResource[first.id],
+                          let secondHandles = handlesByResource[second.id],
+                          let firstHandle = firstHandles.first,
+                          let secondHandle = secondHandles.first else {
+                        throw ContinuumError.integrityFailure(
+                            "The durable Unix socket graph contains a nonreciprocal peer."
+                        )
+                    }
+                    let pair = try Self.createEmptyUnixSocketPair(
+                        first: first,
+                        second: second
+                    )
+                    let firstDescriptor = pair.first
+                    let secondDescriptor = pair.second
+                    let mutableStatusMask = O_NONBLOCK
+                    guard fcntl(
+                        firstDescriptor,
+                        F_SETFL,
+                        firstHandle.statusFlags & mutableStatusMask
+                    ) == 0,
+                    fcntl(
+                        secondDescriptor,
+                        F_SETFL,
+                        secondHandle.statusFlags & mutableStatusMask
+                    ) == 0 else {
+                        Darwin.close(firstDescriptor)
+                        Darwin.close(secondDescriptor)
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not replay saved Unix socket status flags."
+                        )
+                    }
+
+                    let promotedFirst = fcntl(
+                        firstDescriptor,
+                        F_DUPFD_CLOEXEC,
+                        nextControllerDescriptor
+                    )
+                    if promotedFirst >= 0 {
+                        nextControllerDescriptor = promotedFirst + 1
+                    }
+                    let promotedSecond = promotedFirst < 0 ? -1 : fcntl(
+                        secondDescriptor,
+                        F_DUPFD_CLOEXEC,
+                        nextControllerDescriptor
+                    )
+                    Darwin.close(firstDescriptor)
+                    Darwin.close(secondDescriptor)
+                    guard promotedFirst >= 0, promotedSecond >= 0 else {
+                        if promotedFirst >= 0 { Darwin.close(promotedFirst) }
+                        if promotedSecond >= 0 { Darwin.close(promotedSecond) }
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not isolate recreated Unix socket descriptors for relaunch."
+                        )
+                    }
+                    nextControllerDescriptor = promotedSecond + 1
+                    controllerDescriptors.append(contentsOf: [
+                        promotedFirst, promotedSecond,
+                    ])
+                    for handle in firstHandles {
+                        remapsByProcess[handle.processIdentifier, default: []]
+                            .append(continuum_spawn_descriptor_remap(
+                                source_descriptor: promotedFirst,
+                                target_descriptor: handle.fileDescriptor
+                            ))
+                    }
+                    for handle in secondHandles {
+                        remapsByProcess[handle.processIdentifier, default: []]
+                            .append(continuum_spawn_descriptor_remap(
+                                source_descriptor: promotedSecond,
+                                target_descriptor: handle.fileDescriptor
+                            ))
+                    }
+                    restoredSocketIDs.insert(first.id)
+                    restoredSocketIDs.insert(second.id)
+                }
                 for first in durableGraph.sockets.filter({
                     $0.kind == .tcpConnected
                 }).sorted(by: {
@@ -3743,7 +3832,7 @@ public actor ColdProcessRestorer {
         return false
     }
 
-    private static func validateColdSockets(
+    static func validateColdSockets(
         graph: DurableDescriptorGraph,
         handles: [DurableDescriptorHandle],
         capturedProcessIdentifiers: Set<Int32>
@@ -3762,14 +3851,10 @@ public actor ColdProcessRestorer {
         }
         let supportedStatusMask = O_ACCMODE | O_NONBLOCK | O_ASYNC
         for socket in graph.sockets {
-            guard (socket.domain == AF_INET || socket.domain == AF_INET6),
-                  socket.type == SOCK_STREAM,
-                  socket.protocol == IPPROTO_TCP,
+            guard socket.type == SOCK_STREAM,
                   socket.receiveQueueBytes == 0,
                   socket.sendQueueBytes == 0,
                   socket.externalPath == nil,
-                  let localAddress = socket.localAddress,
-                  isExactLoopbackAddress(localAddress, domain: socket.domain),
                   let resourceHandles = handlesByResource[socket.id],
                   let representative = resourceHandles.first,
                   resourceHandles.allSatisfy({ handle in
@@ -3787,6 +3872,17 @@ public actor ColdProcessRestorer {
             }
             switch socket.kind {
             case .tcpListener:
+                guard (socket.domain == AF_INET || socket.domain == AF_INET6),
+                      socket.protocol == IPPROTO_TCP,
+                      let localAddress = socket.localAddress,
+                      isExactLoopbackAddress(
+                          localAddress,
+                          domain: socket.domain
+                      ) else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved TCP listener has an invalid local address."
+                    )
+                }
                 let options = try socketOptionValues(socket)
                 guard socket.remoteAddress == nil,
                       socket.peerResourceID == nil,
@@ -3809,6 +3905,17 @@ public actor ColdProcessRestorer {
                     )
                 }
             case .tcpConnected:
+                guard (socket.domain == AF_INET || socket.domain == AF_INET6),
+                      socket.protocol == IPPROTO_TCP,
+                      let localAddress = socket.localAddress,
+                      isExactLoopbackAddress(
+                          localAddress,
+                          domain: socket.domain
+                      ) else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved TCP stream has an invalid local address."
+                    )
+                }
                 let options = try socketOptionValues(socket)
                 let hasReplayableOptions = options.isEmpty || (
                     Set(options.keys) == Set([
@@ -3843,12 +3950,161 @@ public actor ColdProcessRestorer {
                         )
                     }
                 }
-            default:
+            case .unixConnected:
+                let options = try socketOptionValues(socket)
+                guard socket.domain == AF_UNIX,
+                      socket.protocol == 0,
+                      socket.localAddress == nil,
+                      socket.remoteAddress == nil,
+                      socket.backlog == nil,
+                      socket.listenerResourceID == nil,
+                      socket.tcpNoDelay == nil,
+                      Set(options.keys) == Set([SO_RCVBUF, SO_SNDBUF]),
+                      options[SO_RCVBUF, default: 0] > 0,
+                      options[SO_SNDBUF, default: 0] > 0,
+                      let peerID = socket.peerResourceID,
+                      peerID != socket.id,
+                      let peer = socketsByID[peerID],
+                      peer.kind == .unixConnected,
+                      peer.domain == socket.domain,
+                      peer.type == socket.type,
+                      peer.protocol == socket.protocol,
+                      peer.peerResourceID == socket.id,
+                      peer.localAddress == socket.remoteAddress,
+                      peer.remoteAddress == socket.localAddress,
+                      peer.sendShutdown == socket.receiveShutdown,
+                      peer.receiveShutdown == socket.sendShutdown else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved Unix stream is not an empty unnamed reciprocal socket pair."
+                    )
+                }
+                guard resourceHandles.allSatisfy({
+                    $0.statusFlags & O_ASYNC == 0
+                }) else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved Unix stream uses asynchronous ownership state Continuum cannot replay."
+                    )
+                }
+            case .unixListener:
                 throw ContinuumError.restoreUnavailable(
-                    "Unix and non-TCP sockets cannot be cold-restored yet."
+                    "Unix listeners cannot be cold-restored yet."
                 )
             }
         }
+    }
+
+    static func createEmptyUnixSocketPair(
+        first: DurableSocketResource,
+        second: DurableSocketResource
+    ) throws -> (first: Int32, second: Int32) {
+        guard first.kind == .unixConnected,
+              second.kind == .unixConnected,
+              first.domain == AF_UNIX,
+              second.domain == AF_UNIX,
+              first.type == SOCK_STREAM,
+              second.type == SOCK_STREAM,
+              first.protocol == 0,
+              second.protocol == 0,
+              first.receiveQueueBytes == 0,
+              first.sendQueueBytes == 0,
+              second.receiveQueueBytes == 0,
+              second.sendQueueBytes == 0,
+              first.localAddress == nil,
+              first.remoteAddress == nil,
+              second.localAddress == nil,
+              second.remoteAddress == nil,
+              first.externalPath == nil,
+              second.externalPath == nil,
+              first.backlog == nil,
+              second.backlog == nil,
+              first.listenerResourceID == nil,
+              second.listenerResourceID == nil,
+              first.tcpNoDelay == nil,
+              second.tcpNoDelay == nil,
+              first.peerResourceID == second.id,
+              second.peerResourceID == first.id,
+              first.sendShutdown == second.receiveShutdown,
+              first.receiveShutdown == second.sendShutdown else {
+            throw ContinuumError.integrityFailure(
+                "A durable Unix socket pair is not reciprocal."
+            )
+        }
+        var descriptors = [Int32](repeating: -1, count: 2)
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0,
+              fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) == 0,
+              fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) == 0 else {
+            let savedError = errno
+            descriptors.forEach { if $0 >= 0 { Darwin.close($0) } }
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not recreate an unnamed Unix socket pair (errno \(savedError))."
+            )
+        }
+        var keepDescriptors = false
+        defer {
+            if !keepDescriptors {
+                Darwin.close(descriptors[0])
+                Darwin.close(descriptors[1])
+            }
+        }
+        guard try replayUnixSocketOptions(
+            descriptor: descriptors[0],
+            resource: first
+        ), try replayUnixSocketOptions(
+            descriptor: descriptors[1],
+            resource: second
+        ), applyUnixPairShutdowns(
+            firstDescriptor: descriptors[0],
+            first: first,
+            secondDescriptor: descriptors[1],
+            second: second
+        ) else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not replay saved Unix socket options or half-close state."
+            )
+        }
+        keepDescriptors = true
+        return (descriptors[0], descriptors[1])
+    }
+
+    private static func replayUnixSocketOptions(
+        descriptor: Int32,
+        resource: DurableSocketResource
+    ) throws -> Bool {
+        let options = try socketOptionValues(resource)
+        guard Set(options.keys) == Set([SO_RCVBUF, SO_SNDBUF]) else {
+            return false
+        }
+        for name in [SO_RCVBUF, SO_SNDBUF] {
+            guard let value = options[name], value > 0,
+                  setSocketOption(
+                      descriptor: descriptor,
+                      name: name,
+                      value: value
+                  ), socketOption(
+                      descriptor: descriptor,
+                      name: name
+                  ) == value else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func applyUnixPairShutdowns(
+        firstDescriptor: Int32,
+        first: DurableSocketResource,
+        secondDescriptor: Int32,
+        second: DurableSocketResource
+    ) -> Bool {
+        if first.sendShutdown,
+           Darwin.shutdown(firstDescriptor, SHUT_WR) != 0 {
+            return false
+        }
+        if second.sendShutdown,
+           Darwin.shutdown(secondDescriptor, SHUT_WR) != 0 {
+            return false
+        }
+        return true
     }
 
     private static func setSocketOption(
@@ -5039,7 +5295,7 @@ public actor ColdProcessRestorer {
         }
     }
 
-    private static func bootstrapDescriptorPlan(
+    static func bootstrapDescriptorPlan(
         _ descriptors: [DurableWritableFileDescriptor],
         pipeHandles: [DurableDescriptorHandle] = [],
         socketHandles: [DurableDescriptorHandle] = [],
@@ -5113,7 +5369,8 @@ public actor ColdProcessRestorer {
                     "The durable pipe-descriptor plan is invalid."
                 )
             }
-            let prefix = socketHandles.isEmpty ? "PIPE" : "RESOURCE 1"
+            let prefix = socketHandles.isEmpty && kqueues.isEmpty
+                ? "PIPE" : "RESOURCE 1"
             lines.append(
                 "\(prefix) \(handle.fileDescriptor) \(handle.descriptorFlags) "
                     + "\(handle.statusFlags)"

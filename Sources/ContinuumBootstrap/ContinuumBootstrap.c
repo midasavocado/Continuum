@@ -732,7 +732,9 @@ static int continuum_bootstrap_run_broker(int channel, int is_child) {
         || setup.remap_count > CONTINUUM_BROKER_MAX_REMAPS
         || setup.captured_process_id <= 0
         || setup.captured_process_group_id <= 0
-        || setup.foreground_process_group_id <= 0) {
+        || setup.foreground_process_group_id < 0
+        || (setup.foreground_process_group_id == 0
+            && setup.controlling_terminal_descriptor >= 0)) {
         return -1;
     }
     int32_t targets[CONTINUUM_BROKER_MAX_REMAPS];

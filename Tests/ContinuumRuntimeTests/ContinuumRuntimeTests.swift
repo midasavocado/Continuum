@@ -2665,6 +2665,145 @@ final class ContinuumRuntimeTests: XCTestCase {
         )
     }
 
+    func testDescriptorGraphExportsReciprocalUnnamedUnixSocketPair() throws {
+        let fixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("continuum-unix-graph-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: fixtureRoot,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+        let fixture = fixtureRoot.appendingPathComponent("cat")
+        try FileManager.default.copyItem(
+            at: URL(fileURLWithPath: "/bin/cat"),
+            to: fixture
+        )
+        let entitlements = fixtureRoot.appendingPathComponent("debug.entitlements")
+        try """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+        "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>
+        """.write(to: entitlements, atomically: true, encoding: .utf8)
+        let signer = Process()
+        signer.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        signer.arguments = [
+            "--force", "--sign", "-", "--entitlements",
+            entitlements.path, fixture.path,
+        ]
+        signer.standardOutput = FileHandle.nullDevice
+        signer.standardError = FileHandle.nullDevice
+        try signer.run()
+        signer.waitUntilExit()
+        XCTAssertEqual(signer.terminationStatus, 0)
+
+        var endpoints = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &endpoints), 0)
+        guard endpoints.allSatisfy({ $0 >= 0 }) else {
+            return XCTFail("Expected an unnamed Unix socket pair")
+        }
+        let input = FileHandle(
+            fileDescriptor: endpoints[0],
+            closeOnDealloc: true
+        )
+        let output = FileHandle(
+            fileDescriptor: endpoints[1],
+            closeOnDealloc: true
+        )
+        let process = Process()
+        process.executableURL = fixture
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        input.closeFile()
+        output.closeFile()
+        endpoints = [-1, -1]
+        defer {
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+        }
+
+        let capture = ContinuumTestDescriptorGraphCapture()
+        var snapshot: OpaquePointer?
+        var info = continuum_remote_process_group_snapshot_info()
+        XCTAssertEqual(
+            continuum_remote_process_group_capture_with_resources(
+                process.processIdentifier,
+                512 * 1_024 * 1_024,
+                continuumTestDescriptorGraphResourceCallback,
+                Unmanaged.passUnretained(capture).toOpaque(),
+                &snapshot,
+                &info
+            ),
+            CONTINUUM_STATUS_OK
+        )
+        defer {
+            if let snapshot {
+                continuum_remote_process_group_snapshot_destroy(snapshot)
+            }
+        }
+        XCTAssertEqual(capture.status, CONTINUUM_STATUS_OK)
+        XCTAssertEqual(capture.sockets.count, 2)
+        guard capture.sockets.count == 2 else { return }
+        let socketsByID = Dictionary(
+            uniqueKeysWithValues: capture.sockets.map {
+                ($0.resource_identity, $0)
+            }
+        )
+        for socket in capture.sockets {
+            XCTAssertEqual(
+                socket.kind,
+                CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED
+            )
+            XCTAssertEqual(socket.domain, AF_UNIX)
+            XCTAssertEqual(socket.socket_type, SOCK_STREAM)
+            XCTAssertEqual(socket.protocol, 0)
+            XCTAssertEqual(socket.local_address_length, 0)
+            XCTAssertEqual(socket.remote_address_length, 0)
+            XCTAssertEqual(socket.receive_queue_bytes, 0)
+            XCTAssertEqual(socket.send_queue_bytes, 0)
+            let allowedState = UInt32(
+                SOI_S_ISCONNECTED | SOI_S_CANTSENDMORE
+                    | SOI_S_CANTRCVMORE | SOI_S_NBIO
+            )
+            XCTAssertNotEqual(
+                socket.socket_state & UInt32(SOI_S_ISCONNECTED),
+                0
+            )
+            XCTAssertEqual(socket.socket_state & ~allowedState, 0)
+            let resourceHandles = capture.handles.filter {
+                $0.resource_identity == socket.resource_identity
+            }
+            XCTAssertFalse(resourceHandles.isEmpty)
+            for handle in resourceHandles {
+                XCTAssertEqual(handle.status_flags & O_ASYNC, 0)
+                XCTAssertEqual(
+                    handle.status_flags & O_NONBLOCK != 0,
+                    socket.socket_state & UInt32(SOI_S_NBIO) != 0
+                )
+            }
+            XCTAssertNotEqual(socket.peer_identity, socket.resource_identity)
+            guard let peer = socketsByID[socket.peer_identity] else {
+                XCTFail("Expected the captured reciprocal Unix peer")
+                continue
+            }
+            XCTAssertEqual(peer.peer_identity, socket.resource_identity)
+            XCTAssertEqual(peer.send_shutdown, socket.receive_shutdown)
+            XCTAssertEqual(peer.receive_shutdown, socket.send_shutdown)
+        }
+        XCTAssertGreaterThanOrEqual(
+            capture.handles.filter {
+                $0.process_id == process.processIdentifier
+                    && ($0.file_descriptor == STDIN_FILENO
+                        || $0.file_descriptor == STDOUT_FILENO)
+            }.count,
+            2
+        )
+    }
+
     func testRecreatesClosedEmptyReciprocalPipePair() {
         var measuredDescriptors = [Int32](repeating: -1, count: 2)
         XCTAssertEqual(
@@ -3609,6 +3748,113 @@ final class ContinuumRuntimeTests: XCTestCase {
                 return spec
             }
         }
+
+        var noTTYZeroForeground = specifications(invalidLeaf: false)
+        let noTTYRootIndex = definitions.firstIndex {
+            $0.process == rootB
+        }!
+        noTTYZeroForeground[noTTYRootIndex].foreground_process_group_id = 0
+        var noTTYForest: OpaquePointer?
+        XCTAssertEqual(
+            noTTYZeroForeground.withUnsafeBufferPointer { processBuffer in
+                bootstrapURL.path.withCString { bootstrap in
+                    continuum_brokered_forest_prepare(
+                        bootstrap,
+                        processBuffer.baseAddress,
+                        processBuffer.count,
+                        &noTTYForest
+                    )
+                }
+            },
+            CONTINUUM_STATUS_OK,
+            "A no-TTY service root must accept foreground process group zero"
+        )
+        guard let noTTYForest else {
+            return XCTFail("Expected a prepared no-TTY forest")
+        }
+        XCTAssertEqual(
+            continuum_brokered_forest_abort(noTTYForest, 3_000),
+            CONTINUUM_STATUS_OK
+        )
+
+        var timedForest: OpaquePointer?
+        let timedSpecifications = specifications(invalidLeaf: false)
+        XCTAssertEqual(
+            timedSpecifications.withUnsafeBufferPointer { processBuffer in
+                bootstrapURL.path.withCString { bootstrap in
+                    continuum_brokered_forest_prepare(
+                        bootstrap,
+                        processBuffer.baseAddress,
+                        processBuffer.count,
+                        &timedForest
+                    )
+                }
+            },
+            CONTINUUM_STATUS_OK
+        )
+        guard let timedForest else {
+            return XCTFail("Expected a forest for traced-abort coverage")
+        }
+        var timedIdentities = Array(
+            repeating: continuum_brokered_process_identity(),
+            count: definitions.count
+        )
+        var timedIdentityCount = 0
+        XCTAssertEqual(
+            timedIdentities.withUnsafeMutableBufferPointer {
+                continuum_brokered_forest_process_identities(
+                    timedForest,
+                    $0.baseAddress,
+                    $0.count,
+                    &timedIdentityCount
+                )
+            },
+            CONTINUUM_STATUS_OK
+        )
+        let timedAdvance = continuum_brokered_forest_advance_to_entry_stops(
+            timedForest,
+            1
+        )
+        XCTAssertNotEqual(timedAdvance, CONTINUUM_STATUS_OK)
+        XCTAssertNotEqual(
+            timedAdvance,
+            CONTINUUM_STATUS_ROLLBACK_FAILED,
+            "A timed-out traced forest must be killed and fully reaped"
+        )
+        XCTAssertEqual(timedIdentityCount, definitions.count)
+        for identity in timedIdentities {
+            errno = 0
+            XCTAssertEqual(kill(identity.replacement_process_id, 0), -1)
+            XCTAssertEqual(errno, ESRCH)
+        }
+
+        var TTYZeroForeground = specifications(invalidLeaf: false)
+        let TTYRootIndex = definitions.firstIndex {
+            $0.process == rootA
+        }!
+        TTYZeroForeground[TTYRootIndex].foreground_process_group_id = 0
+        TTYZeroForeground[TTYRootIndex].topology
+            .controlling_terminal_descriptor = 300
+        var invalidTTYForest: OpaquePointer?
+        XCTAssertEqual(
+            TTYZeroForeground.withUnsafeBufferPointer { processBuffer in
+                bootstrapURL.path.withCString { bootstrap in
+                    continuum_brokered_forest_prepare(
+                        bootstrap,
+                        processBuffer.baseAddress,
+                        processBuffer.count,
+                        &invalidTTYForest
+                    )
+                }
+            },
+            CONTINUUM_STATUS_INVALID_ARGUMENT,
+            "A controlling-TTY root must reject foreground process group zero"
+        )
+        XCTAssertNil(invalidTTYForest)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: proofRoot.path),
+            []
+        )
 
         var failedForest: OpaquePointer?
         let failing = specifications(invalidLeaf: true)

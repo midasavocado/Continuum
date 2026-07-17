@@ -423,47 +423,92 @@ enum ExternalHotProof {
         environment.append("CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=1")
         environment.append("MallocLargeCache=0")
         environment.append("DYLD_INSERT_LIBRARIES=\(bootstrapPath)")
-        let arguments = [
-            targetPath,
-            "--continuum-pipe-forest-root",
-            observationURL.path,
-        ]
-        var originalRoot: Int32 = 0
-        let launchStatus = withCStringArray(arguments) { argumentEntries in
-            withCStringArray(environment) { environmentEntries in
-                targetPath.withCString { executable in
-                    FileManager.default.currentDirectoryPath.withCString {
-                        workingDirectory in
-                        let remaps = [
-                            continuum_spawn_descriptor_remap(
-                                source_descriptor: ptySlave,
-                                target_descriptor: STDIN_FILENO
-                            ),
-                            continuum_spawn_descriptor_remap(
-                                source_descriptor: ptySlave,
-                                target_descriptor: STDOUT_FILENO
-                            ),
-                            continuum_spawn_descriptor_remap(
-                                source_descriptor: ptySlave,
-                                target_descriptor: STDERR_FILENO
-                            ),
-                        ]
-                        return remaps.withUnsafeBufferPointer { buffer in
-                            continuum_spawn_process_with_remaps(
-                                executable,
-                                argumentEntries,
-                                environmentEntries,
-                                workingDirectory,
-                                buffer.baseAddress,
-                                buffer.count,
-                                1,
-                                &originalRoot
-                            )
+        func launchManaged(
+            arguments: [String],
+            ptySlave: Int32,
+            processIdentifier: inout Int32
+        ) -> continuum_status {
+            withCStringArray(arguments) { argumentEntries in
+                withCStringArray(environment) { environmentEntries in
+                    targetPath.withCString { executable in
+                        FileManager.default.currentDirectoryPath.withCString {
+                            workingDirectory in
+                            let remaps = ptySlave < 0 ? [] : [
+                                continuum_spawn_descriptor_remap(
+                                    source_descriptor: ptySlave,
+                                    target_descriptor: STDIN_FILENO
+                                ),
+                                continuum_spawn_descriptor_remap(
+                                    source_descriptor: ptySlave,
+                                    target_descriptor: STDOUT_FILENO
+                                ),
+                                continuum_spawn_descriptor_remap(
+                                    source_descriptor: ptySlave,
+                                    target_descriptor: STDERR_FILENO
+                                ),
+                            ]
+                            return remaps.withUnsafeBufferPointer { buffer in
+                                continuum_spawn_process_with_remaps(
+                                    executable,
+                                    argumentEntries,
+                                    environmentEntries,
+                                    workingDirectory,
+                                    buffer.baseAddress,
+                                    buffer.count,
+                                    1,
+                                    &processIdentifier
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+
+        let serviceArguments = [
+            targetPath,
+            "--continuum-pipe-forest-service",
+            observationURL.path,
+        ]
+        var originalService: Int32 = 0
+        let serviceLaunchStatus = launchManaged(
+            arguments: serviceArguments,
+            ptySlave: -1,
+            processIdentifier: &originalService
+        )
+        try require(
+            serviceLaunchStatus == CONTINUUM_STATUS_OK
+                && originalService > 0,
+            "managed spawn could not launch the original local service root"
+        )
+        try check(
+            continuum_wait_for_process_stop(originalService, 5_000),
+            operation: "wait for original service bootstrap stop"
+        )
+        try require(
+            kill(originalService, SIGCONT) == 0,
+            "could not release the original service bootstrap stop"
+        )
+        let serviceReady = try await waitForPipeForestService(
+            at: observationURL
+        )
+        try require(
+            serviceReady.processIdentifier == originalService,
+            "target reported the wrong original local service identity"
+        )
+
+        let arguments = [
+            targetPath,
+            "--continuum-pipe-forest-root",
+            observationURL.path,
+            String(serviceReady.port),
+        ]
+        var originalRoot: Int32 = 0
+        let launchStatus = launchManaged(
+            arguments: arguments,
+            ptySlave: ptySlave,
+            processIdentifier: &originalRoot
+        )
         Darwin.close(ptySlave)
         ptySlave = -1
         try require(
@@ -474,13 +519,17 @@ enum ExternalHotProof {
         var originalChild: Int32 = 0
         var originalsReaped = false
         defer {
-            if !originalsReaped, originalRoot > 0 {
+            if !originalsReaped {
                 if originalChild > 0 { kill(originalChild, SIGKILL) }
                 // A failed capture may leave the cooperative safepoint active.
                 // Test cleanup must not wait for target signal handlers.
-                kill(originalRoot, SIGKILL)
+                if originalRoot > 0 { kill(originalRoot, SIGKILL) }
+                if originalService > 0 { kill(originalService, SIGKILL) }
                 var status: Int32 = 0
-                _ = waitpid(originalRoot, &status, 0)
+                if originalRoot > 0 { _ = waitpid(originalRoot, &status, 0) }
+                if originalService > 0 {
+                    _ = waitpid(originalService, &status, 0)
+                }
             }
         }
         try check(
@@ -497,15 +546,20 @@ enum ExternalHotProof {
             "target reported the wrong original forest identities"
         )
         originalChild = ready.child
+        try await waitForPipeForestObservation(
+            "SERVICE_CONNECTED",
+            at: observationURL
+        )
         try require(
             pipeForestParentProcessIdentifier(originalChild) == originalRoot,
             "the original helper was not a direct child of the root"
         )
-        fputs(
-            "pipe-forest proof: capturing original forest root=\(originalRoot) child=\(originalChild)\n",
-            stderr
+        try verifyTerminalServiceTopology(
+            shell: originalRoot,
+            job: originalChild,
+            service: originalService,
+            expectedRootParent: Int32(getpid())
         )
-        fflush(stderr)
 
         let service = HotProcessCheckpointService(
             maximumCapturedBytes: fullProcessCaptureBudget,
@@ -525,12 +579,10 @@ enum ExternalHotProof {
         )
         let capture = try await service.capture(
             app: app,
-            processIdentifiers: [originalRoot, originalChild],
+            processIdentifiers: [originalRoot, originalService],
             kind: .manual,
             branchID: UUID()
         )
-        fputs("pipe-forest proof: durable capture complete\n", stderr)
-        fflush(stderr)
         let storeKey = Data(repeating: 0xA7, count: 32)
         let storeURL = proofRoot.appendingPathComponent("store", isDirectory: true)
         let store = try EncryptedSnapshotStore(
@@ -554,7 +606,15 @@ enum ExternalHotProof {
             $0.kind == .tcpListener
         }
         try require(
-            durableImage.members.count == 2
+            durableImage.members.count == 3
+                && durableImage.members.allSatisfy { member in
+                    !member.regions.isEmpty
+                        && !member.threads.isEmpty
+                        && member.threads.allSatisfy {
+                            $0.generalState.logicalBytes > 0
+                                && $0.vectorState.logicalBytes > 0
+                        }
+                }
                 && durableImage.writableFiles.isEmpty
                 && durableImage.establishedTCPEndpoints?.count == 4
                 && durableImage.descriptorGraph?.sockets.count == 3
@@ -566,16 +626,31 @@ enum ExternalHotProof {
                 && durableImage.descriptorGraph?.kqueues.count == 1
                 && durableImage.descriptorGraph?.kqueues.first?
                     .registrations.count == 2,
-            "durable pipe/TCP forest stored file contents or lost a resource"
+            "durable Terminal/service forest lost memory, registers, or a descriptor resource"
+        )
+        try verifyCapturedTerminalServiceTopology(
+            image: durableImage,
+            shell: originalRoot,
+            job: originalChild,
+            service: originalService,
+            expectedRootParent: Int32(getpid())
         )
 
         try replaceFileBytesPreservingInode(at: sentinelURL, with: futureSentinel)
         try require(kill(originalChild, SIGKILL) == 0, "could not kill original helper")
         try require(kill(originalRoot, SIGKILL) == 0, "could not kill original root")
+        try require(
+            kill(originalService, SIGKILL) == 0,
+            "could not kill original local service"
+        )
         var originalStatus: Int32 = 0
         try require(
             waitpid(originalRoot, &originalStatus, 0) == originalRoot,
             "could not reap the original root"
+        )
+        try require(
+            waitpid(originalService, &originalStatus, 0) == originalService,
+            "could not reap the original local service"
         )
         originalsReaped = true
         for _ in 0..<200 where pipeForestProcessExists(originalChild) {
@@ -583,7 +658,8 @@ enum ExternalHotProof {
         }
         try require(
             !pipeForestProcessExists(originalRoot)
-                && !pipeForestProcessExists(originalChild),
+                && !pipeForestProcessExists(originalChild)
+                && !pipeForestProcessExists(originalService),
             "the complete original forest was not exited and reaped"
         )
 
@@ -599,8 +675,6 @@ enum ExternalHotProof {
             from: snapshot.id,
             repository: reopenedStore
         )
-        fputs("pipe-forest proof: cold preparation complete\n", stderr)
-        fflush(stderr)
         var committed = false
         defer {
             if !committed {
@@ -613,21 +687,33 @@ enum ExternalHotProof {
         let childMember = preparation.members.first {
             $0.capturedProcessIdentifier == originalChild
         }
-        guard let rootMember, let childMember else {
+        let serviceMember = preparation.members.first {
+            $0.capturedProcessIdentifier == originalService
+        }
+        guard let rootMember, let childMember, let serviceMember else {
             throw ExternalHotProofFailure.invariant(
-                "cold preparation lost the root/helper mapping"
+                "cold preparation lost the shell/job/service mapping"
             )
         }
         let replacementRoot = rootMember.replacementProcessIdentifier
         let replacementChild = childMember.replacementProcessIdentifier
+        let replacementService = serviceMember.replacementProcessIdentifier
+        let originalIdentifiers = Set([
+            originalRoot, originalChild, originalService,
+        ])
+        let replacementIdentifiers = Set([
+            replacementRoot, replacementChild, replacementService,
+        ])
         try require(
-            replacementRoot != originalRoot
-                && replacementRoot != originalChild
-                && replacementChild != originalRoot
-                && replacementChild != originalChild
-                && replacementRoot != replacementChild
-                && childMember.replacementParentProcessIdentifier != nil,
-            "cold preparation did not create a new exact parent/child forest"
+            originalIdentifiers.isDisjoint(with: replacementIdentifiers)
+                && replacementIdentifiers.count == 3
+                && childMember.replacementParentProcessIdentifier
+                    == replacementRoot
+                && rootMember.replacementParentProcessIdentifier
+                    == Int32(getpid())
+                && serviceMember.replacementParentProcessIdentifier
+                    == Int32(getpid()),
+            "cold preparation did not create a wholly new exact three-process forest"
         )
         let commit = try await restorer.commitProcessForest(preparation.id)
         committed = true
@@ -636,27 +722,35 @@ enum ExternalHotProof {
             if !replacementsReaped {
                 kill(replacementChild, SIGKILL)
                 kill(replacementRoot, SIGKILL)
+                kill(replacementService, SIGKILL)
                 var status: Int32 = 0
                 _ = waitpid(replacementRoot, &status, 0)
+                _ = waitpid(replacementService, &status, 0)
             }
         }
         try require(
             commit.rootProcessIdentifier == replacementRoot
                 && Set(commit.processIdentifiers)
-                    == Set([replacementRoot, replacementChild])
+                    == replacementIdentifiers
                 && pipeForestParentProcessIdentifier(replacementChild)
                     == replacementRoot,
             "committed forest identities or parentage changed"
+        )
+        try verifyTerminalServiceTopology(
+            shell: replacementRoot,
+            job: replacementChild,
+            service: replacementService,
+            expectedRootParent: Int32(getpid())
         )
         try verifyPipeForestAliases(
             root: replacementRoot,
             child: replacementChild
         )
         try verifySocketForestAliases(
-            root: replacementRoot,
+            root: replacementService,
             child: replacementChild
         )
-        try verifyListenerForestAliases(root: replacementRoot)
+        try verifyListenerForestAliases(root: replacementService)
 
         try Data("WRITE\n".utf8).write(to: commandURL, options: .atomic)
         try await waitForPipeForestObservation("PIPE_OK", at: observationURL)
@@ -679,10 +773,19 @@ enum ExternalHotProof {
 
         try require(kill(replacementChild, SIGKILL) == 0, "could not stop restored helper")
         try require(kill(replacementRoot, SIGKILL) == 0, "could not stop restored root")
+        try require(
+            kill(replacementService, SIGKILL) == 0,
+            "could not stop restored local service"
+        )
         var replacementStatus: Int32 = 0
         try require(
             waitpid(replacementRoot, &replacementStatus, 0) == replacementRoot,
             "could not reap restored root"
+        )
+        try require(
+            waitpid(replacementService, &replacementStatus, 0)
+                == replacementService,
+            "could not reap restored local service"
         )
         replacementsReaped = true
         for _ in 0..<200 where pipeForestProcessExists(replacementChild) {
@@ -690,20 +793,29 @@ enum ExternalHotProof {
         }
         try require(
             !pipeForestProcessExists(replacementRoot)
-                && !pipeForestProcessExists(replacementChild),
+                && !pipeForestProcessExists(replacementChild)
+                && !pipeForestProcessExists(replacementService),
             "restored forest cleanup left a process behind"
         )
 
         print("pipe-forest-cold-proof: PASS")
-        print("  originals:    root=\(originalRoot), child=\(originalChild) (reaped)")
-        print("  replacements: root=\(replacementRoot), child=\(replacementChild)")
-        print("  parentage:    direct child preserved")
+        print(
+            "  originals:    shell=\(originalRoot), job=\(originalChild), "
+                + "service=\(originalService) (reaped)"
+        )
+        print(
+            "  replacements: shell=\(replacementRoot), job=\(replacementChild), "
+                + "service=\(replacementService)"
+        )
+        print("  topology:     exact PPID/SID/PGID and foreground job preserved")
+        print("  durable image: memory and ARM64 register banks present for all 3")
+        print("  route:        generic multi-root forest")
         print("  pipe aliases: root 200/201 <-> child 210/211")
         print("  pipe byte:    0xA7 crossed the restored pipe")
         print("  kqueue:       EVFILT_READ delivered the restored pipe byte")
-        print("  TCP aliases:  root 220/221 <-> child 230/231")
-        print("  TCP byte:     0xB8 crossed the restored loopback stream")
-        print("  TCP listener: aliases 240/241 accepted a new 0xC9 marker")
+        print("  TCP aliases:  service 220/221 <-> job 230/231")
+        print("  TCP byte:     0xB8 crossed the restored job/service stream")
+        print("  TCP listener: service aliases 240/241 accepted a new 0xC9 marker")
         print("  TCP tuple:    listener exact; linked client port may remap after TIME_WAIT")
         print("  local files:  post-capture sentinel unchanged")
     }
@@ -727,6 +839,28 @@ enum ExternalHotProof {
         }
         throw ExternalHotProofFailure.target(
             "pipe forest did not publish its root/helper ready record"
+        )
+    }
+
+    private static func waitForPipeForestService(
+        at url: URL
+    ) async throws -> (processIdentifier: Int32, port: UInt16) {
+        for _ in 0..<200 {
+            if let text = try? String(contentsOf: url, encoding: .utf8),
+               let line = text.split(separator: "\n").first(where: {
+                   $0.hasPrefix("SERVICE_READY ")
+               }) {
+                let fields = line.split(separator: " ")
+                if fields.count == 3,
+                   let processIdentifier = Int32(fields[1]),
+                   let port = UInt16(fields[2]), port > 0 {
+                    return (processIdentifier, port)
+                }
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw ExternalHotProofFailure.target(
+            "pipe forest did not publish its independent service ready record"
         )
     }
 
@@ -765,6 +899,95 @@ enum ExternalHotProof {
         )
         guard bytes == MemoryLayout<proc_bsdinfo>.size else { return nil }
         return Int32(info.pbi_ppid)
+    }
+
+    private static func pipeForestTopology(
+        _ processID: Int32
+    ) -> (parent: Int32, session: Int32, group: Int32, foreground: Int32)? {
+        var info = proc_bsdinfo()
+        let bytes = proc_pidinfo(
+            processID,
+            PROC_PIDTBSDINFO,
+            0,
+            &info,
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        guard bytes == MemoryLayout<proc_bsdinfo>.size else { return nil }
+        return (
+            Int32(info.pbi_ppid),
+            getsid(processID),
+            Int32(bitPattern: info.pbi_pgid),
+            Int32(bitPattern: info.e_tpgid)
+        )
+    }
+
+    private static func verifyTerminalServiceTopology(
+        shell: Int32,
+        job: Int32,
+        service: Int32,
+        expectedRootParent: Int32
+    ) throws {
+        guard let shellTopology = pipeForestTopology(shell),
+              let jobTopology = pipeForestTopology(job),
+              let serviceTopology = pipeForestTopology(service) else {
+            throw ExternalHotProofFailure.invariant(
+                "could not inspect the Terminal/service process topology"
+            )
+        }
+        try require(
+            shellTopology.parent == expectedRootParent
+                && shellTopology.session == shell
+                && shellTopology.group == shell
+                && shellTopology.foreground == job
+                && jobTopology.parent == shell
+                && jobTopology.session == shell
+                && jobTopology.group == job
+                && jobTopology.foreground == job
+                && serviceTopology.parent == expectedRootParent
+                && serviceTopology.session == service
+                && serviceTopology.group == service
+                && serviceTopology.foreground == 0,
+            "Terminal/service PPID, SID, PGID, or foreground group was not exact"
+        )
+    }
+
+    private static func verifyCapturedTerminalServiceTopology(
+        image: DurableCheckpointImage,
+        shell: Int32,
+        job: Int32,
+        service: Int32,
+        expectedRootParent: Int32
+    ) throws {
+        let members = Dictionary(
+            uniqueKeysWithValues: image.members.map {
+                ($0.processIdentifier, $0)
+            }
+        )
+        guard let shellImage = members[shell],
+              let jobImage = members[job],
+              let serviceImage = members[service],
+              let shellTopology = shellImage.topology,
+              let jobTopology = jobImage.topology,
+              let serviceTopology = serviceImage.topology else {
+            throw ExternalHotProofFailure.invariant(
+                "durable image omitted the Terminal/service kernel topology"
+            )
+        }
+        try require(
+            shellImage.parentProcessIdentifier == expectedRootParent
+                && shellTopology.sessionIdentifier == shell
+                && shellTopology.processGroupIdentifier == shell
+                && shellTopology.foregroundProcessGroupIdentifier == job
+                && jobImage.parentProcessIdentifier == shell
+                && jobTopology.sessionIdentifier == shell
+                && jobTopology.processGroupIdentifier == job
+                && jobTopology.foregroundProcessGroupIdentifier == job
+                && serviceImage.parentProcessIdentifier == expectedRootParent
+                && serviceTopology.sessionIdentifier == service
+                && serviceTopology.processGroupIdentifier == service
+                && serviceTopology.foregroundProcessGroupIdentifier == 0,
+            "durable image changed Terminal/service PPID, SID, PGID, or foreground group"
+        )
     }
 
     private static func pipeForestPipeInfo(

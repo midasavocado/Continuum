@@ -191,23 +191,15 @@ static int run_pipe_forest_child(
     }
 }
 
-static int run_pipe_forest_root(const char *executable, const char *observation_path) {
-    if (!pipe_forest_set_paths(observation_path)) {
-        return EXIT_FAILURE;
-    }
-    (void)unsetenv("CONTINUUM_BOOTSTRAP_STOP");
-    if (setsid() < 0
-        || ioctl(STDIN_FILENO, TIOCSCTTY, 0) != 0
-        || tcsetpgrp(STDIN_FILENO, getpgrp()) != 0) {
-        return EXIT_FAILURE;
-    }
+static int pipe_forest_create_listener(
+    struct sockaddr_in *listener_address
+) {
     int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    struct sockaddr_in listener_address;
-    memset(&listener_address, 0, sizeof(listener_address));
-    listener_address.sin_len = sizeof(listener_address);
-    listener_address.sin_family = AF_INET;
-    listener_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t listener_length = sizeof(listener_address);
+    memset(listener_address, 0, sizeof(*listener_address));
+    listener_address->sin_len = sizeof(*listener_address);
+    listener_address->sin_family = AF_INET;
+    listener_address->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t listener_length = sizeof(*listener_address);
     int enabled = 1;
     int buffer_bytes = 1024 * 1024;
     if (listener < 0
@@ -223,16 +215,118 @@ static int run_pipe_forest_root(const char *executable, const char *observation_
         ) != 0
         || bind(
             listener,
-            (const struct sockaddr *)&listener_address,
-            sizeof(listener_address)
+            (const struct sockaddr *)listener_address,
+            sizeof(*listener_address)
         ) != 0
         || listen(listener, 1) != 0
         || getsockname(
             listener,
-            (struct sockaddr *)&listener_address,
+            (struct sockaddr *)listener_address,
             &listener_length
         ) != 0) {
         if (listener >= 0) close(listener);
+        return -1;
+    }
+    return listener;
+}
+
+static int run_pipe_forest_service(const char *observation_path) {
+    if (!pipe_forest_set_paths(observation_path)) {
+        return EXIT_FAILURE;
+    }
+    (void)unsetenv("CONTINUUM_BOOTSTRAP_STOP");
+    if (setsid() < 0) {
+        return EXIT_FAILURE;
+    }
+    struct sockaddr_in listener_address;
+    int listener = pipe_forest_create_listener(&listener_address);
+    if (listener < 0
+        || dup2(listener, PIPE_FOREST_ROOT_LISTENER_FD) < 0
+        || dup2(listener, PIPE_FOREST_ROOT_LISTENER_ALIAS_FD) < 0
+        || fcntl(PIPE_FOREST_ROOT_LISTENER_FD, F_SETFL, O_NONBLOCK) != 0
+        || fcntl(PIPE_FOREST_ROOT_LISTENER_FD, F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(PIPE_FOREST_ROOT_LISTENER_ALIAS_FD, F_SETFD, 0) != 0) {
+        if (listener >= 0) close(listener);
+        return EXIT_FAILURE;
+    }
+    close(listener);
+    char ready[96];
+    int length = snprintf(
+        ready,
+        sizeof(ready),
+        "SERVICE_READY %d %u\n",
+        getpid(),
+        (unsigned)ntohs(listener_address.sin_port)
+    );
+    if (length <= 0 || (size_t)length >= sizeof(ready)) {
+        return EXIT_FAILURE;
+    }
+    pipe_forest_append(ready, (size_t)length);
+
+    int accepted = -1;
+    for (int attempt = 0; attempt < 500 && accepted < 0; attempt += 1) {
+        accepted = accept(PIPE_FOREST_ROOT_LISTENER_FD, NULL, NULL);
+        if (accepted < 0 && errno != EAGAIN && errno != EINTR) {
+            return EXIT_FAILURE;
+        }
+        if (accepted < 0) usleep(10000);
+    }
+    uint8_t handshake = 0;
+    const uint8_t acknowledgement = PIPE_FOREST_TCP_BYTE;
+    if (accepted < 0
+        || read(accepted, &handshake, sizeof(handshake)) != sizeof(handshake)
+        || handshake != PIPE_FOREST_TCP_BYTE
+        || write(accepted, &acknowledgement, sizeof(acknowledgement))
+            != sizeof(acknowledgement)
+        || dup2(accepted, PIPE_FOREST_ROOT_SOCKET_FD) < 0
+        || dup2(accepted, PIPE_FOREST_ROOT_SOCKET_ALIAS_FD) < 0
+        || fcntl(PIPE_FOREST_ROOT_SOCKET_FD, F_SETFL, O_NONBLOCK) != 0
+        || fcntl(PIPE_FOREST_ROOT_SOCKET_FD, F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(PIPE_FOREST_ROOT_SOCKET_ALIAS_FD, F_SETFD, 0) != 0) {
+        if (accepted >= 0) close(accepted);
+        return EXIT_FAILURE;
+    }
+    close(accepted);
+    static const char connected[] = "SERVICE_CONNECTED\n";
+    pipe_forest_append(connected, sizeof(connected) - 1);
+
+    int tcp_reported = 0;
+    int listener_reported = 0;
+    for (;;) {
+        uint8_t byte = 0;
+        if (read(PIPE_FOREST_ROOT_SOCKET_FD, &byte, sizeof(byte)) == sizeof(byte)
+            && byte == PIPE_FOREST_TCP_BYTE && !tcp_reported) {
+            static const char success[] = "TCP_OK\n";
+            pipe_forest_append(success, sizeof(success) - 1);
+            tcp_reported = 1;
+        }
+        int incoming = accept(PIPE_FOREST_ROOT_LISTENER_FD, NULL, NULL);
+        if (incoming >= 0) {
+            byte = 0;
+            if (read(incoming, &byte, sizeof(byte)) == sizeof(byte)
+                && byte == PIPE_FOREST_LISTENER_BYTE && !listener_reported) {
+                static const char success[] = "LISTENER_OK\n";
+                pipe_forest_append(success, sizeof(success) - 1);
+                listener_reported = 1;
+            }
+            close(incoming);
+        }
+        usleep(10000);
+    }
+}
+
+static int run_pipe_forest_root(
+    const char *executable,
+    const char *observation_path,
+    const char *service_port
+) {
+    if (!pipe_forest_set_paths(observation_path)) {
+        return EXIT_FAILURE;
+    }
+    (void)unsetenv("CONTINUUM_BOOTSTRAP_STOP");
+    if (setsid() < 0
+        || ioctl(STDIN_FILENO, TIOCSCTTY, 0) != 0
+        || tcsetpgrp(STDIN_FILENO, getpgrp()) != 0) {
         return EXIT_FAILURE;
     }
     int endpoints[2] = {-1, -1};
@@ -245,7 +339,6 @@ static int run_pipe_forest_root(const char *executable, const char *observation_
         || fcntl(endpoints[1], F_SETFD, FD_CLOEXEC) != 0) {
         if (endpoints[0] >= 0) close(endpoints[0]);
         if (endpoints[1] >= 0) close(endpoints[1]);
-        close(listener);
         return EXIT_FAILURE;
     }
     close(endpoints[0]);
@@ -276,67 +369,44 @@ static int run_pipe_forest_root(const char *executable, const char *observation_
             posix_spawn_file_actions_destroy(&actions);
         }
         close(endpoints[1]);
-        close(listener);
         return EXIT_FAILURE;
     }
-    char port_text[16];
-    int port_length = snprintf(
-        port_text,
-        sizeof(port_text),
-        "%u",
-        (unsigned)ntohs(listener_address.sin_port)
-    );
     char *const arguments[] = {
         (char *)executable,
         "--continuum-pipe-forest-child",
         (char *)observation_path,
-        port_text,
+        (char *)service_port,
         NULL
     };
     pid_t child = 0;
+    posix_spawnattr_t attributes;
+    int attributes_initialized = posix_spawnattr_init(&attributes) == 0;
+    short flags = POSIX_SPAWN_SETPGROUP;
+    int attributes_valid = attributes_initialized
+        && posix_spawnattr_setflags(&attributes, flags) == 0
+        && posix_spawnattr_setpgroup(&attributes, 0) == 0;
     int spawn_result = posix_spawn(
         &child,
         executable,
         &actions,
-        NULL,
+        attributes_valid ? &attributes : NULL,
         arguments,
         environ
     );
+    if (attributes_initialized) posix_spawnattr_destroy(&attributes);
     posix_spawn_file_actions_destroy(&actions);
     close(endpoints[1]);
-    int accepted = spawn_result == 0 ? accept(listener, NULL, NULL) : -1;
-    uint8_t handshake = 0;
-    const uint8_t acknowledgement = PIPE_FOREST_TCP_BYTE;
-    if (port_length <= 0 || (size_t)port_length >= sizeof(port_text)
-        || spawn_result != 0 || accepted < 0
-        || read(accepted, &handshake, sizeof(handshake)) != sizeof(handshake)
-        || handshake != PIPE_FOREST_TCP_BYTE
-        || write(accepted, &acknowledgement, sizeof(acknowledgement))
-            != sizeof(acknowledgement)
-        || dup2(listener, PIPE_FOREST_ROOT_LISTENER_FD) < 0
-        || dup2(listener, PIPE_FOREST_ROOT_LISTENER_ALIAS_FD) < 0
-        || fcntl(PIPE_FOREST_ROOT_LISTENER_FD, F_SETFL, O_NONBLOCK) != 0
-        || fcntl(PIPE_FOREST_ROOT_LISTENER_FD, F_SETFD, FD_CLOEXEC) != 0
-        || fcntl(PIPE_FOREST_ROOT_LISTENER_ALIAS_FD, F_SETFD, 0) != 0
-        || dup2(accepted, PIPE_FOREST_ROOT_SOCKET_FD) < 0
-        || dup2(accepted, PIPE_FOREST_ROOT_SOCKET_ALIAS_FD) < 0
-        || fcntl(PIPE_FOREST_ROOT_SOCKET_FD, F_SETFL, O_NONBLOCK) != 0
-        || fcntl(PIPE_FOREST_ROOT_SOCKET_FD, F_SETFD, FD_CLOEXEC) != 0
-        || fcntl(PIPE_FOREST_ROOT_SOCKET_ALIAS_FD, F_SETFD, 0) != 0
+    if (!attributes_valid || spawn_result != 0
+        || tcsetpgrp(STDIN_FILENO, child) != 0
         || !install_pipe_forest_handler(SIGWINCH, pipe_forest_exchange)
         || !install_pipe_forest_handler(SIGCHLD, pipe_forest_record_child_exit)
         || !install_pipe_forest_handler(SIGTERM, pipe_forest_reap_child_and_exit)) {
-        close(listener);
-        if (accepted >= 0) close(accepted);
         if (child > 0) {
             kill(child, SIGKILL);
             (void)waitpid(child, NULL, 0);
         }
         return EXIT_FAILURE;
     }
-    close(listener);
-    close(accepted);
-
     int queue = kqueue();
     struct kevent64_s registrations[2];
     memset(registrations, 0, sizeof(registrations));
@@ -383,8 +453,6 @@ static int run_pipe_forest_root(const char *executable, const char *observation_
     }
     pipe_forest_append(ready, (size_t)length);
     int pipe_reported = 0;
-    int tcp_reported = 0;
-    int listener_reported = 0;
     for (;;) {
         uint8_t byte = 0;
         struct kevent64_s event;
@@ -406,24 +474,6 @@ static int run_pipe_forest_root(const char *executable, const char *observation_
             static const char success[] = "PIPE_OK\n";
             pipe_forest_append(success, sizeof(success) - 1);
             pipe_reported = 1;
-        }
-        byte = 0;
-        if (read(PIPE_FOREST_ROOT_SOCKET_FD, &byte, sizeof(byte)) == sizeof(byte)
-            && byte == PIPE_FOREST_TCP_BYTE && !tcp_reported) {
-            static const char success[] = "TCP_OK\n";
-            pipe_forest_append(success, sizeof(success) - 1);
-            tcp_reported = 1;
-        }
-        int incoming = accept(PIPE_FOREST_ROOT_LISTENER_FD, NULL, NULL);
-        if (incoming >= 0) {
-            byte = 0;
-            if (read(incoming, &byte, sizeof(byte)) == sizeof(byte)
-                && byte == PIPE_FOREST_LISTENER_BYTE && !listener_reported) {
-                static const char success[] = "LISTENER_OK\n";
-                pipe_forest_append(success, sizeof(success) - 1);
-                listener_reported = 1;
-            }
-            close(incoming);
         }
         usleep(10000);
     }
@@ -896,8 +946,12 @@ int main(int argc, char **argv) {
         return run_pipe_forest_child(argv[2], argv[3]);
     }
     if (argc > 2
+        && strcmp(argv[1], "--continuum-pipe-forest-service") == 0) {
+        return run_pipe_forest_service(argv[2]);
+    }
+    if (argc > 3
         && strcmp(argv[1], "--continuum-pipe-forest-root") == 0) {
-        return run_pipe_forest_root(argv[0], argv[2]);
+        return run_pipe_forest_root(argv[0], argv[2], argv[3]);
     }
     if (argc > 1 && strcmp(argv[1], "--continuum-idle-child") == 0) {
         while (getppid() != 1) {

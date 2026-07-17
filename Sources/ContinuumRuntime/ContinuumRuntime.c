@@ -798,7 +798,7 @@ static int continuum_broker_validate_spec(
     if (spec == NULL || spec->structure_size != sizeof(*spec)
         || spec->captured_process_id <= 0
         || spec->captured_process_group_id <= 0
-        || spec->foreground_process_group_id <= 0
+        || spec->foreground_process_group_id < 0
         || spec->executable_path == NULL
         || spec->executable_path[0] == '\0' || spec->arguments == NULL
         || spec->arguments[0] == NULL || spec->working_directory == NULL
@@ -811,6 +811,8 @@ static int continuum_broker_validate_spec(
         || spec->topology.process_group_policy < CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT
         || spec->topology.process_group_policy > CONTINUUM_SPAWN_PROCESS_GROUP_JOIN
         || spec->topology.controlling_terminal_descriptor < -1
+        || (spec->foreground_process_group_id == 0
+            && spec->topology.controlling_terminal_descriptor >= 0)
         || (!is_root && spec->topology.create_session)) return 0;
     if (is_root
         && spec->topology.process_group_policy
@@ -1376,11 +1378,34 @@ static continuum_status continuum_broker_forest_abort_prepared(
             node->channel = -1;
         }
         if (node->replacement_process_id <= 0) continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (node->traced) {
+            if (ptrace(
+                    PT_KILL,
+                    node->replacement_process_id,
+                    (caddr_t)1,
+                    0
+                ) != 0 && errno != ESRCH) {
+                return CONTINUUM_STATUS_ROLLBACK_FAILED;
+            }
+            node->traced = 0;
+            if (!continuum_broker_kill_and_reap_traced_child(
+                    node->replacement_process_id,
+                    deadline
+                )) {
+                return CONTINUUM_STATUS_ROLLBACK_FAILED;
+            }
+            continue;
+        }
+#pragma clang diagnostic pop
         int terminated = abort_sent
             ? continuum_broker_wait_for_forest_node_termination(node, deadline)
             : 0;
         if (terminated > 0) continue;
-        if (terminated < 0) return CONTINUUM_STATUS_ROLLBACK_FAILED;
+        if (terminated < 0) {
+            return CONTINUUM_STATUS_ROLLBACK_FAILED;
+        }
 
         int liveness = continuum_broker_forest_node_liveness(node);
         if (liveness < 0) return CONTINUUM_STATUS_ROLLBACK_FAILED;
@@ -1964,6 +1989,25 @@ continuum_status continuum_brokered_forest_abort(
     for (size_t position = forest->process_count; position > 0;
          position -= 1) {
         continuum_brokered_forest_node *node = &forest->nodes[position - 1];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (node->traced) {
+            (void)ptrace(
+                PT_KILL,
+                node->replacement_process_id,
+                (caddr_t)1,
+                0
+            );
+            node->traced = 0;
+            if (!continuum_broker_kill_and_reap_traced_child(
+                    node->replacement_process_id,
+                    deadline
+                )) {
+                cleanup_failed = 1;
+            }
+            continue;
+        }
+#pragma clang diagnostic pop
         int intended = continuum_broker_process_matches(
             node->replacement_process_id,
             node->expected_replacement_parent_id,
@@ -1978,8 +2022,12 @@ continuum_status continuum_brokered_forest_abort(
             0);
         if (!intended && !traced_to_controller) {
             if (!continuum_broker_forest_exact_identity_is_absent(node)) {
-                if (node->commit_task == MACH_PORT_NULL
-                    || task_terminate(node->commit_task) != KERN_SUCCESS) {
+                kern_return_t task_status = node->commit_task == MACH_PORT_NULL
+                    ? KERN_INVALID_TASK
+                    : task_terminate(node->commit_task);
+                if (task_status != KERN_SUCCESS
+                    && kill(node->replacement_process_id, SIGKILL) != 0
+                    && errno != ESRCH) {
                     cleanup_failed = 1;
                 }
             }
@@ -14041,7 +14089,37 @@ static continuum_status continuum_descriptor_graph_validate(
                     graph->sockets[listener].resource_identity;
             }
         } else if (socket->kind == CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED) {
-            if (continuum_descriptor_socket_index(graph, socket->peer_identity) < 0) {
+            const uint32_t replayable_state = SOI_S_ISCONNECTED
+                | SOI_S_CANTSENDMORE | SOI_S_CANTRCVMORE | SOI_S_NBIO;
+            if ((socket->socket_state & ~replayable_state) != 0
+                || (socket->socket_state & SOI_S_ISCONNECTED) == 0) {
+                return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+            }
+            for (size_t handle_index = 0;
+                 handle_index < graph->handle_count;
+                 handle_index += 1) {
+                const continuum_remote_descriptor_handle_info *handle =
+                    &graph->handles[handle_index];
+                if (handle->resource_kind
+                        != CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_SOCKET
+                    || handle->resource_identity
+                        != socket->resource_identity) {
+                    continue;
+                }
+                const int state_is_nonblocking =
+                    (socket->socket_state & SOI_S_NBIO) != 0;
+                const int handle_is_nonblocking =
+                    (handle->status_flags & O_NONBLOCK) != 0;
+                if ((handle->status_flags & O_ASYNC) != 0
+                    || state_is_nonblocking != handle_is_nonblocking) {
+                    return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+                }
+            }
+            const ssize_t peer = continuum_descriptor_socket_index(
+                graph,
+                socket->peer_identity
+            );
+            if (peer < 0) {
                 const int externally_reconnectable =
                     socket->local_address_length == 0
                     && continuum_unix_address_has_path(
@@ -14051,6 +14129,31 @@ static continuum_status continuum_descriptor_graph_validate(
                     return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
                 }
                 socket->peer_identity = 0;
+            } else {
+                const continuum_remote_socket_resource_info *other =
+                    &graph->sockets[peer];
+                if ((size_t)peer == index
+                    || other->kind != CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED
+                    || other->peer_identity != socket->resource_identity
+                    || other->domain != socket->domain
+                    || other->socket_type != socket->socket_type
+                    || other->protocol != socket->protocol
+                    || other->send_shutdown != socket->receive_shutdown
+                    || other->receive_shutdown != socket->send_shutdown
+                    || !continuum_descriptor_address_equal(
+                        socket->local_address,
+                        socket->local_address_length,
+                        other->remote_address,
+                        other->remote_address_length
+                    )
+                    || !continuum_descriptor_address_equal(
+                        socket->remote_address,
+                        socket->remote_address_length,
+                        other->local_address,
+                        other->local_address_length
+                    )) {
+                    return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+                }
             }
         }
     }

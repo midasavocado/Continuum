@@ -564,18 +564,18 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             return false
         }
         guard descriptorGraph.sockets.allSatisfy({ socket in
-            let common = (socket.domain == AF_INET || socket.domain == AF_INET6)
-                && socket.type == SOCK_STREAM
-                && socket.protocol == IPPROTO_TCP
+            let common = socket.type == SOCK_STREAM
                 && socket.receiveQueueBytes == 0
                 && socket.sendQueueBytes == 0
-                && socket.localAddress != nil
                 && socket.externalPath == nil
                 && handlesBySocket[socket.id]?.isEmpty == false
             guard common else { return false }
             if socket.kind == .tcpListener {
                 let optionNames = socket.options.map(\.name)
-                return socket.remoteAddress == nil
+                return (socket.domain == AF_INET || socket.domain == AF_INET6)
+                    && socket.protocol == IPPROTO_TCP
+                    && socket.localAddress != nil
+                    && socket.remoteAddress == nil
                     && socket.peerResourceID == nil
                     && socket.listenerResourceID == nil
                     && socket.backlog.map { $0 > 0 } == true
@@ -584,7 +584,45 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     ])
                     && optionNames.count == 4
             }
-            guard socket.kind == .tcpConnected,
+            if socket.kind == .unixConnected {
+                guard socket.domain == AF_UNIX,
+                      socket.protocol == 0,
+                      socket.localAddress == nil,
+                      socket.remoteAddress == nil,
+                      socket.backlog == nil,
+                      socket.listenerResourceID == nil,
+                      socket.tcpNoDelay == nil,
+                      let peerID = socket.peerResourceID,
+                      let peer = socketByID[peerID] else { return false }
+                let options = Dictionary(
+                    uniqueKeysWithValues: socket.options.map {
+                        ($0.name, $0)
+                    }
+                )
+                return peerID != socket.id
+                    && peer.kind == .unixConnected
+                    && peer.domain == socket.domain
+                    && peer.type == socket.type
+                    && peer.protocol == socket.protocol
+                    && peer.peerResourceID == socket.id
+                    && peer.localAddress == socket.remoteAddress
+                    && peer.remoteAddress == socket.localAddress
+                    && peer.sendShutdown == socket.receiveShutdown
+                    && peer.receiveShutdown == socket.sendShutdown
+                    && socket.options.count == 2
+                    && Set(options.keys) == Set([SO_RCVBUF, SO_SNDBUF])
+                    && options.values.allSatisfy({ option in
+                        option.level == SOL_SOCKET
+                            && option.value.count == MemoryLayout<Int32>.size
+                            && option.value.withUnsafeBytes {
+                                $0.loadUnaligned(as: Int32.self) > 0
+                            }
+                    })
+            }
+            guard (socket.domain == AF_INET || socket.domain == AF_INET6),
+                  socket.protocol == IPPROTO_TCP,
+                  socket.localAddress != nil,
+                  socket.kind == .tcpConnected,
                   let peerID = socket.peerResourceID,
                   let peer = socketByID[peerID] else { return false }
             let listenerIsValid = socket.listenerResourceID.map { listenerID in
@@ -610,6 +648,8 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     || handle.descriptorFlags == FD_CLOEXEC)
                 && handle.statusFlags & O_ACCMODE == O_RDWR
                 && handle.statusFlags & ~supportedStatusMask == 0
+                && (socketByID[handle.resourceID]?.kind != .unixConnected
+                    || handle.statusFlags & O_ASYNC == 0)
                 && handlesBySocket[handle.resourceID]?.allSatisfy({
                     $0.statusFlags == handle.statusFlags
                 }) == true
@@ -1092,6 +1132,58 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 ($0.resource_identity, $0)
             }
         )
+        for socket in graph.sockets where
+            socket.kind == CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED
+                && socket.peer_identity != 0 {
+            guard let peer = rawSocketsByIdentity[socket.peer_identity],
+                  peer.resource_identity != socket.resource_identity,
+                  peer.kind == CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED,
+                  peer.peer_identity == socket.resource_identity,
+                  peer.domain == socket.domain,
+                  peer.socket_type == socket.socket_type,
+                  peer.protocol == socket.protocol,
+                  peer.local_address_length == socket.remote_address_length,
+                  peer.remote_address_length == socket.local_address_length
+            else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported a nonreciprocal Unix socket peer."
+                )
+            }
+            var localAddress = socket.local_address
+            var remoteAddress = socket.remote_address
+            var peerLocalAddress = peer.local_address
+            var peerRemoteAddress = peer.remote_address
+            let localData = withUnsafeBytes(of: &localAddress) {
+                Data($0.prefix(Int(socket.local_address_length)))
+            }
+            let remoteData = withUnsafeBytes(of: &remoteAddress) {
+                Data($0.prefix(Int(socket.remote_address_length)))
+            }
+            let peerLocalData = withUnsafeBytes(of: &peerLocalAddress) {
+                Data($0.prefix(Int(peer.local_address_length)))
+            }
+            let peerRemoteData = withUnsafeBytes(of: &peerRemoteAddress) {
+                Data($0.prefix(Int(peer.remote_address_length)))
+            }
+            guard localData == peerRemoteData,
+                  remoteData == peerLocalData,
+                  (socket.send_shutdown != 0) == (peer.receive_shutdown != 0),
+                  (socket.receive_shutdown != 0) == (peer.send_shutdown != 0),
+                  Self.unixSocketStateIsColdReplayable(
+                      socket.socket_state,
+                      statusFlags: graph.handles.filter {
+                          $0.resource_kind
+                              == CONTINUUM_REMOTE_DESCRIPTOR_RESOURCE_SOCKET
+                              && $0.resource_identity
+                                  == socket.resource_identity
+                      }.map(\.status_flags)
+                  )
+            else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The runtime exported mismatched Unix socket peer state."
+                )
+            }
+        }
 
         let handles = try graph.handles.map { handle in
             let resourceID: UUID?
@@ -1253,6 +1345,23 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     option(SO_RCVBUF, socket.receive_buffer_bytes),
                     option(SO_SNDBUF, socket.send_buffer_bytes),
                 ]
+            } else if kind == .unixConnected {
+                guard socket.socket_options == 0,
+                      socket.linger_ticks == 0,
+                      socket.receive_low_water_bytes == 1,
+                      socket.send_low_water_bytes == 2_048,
+                      socket.receive_timeout_ticks == 0,
+                      socket.send_timeout_ticks == 0,
+                      socket.receive_buffer_bytes > 0,
+                      socket.send_buffer_bytes > 0 else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "A connected Unix socket uses options Continuum cannot reproduce exactly."
+                    )
+                }
+                options = [
+                    option(SO_RCVBUF, socket.receive_buffer_bytes),
+                    option(SO_SNDBUF, socket.send_buffer_bytes),
+                ]
             }
             return DurableSocketResource(
                 id: id,
@@ -1338,6 +1447,27 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             pipes: pipes,
             kqueues: kqueues
         )
+    }
+
+    static func unixSocketStateIsColdReplayable(
+        _ socketState: UInt32,
+        statusFlags: [Int32]
+    ) -> Bool {
+        let connected = UInt32(SOI_S_ISCONNECTED)
+        let receiveShutdown = UInt32(SOI_S_CANTRCVMORE)
+        let sendShutdown = UInt32(SOI_S_CANTSENDMORE)
+        let nonblocking = UInt32(SOI_S_NBIO)
+        let allowed = connected | receiveShutdown | sendShutdown | nonblocking
+        guard !statusFlags.isEmpty,
+              socketState & connected != 0,
+              socketState & ~allowed == 0 else {
+            return false
+        }
+        let stateIsNonblocking = socketState & nonblocking != 0
+        return statusFlags.allSatisfy { flags in
+            flags & O_ASYNC == 0
+                && (flags & O_NONBLOCK != 0) == stateIsNonblocking
+        }
     }
 
     private func durablePTYDescriptors(
