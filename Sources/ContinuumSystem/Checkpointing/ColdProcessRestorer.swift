@@ -2486,7 +2486,8 @@ public actor ColdProcessRestorer {
     }
 
     private func validate(_ image: DurableCheckpointImage) throws {
-        guard image.formatVersion == DurableCheckpointImage.currentFormatVersion else {
+        guard image.formatVersion == 6
+                || image.formatVersion == DurableCheckpointImage.currentFormatVersion else {
             throw ContinuumError.restoreUnavailable(
                 "This checkpoint uses an unsupported durable format."
             )
@@ -2511,7 +2512,7 @@ public actor ColdProcessRestorer {
     private func prepareDescriptorGraph(
         for image: DurableCheckpointImage
     ) throws -> PreparedDescriptorGraph {
-        // Format-six images use the normalized graph as the sole socket source
+        // Format-seven images use the normalized graph as the sole socket source
         // of truth. Endpoint-per-fd records remain only for legacy images.
         let endpoints = image.descriptorGraph == nil
             ? image.establishedTCPEndpoints ?? []
@@ -2544,24 +2545,11 @@ public actor ColdProcessRestorer {
                     "The durable descriptor graph contains duplicate or unknown resources."
                 )
             }
-            guard durableGraph.sockets.allSatisfy({
-                $0.kind == .tcpConnected
-                    && ($0.domain == AF_INET || $0.domain == AF_INET6)
-                    && $0.type == SOCK_STREAM
-                    && $0.protocol == IPPROTO_TCP
-                    && $0.receiveQueueBytes == 0
-                    && $0.sendQueueBytes == 0
-                    && $0.localAddress != nil
-                    && $0.remoteAddress != nil
-                    && $0.peerResourceID != nil
-                    && $0.listenerResourceID == nil
-                    && $0.externalPath == nil
-                    && $0.options.isEmpty
-            }) else {
-                throw ContinuumError.restoreUnavailable(
-                    "This snapshot contains listeners, Unix sockets, queued TCP data, or socket options that Continuum cannot rebuild yet."
-                )
-            }
+            try Self.validateColdSockets(
+                graph: durableGraph,
+                handles: socketHandles,
+                capturedProcessIdentifiers: Set(image.members.map(\.processIdentifier))
+            )
             try validateColdKqueues(
                 graph: durableGraph,
                 handles: kqueueHandles,
@@ -2855,8 +2843,53 @@ public actor ColdProcessRestorer {
                     )
                 }
 
-                var restoredSocketIDs: Set<UUID> = []
-                for first in durableGraph.sockets.sorted(by: {
+                var listenerDescriptors: [UUID: Int32] = [:]
+                for listener in durableGraph.sockets.filter({
+                    $0.kind == .tcpListener
+                }).sorted(by: {
+                    $0.id.uuidString < $1.id.uuidString
+                }) {
+                    guard let listenerHandles = handlesByResource[listener.id],
+                          let representative = listenerHandles.first else {
+                        throw ContinuumError.integrityFailure(
+                            "The durable listener graph contains an unowned resource."
+                        )
+                    }
+                    let recreated = try Self.createExactLoopbackListener(listener)
+                    let promoted = fcntl(
+                        recreated,
+                        F_DUPFD_CLOEXEC,
+                        nextControllerDescriptor
+                    )
+                    Darwin.close(recreated)
+                    guard promoted >= 0 else {
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not isolate a recreated listener for relaunch."
+                        )
+                    }
+                    nextControllerDescriptor = promoted + 1
+                    controllerDescriptors.append(promoted)
+                    listenerDescriptors[listener.id] = promoted
+                    for handle in listenerHandles {
+                        remapsByProcess[handle.processIdentifier, default: []]
+                            .append(continuum_spawn_descriptor_remap(
+                                source_descriptor: promoted,
+                                target_descriptor: handle.fileDescriptor
+                            ))
+                    }
+                    // Leave it blocking until all linked accepted streams have
+                    // been recreated through this exact listener.
+                    guard representative.statusFlags & O_ACCMODE == O_RDWR else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved listener has invalid access flags."
+                        )
+                    }
+                }
+
+                var restoredSocketIDs = Set(listenerDescriptors.keys)
+                for first in durableGraph.sockets.filter({
+                    $0.kind == .tcpConnected
+                }).sorted(by: {
                     $0.id.uuidString < $1.id.uuidString
                 }) where !restoredSocketIDs.contains(first.id) {
                     guard let peerID = first.peerResourceID,
@@ -2894,35 +2927,76 @@ public actor ColdProcessRestorer {
                         )
                     }
 
-                    var firstRuntime = try Self.runtimeTCPEndpoint(
-                        first,
-                        handle: firstHandle
-                    )
-                    var secondRuntime = try Self.runtimeTCPEndpoint(
-                        second,
-                        handle: secondHandle
-                    )
                     var firstDescriptor: Int32 = -1
                     var secondDescriptor: Int32 = -1
-                    let status = continuum_recreate_closed_loopback_tcp_pair(
-                        &firstRuntime,
-                        &secondRuntime,
-                        &firstDescriptor,
-                        &secondDescriptor
-                    )
-                    guard status == CONTINUUM_STATUS_OK,
-                          firstDescriptor >= 0,
-                          secondDescriptor >= 0 else {
-                        if firstDescriptor >= 0 { Darwin.close(firstDescriptor) }
-                        if secondDescriptor >= 0 { Darwin.close(secondDescriptor) }
-                        let detail = continuum_status_string(status).map {
-                            String(cString: $0)
-                        } ?? "status \(status.rawValue)"
+                    if let listenerID = first.listenerResourceID {
+                        guard let listenerDescriptor = listenerDescriptors[listenerID] else {
+                            throw ContinuumError.integrityFailure(
+                                "A saved accepted stream references a missing listener."
+                            )
+                        }
+                        let pair = try Self.createConnectedPairThroughListener(
+                            listenerDescriptor: listenerDescriptor,
+                            accepted: first,
+                            client: second
+                        )
+                        firstDescriptor = pair.accepted
+                        secondDescriptor = pair.client
+                    } else if let listenerID = second.listenerResourceID {
+                        guard let listenerDescriptor = listenerDescriptors[listenerID] else {
+                            throw ContinuumError.integrityFailure(
+                                "A saved accepted stream references a missing listener."
+                            )
+                        }
+                        let pair = try Self.createConnectedPairThroughListener(
+                            listenerDescriptor: listenerDescriptor,
+                            accepted: second,
+                            client: first
+                        )
+                        firstDescriptor = pair.client
+                        secondDescriptor = pair.accepted
+                    } else {
+                        var firstRuntime = try Self.runtimeTCPEndpoint(
+                            first,
+                            handle: firstHandle
+                        )
+                        var secondRuntime = try Self.runtimeTCPEndpoint(
+                            second,
+                            handle: secondHandle
+                        )
+                        let status = continuum_recreate_closed_loopback_tcp_pair(
+                            &firstRuntime,
+                            &secondRuntime,
+                            &firstDescriptor,
+                            &secondDescriptor
+                        )
+                        guard status == CONTINUUM_STATUS_OK else {
+                            if firstDescriptor >= 0 { Darwin.close(firstDescriptor) }
+                            if secondDescriptor >= 0 { Darwin.close(secondDescriptor) }
+                            let detail = continuum_status_string(status).map {
+                                String(cString: $0)
+                            } ?? "status \(status.rawValue)"
+                            throw ContinuumError.restoreUnavailable(
+                                "Continuum could not recreate a closed local TCP stream: \(detail)."
+                            )
+                        }
+                    }
+                    guard try Self.replayConnectedSocketOptions(
+                        descriptor: firstDescriptor,
+                        resource: first
+                    ), try Self.replayConnectedSocketOptions(
+                        descriptor: secondDescriptor,
+                        resource: second
+                    ) else {
+                        Darwin.close(firstDescriptor)
+                        Darwin.close(secondDescriptor)
                         throw ContinuumError.restoreUnavailable(
-                            "Continuum could not recreate a closed local TCP stream: \(detail)."
+                            "Continuum could not replay saved TCP socket options."
                         )
                     }
-                    guard fcntl(
+                    guard firstDescriptor >= 0,
+                          secondDescriptor >= 0,
+                          fcntl(
                         firstDescriptor,
                         F_SETFL,
                         firstHandle.statusFlags & (O_NONBLOCK | O_ASYNC)
@@ -2982,6 +3056,22 @@ public actor ColdProcessRestorer {
                     }
                     restoredSocketIDs.insert(first.id)
                     restoredSocketIDs.insert(second.id)
+                }
+
+                for listener in durableGraph.sockets where
+                    listener.kind == .tcpListener {
+                    guard let descriptor = listenerDescriptors[listener.id],
+                          let statusFlags = handlesByResource[listener.id]?
+                            .first?.statusFlags,
+                          fcntl(
+                              descriptor,
+                              F_SETFL,
+                              statusFlags & (O_NONBLOCK | O_ASYNC)
+                          ) == 0 else {
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not replay saved listener status flags."
+                        )
+                    }
                 }
             }
 
@@ -3204,6 +3294,551 @@ public actor ColdProcessRestorer {
             destination.copyBytes(from: remoteAddress)
         }
         return result
+    }
+
+    private static func socketOptionValues(
+        _ socket: DurableSocketResource
+    ) throws -> [Int32: Int32] {
+        var result: [Int32: Int32] = [:]
+        for option in socket.options {
+            guard option.level == SOL_SOCKET,
+                  option.value.count == MemoryLayout<Int32>.size,
+                  result[option.name] == nil else {
+                throw ContinuumError.integrityFailure(
+                    "A durable listener contains malformed or duplicate socket options."
+                )
+            }
+            result[option.name] = option.value.withUnsafeBytes {
+                $0.loadUnaligned(as: Int32.self)
+            }
+        }
+        return result
+    }
+
+    private static func isExactLoopbackAddress(
+        _ data: Data,
+        domain: Int32
+    ) -> Bool {
+        if domain == AF_INET,
+           data.count == MemoryLayout<sockaddr_in>.size {
+            let address = data.withUnsafeBytes {
+                $0.loadUnaligned(as: sockaddr_in.self)
+            }
+            return address.sin_len == UInt8(MemoryLayout<sockaddr_in>.size)
+                && address.sin_family == sa_family_t(AF_INET)
+                && address.sin_port != 0
+                && address.sin_addr.s_addr == in_addr_t(INADDR_LOOPBACK).bigEndian
+        }
+        if domain == AF_INET6,
+           data.count == MemoryLayout<sockaddr_in6>.size {
+            let address = data.withUnsafeBytes {
+                $0.loadUnaligned(as: sockaddr_in6.self)
+            }
+            var loopback = in6addr_loopback
+            return address.sin6_len == UInt8(MemoryLayout<sockaddr_in6>.size)
+                && address.sin6_family == sa_family_t(AF_INET6)
+                && address.sin6_port != 0
+                && withUnsafeBytes(of: address.sin6_addr) { actual in
+                    withUnsafeBytes(of: &loopback) { expected in
+                        actual.elementsEqual(expected)
+                    }
+                }
+        }
+        return false
+    }
+
+    private static func validateColdSockets(
+        graph: DurableDescriptorGraph,
+        handles: [DurableDescriptorHandle],
+        capturedProcessIdentifiers: Set<Int32>
+    ) throws {
+        let socketsByID = Dictionary(
+            uniqueKeysWithValues: graph.sockets.map { ($0.id, $0) }
+        )
+        let handlesByResource = Dictionary(grouping: handles, by: \.resourceID)
+        let listenerAddresses = graph.sockets.compactMap { socket -> Data? in
+            socket.kind == .tcpListener ? socket.localAddress : nil
+        }
+        guard Set(listenerAddresses).count == listenerAddresses.count else {
+            throw ContinuumError.restoreUnavailable(
+                "Multiple saved listeners share one address, so their reuse-port routing is ambiguous."
+            )
+        }
+        let supportedStatusMask = O_ACCMODE | O_NONBLOCK | O_ASYNC
+        for socket in graph.sockets {
+            guard (socket.domain == AF_INET || socket.domain == AF_INET6),
+                  socket.type == SOCK_STREAM,
+                  socket.protocol == IPPROTO_TCP,
+                  socket.receiveQueueBytes == 0,
+                  socket.sendQueueBytes == 0,
+                  socket.externalPath == nil,
+                  let localAddress = socket.localAddress,
+                  isExactLoopbackAddress(localAddress, domain: socket.domain),
+                  let resourceHandles = handlesByResource[socket.id],
+                  let representative = resourceHandles.first,
+                  resourceHandles.allSatisfy({ handle in
+                      capturedProcessIdentifiers.contains(handle.processIdentifier)
+                          && handle.fileDescriptor >= 0
+                          && (handle.descriptorFlags == 0
+                              || handle.descriptorFlags == FD_CLOEXEC)
+                          && handle.statusFlags == representative.statusFlags
+                          && handle.statusFlags & O_ACCMODE == O_RDWR
+                          && handle.statusFlags & ~supportedStatusMask == 0
+                  }) else {
+                throw ContinuumError.restoreUnavailable(
+                    "A saved socket is not an empty, exactly replayable loopback TCP resource."
+                )
+            }
+            switch socket.kind {
+            case .tcpListener:
+                let options = try socketOptionValues(socket)
+                guard socket.remoteAddress == nil,
+                      socket.peerResourceID == nil,
+                      socket.listenerResourceID == nil,
+                      !socket.receiveShutdown,
+                      !socket.sendShutdown,
+                      let backlog = socket.backlog,
+                      backlog > 0,
+                      Set(options.keys) == Set([
+                          SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF, SO_SNDBUF,
+                      ]),
+                      options[SO_REUSEADDR] == 0
+                        || options[SO_REUSEADDR] == 1,
+                      options[SO_REUSEPORT] == 0
+                        || options[SO_REUSEPORT] == 1,
+                      options[SO_RCVBUF, default: 0] > 0,
+                      options[SO_SNDBUF, default: 0] > 0 else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved TCP listener has unsupported options or an invalid backlog."
+                    )
+                }
+            case .tcpConnected:
+                let options = try socketOptionValues(socket)
+                let hasReplayableOptions = options.isEmpty || (
+                    Set(options.keys) == Set([
+                        SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF, SO_SNDBUF,
+                    ])
+                    && (options[SO_REUSEADDR] == 0
+                        || options[SO_REUSEADDR] == 1)
+                    && (options[SO_REUSEPORT] == 0
+                        || options[SO_REUSEPORT] == 1)
+                    && options[SO_RCVBUF, default: 0] > 0
+                    && options[SO_SNDBUF, default: 0] > 0
+                )
+                guard let remoteAddress = socket.remoteAddress,
+                      isExactLoopbackAddress(remoteAddress, domain: socket.domain),
+                      hasReplayableOptions,
+                      let peerID = socket.peerResourceID,
+                      let peer = socketsByID[peerID],
+                      peer.peerResourceID == socket.id,
+                      peer.localAddress == socket.remoteAddress,
+                      peer.remoteAddress == socket.localAddress else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved TCP stream has no unique reciprocal loopback peer."
+                    )
+                }
+                if let listenerID = socket.listenerResourceID {
+                    guard let listener = socketsByID[listenerID],
+                          listener.kind == .tcpListener,
+                          listener.localAddress == socket.localAddress,
+                          peer.listenerResourceID == nil else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved accepted TCP stream has no unique matching listener."
+                        )
+                    }
+                }
+            default:
+                throw ContinuumError.restoreUnavailable(
+                    "Unix and non-TCP sockets cannot be cold-restored yet."
+                )
+            }
+        }
+    }
+
+    private static func setSocketOption(
+        descriptor: Int32,
+        name: Int32,
+        value: Int32,
+        level: Int32 = SOL_SOCKET
+    ) -> Bool {
+        var nativeValue = value
+        return setsockopt(
+            descriptor,
+            level,
+            name,
+            &nativeValue,
+            socklen_t(MemoryLayout.size(ofValue: nativeValue))
+        ) == 0
+    }
+
+    private static func socketOption(
+        descriptor: Int32,
+        name: Int32,
+        level: Int32 = SOL_SOCKET
+    ) -> Int32? {
+        var value: Int32 = 0
+        var length = socklen_t(MemoryLayout.size(ofValue: value))
+        guard getsockopt(
+            descriptor,
+            level,
+            name,
+            &value,
+            &length
+        ) == 0, length == MemoryLayout.size(ofValue: value) else {
+            return nil
+        }
+        return value
+    }
+
+    private static func withSocketAddress<Result>(
+        _ data: Data,
+        _ body: (UnsafePointer<sockaddr>, socklen_t) -> Result
+    ) -> Result {
+        data.withUnsafeBytes { bytes in
+            body(
+                bytes.baseAddress!.assumingMemoryBound(to: sockaddr.self),
+                socklen_t(bytes.count)
+            )
+        }
+    }
+
+    private static func socketAddress(
+        descriptor: Int32,
+        peer: Bool
+    ) -> Data? {
+        var storage = sockaddr_storage()
+        var length = socklen_t(MemoryLayout.size(ofValue: storage))
+        let status = withUnsafeMutablePointer(to: &storage) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                peer
+                    ? getpeername(descriptor, $0, &length)
+                    : getsockname(descriptor, $0, &length)
+            }
+        }
+        guard status == 0, length > 0,
+              Int(length) <= MemoryLayout.size(ofValue: storage) else {
+            return nil
+        }
+        return withUnsafeBytes(of: &storage) { Data($0.prefix(Int(length))) }
+    }
+
+    private static func ephemeralPortAddress(_ data: Data) -> Data? {
+        if data.count == MemoryLayout<sockaddr_in>.size {
+            var address = data.withUnsafeBytes {
+                $0.loadUnaligned(as: sockaddr_in.self)
+            }
+            address.sin_port = 0
+            return withUnsafeBytes(of: &address) { Data($0) }
+        }
+        if data.count == MemoryLayout<sockaddr_in6>.size {
+            var address = data.withUnsafeBytes {
+                $0.loadUnaligned(as: sockaddr_in6.self)
+            }
+            address.sin6_port = 0
+            return withUnsafeBytes(of: &address) { Data($0) }
+        }
+        return nil
+    }
+
+    private static func createExactLoopbackListener(
+        _ listener: DurableSocketResource
+    ) throws -> Int32 {
+        guard let address = listener.localAddress,
+              let backlog = listener.backlog else {
+            throw ContinuumError.integrityFailure(
+                "A durable TCP listener is missing its address or backlog."
+            )
+        }
+        let options = try socketOptionValues(listener)
+        let occupancyProbe = Darwin.socket(
+            listener.domain,
+            listener.type,
+            listener.protocol
+        )
+        guard occupancyProbe >= 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not test the saved listener address for conflicts."
+            )
+        }
+        let probeReusable = setSocketOption(
+            descriptor: occupancyProbe,
+            name: SO_REUSEADDR,
+            value: options[SO_REUSEADDR, default: 0]
+        )
+        let probeStatus = withSocketAddress(address) {
+            Darwin.bind(occupancyProbe, $0, $1)
+        }
+        Darwin.close(occupancyProbe)
+        guard probeReusable, probeStatus == 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "The exact saved TCP listener address is occupied by another socket."
+            )
+        }
+        let descriptor = Darwin.socket(
+            listener.domain,
+            listener.type,
+            listener.protocol
+        )
+        guard descriptor >= 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not create the saved TCP listener."
+            )
+        }
+        var keepDescriptor = false
+        defer { if !keepDescriptor { Darwin.close(descriptor) } }
+        for name in [SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF, SO_SNDBUF] {
+            guard let value = options[name] else {
+                throw ContinuumError.integrityFailure(
+                    "A durable TCP listener is missing option \(name)."
+                )
+            }
+            let applied = setSocketOption(
+                descriptor: descriptor,
+                name: name,
+                value: value
+            )
+            let observed = socketOption(descriptor: descriptor, name: name)
+            let matches: Bool
+            if name == SO_REUSEADDR || name == SO_REUSEPORT {
+                matches = observed.map { ($0 == 0) == (value == 0) } == true
+            } else {
+                matches = observed == value
+            }
+            guard applied, matches else {
+                let observedText = observed.map(String.init) ?? "unavailable"
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not replay TCP listener option \(name) exactly (saved \(value), observed \(observedText))."
+                )
+            }
+        }
+        let bindStatus = withSocketAddress(address) {
+            Darwin.bind(descriptor, $0, $1)
+        }
+        guard fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0,
+              bindStatus == 0,
+              Darwin.listen(descriptor, backlog) == 0,
+              socketAddress(descriptor: descriptor, peer: false) == address else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not reclaim the exact saved loopback listener address."
+            )
+        }
+        keepDescriptor = true
+        return descriptor
+    }
+
+    private static func replayConnectedSocketOptions(
+        descriptor: Int32,
+        resource: DurableSocketResource
+    ) throws -> Bool {
+        let options = try socketOptionValues(resource)
+        if options.isEmpty { return true }
+        guard Set(options.keys) == Set([
+            SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF, SO_SNDBUF,
+        ]) else {
+            return false
+        }
+        for name in [SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF, SO_SNDBUF] {
+            guard let value = options[name],
+                  setSocketOption(
+                      descriptor: descriptor,
+                      name: name,
+                      value: value
+                  ),
+                  let observed = socketOption(
+                      descriptor: descriptor,
+                      name: name
+                  ) else {
+                return false
+            }
+            if name == SO_REUSEADDR || name == SO_REUSEPORT {
+                guard (observed == 0) == (value == 0) else { return false }
+            } else if observed != value {
+                return false
+            }
+        }
+        if let tcpNoDelay = resource.tcpNoDelay {
+            let value: Int32 = tcpNoDelay ? 1 : 0
+            guard setSocketOption(
+                descriptor: descriptor,
+                name: TCP_NODELAY,
+                value: value,
+                level: IPPROTO_TCP
+            ), socketOption(
+                descriptor: descriptor,
+                name: TCP_NODELAY,
+                level: IPPROTO_TCP
+            ).map({ ($0 == 0) == !tcpNoDelay }) == true else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func createConnectedPairThroughListener(
+        listenerDescriptor: Int32,
+        accepted: DurableSocketResource,
+        client: DurableSocketResource
+    ) throws -> (accepted: Int32, client: Int32) {
+        guard let listenerAddress = accepted.localAddress,
+              let clientAddress = client.localAddress else {
+            throw ContinuumError.integrityFailure(
+                "A linked TCP pair is missing its exact endpoint addresses."
+            )
+        }
+        func makeClient(
+            boundTo address: Data,
+            permitAddressInUse: Bool
+        ) throws -> Int32? {
+            let descriptor = Darwin.socket(
+                client.domain,
+                client.type,
+                client.protocol
+            )
+            guard descriptor >= 0 else {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not create the client side of a saved TCP stream."
+                )
+            }
+            guard fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0,
+                  setSocketOption(
+                      descriptor: descriptor,
+                      name: SO_REUSEADDR,
+                      value: 1
+                  ),
+                  setSocketOption(
+                      descriptor: descriptor,
+                      name: SO_REUSEPORT,
+                      value: 1
+                  ) else {
+                let savedError = errno
+                Darwin.close(descriptor)
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not configure a saved accepted-stream client (errno \(savedError))."
+                )
+            }
+            let bindStatus = withSocketAddress(address) {
+                Darwin.bind(descriptor, $0, $1)
+            }
+            if bindStatus != 0 {
+                let savedError = errno
+                Darwin.close(descriptor)
+                if permitAddressInUse, savedError == EADDRINUSE {
+                    return nil
+                }
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not bind a saved accepted-stream client (errno \(savedError))."
+                )
+            }
+            return descriptor
+        }
+        let ephemeralAddress = ephemeralPortAddress(clientAddress)
+        var clientDescriptor: Int32
+        if let exactDescriptor = try makeClient(
+            boundTo: clientAddress,
+            permitAddressInUse: ephemeralAddress != nil
+        ) {
+            clientDescriptor = exactDescriptor
+        } else if let ephemeralAddress,
+                  let fallbackDescriptor = try makeClient(
+                      boundTo: ephemeralAddress,
+                      permitAddressInUse: false
+                  ) {
+            clientDescriptor = fallbackDescriptor
+        } else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not bind a saved accepted-stream client."
+            )
+        }
+        var acceptedDescriptor: Int32 = -1
+        var keepDescriptors = false
+        defer {
+            if !keepDescriptors {
+                if clientDescriptor >= 0 { Darwin.close(clientDescriptor) }
+                if acceptedDescriptor >= 0 { Darwin.close(acceptedDescriptor) }
+            }
+        }
+        var connectStatus = withSocketAddress(listenerAddress) {
+            Darwin.connect(clientDescriptor, $0, $1)
+        }
+        // A killed connection can leave its exact four-tuple in TIME_WAIT.
+        // Keep the listener address exact, but use a fresh loopback client port
+        // only when Darwin explicitly refuses that tuple as already in use.
+        if connectStatus != 0, errno == EADDRINUSE,
+           let ephemeralAddress {
+            Darwin.close(clientDescriptor)
+            clientDescriptor = -1
+            guard let fallbackDescriptor = try makeClient(
+                boundTo: ephemeralAddress,
+                permitAddressInUse: false
+            ) else {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not bind a fallback accepted-stream client."
+                )
+            }
+            clientDescriptor = fallbackDescriptor
+            connectStatus = withSocketAddress(listenerAddress) {
+                Darwin.connect(clientDescriptor, $0, $1)
+            }
+        }
+        guard connectStatus == 0 else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not reconnect a saved client through its exact listener (errno \(errno))."
+            )
+        }
+        guard setSocketOption(
+            descriptor: clientDescriptor,
+            name: SO_REUSEADDR,
+            value: 0
+        ), setSocketOption(
+            descriptor: clientDescriptor,
+            name: SO_REUSEPORT,
+            value: 0
+        ), socketOption(descriptor: clientDescriptor, name: SO_REUSEADDR)
+            .map({ $0 == 0 }) == true,
+        socketOption(descriptor: clientDescriptor, name: SO_REUSEPORT)
+            .map({ $0 == 0 }) == true else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not clear temporary client socket options."
+            )
+        }
+        acceptedDescriptor = Darwin.accept(listenerDescriptor, nil, nil)
+        guard acceptedDescriptor >= 0,
+              fcntl(acceptedDescriptor, F_SETFD, FD_CLOEXEC) == 0,
+              socketAddress(descriptor: acceptedDescriptor, peer: false)
+                == accepted.localAddress,
+              socketAddress(descriptor: acceptedDescriptor, peer: true)
+                == socketAddress(descriptor: clientDescriptor, peer: false),
+              socketAddress(descriptor: clientDescriptor, peer: true)
+                == client.remoteAddress else {
+            throw ContinuumError.restoreUnavailable(
+                "The kernel did not recreate a reciprocal accepted TCP stream."
+            )
+        }
+        func applyShutdowns(
+            descriptor: Int32,
+            resource: DurableSocketResource
+        ) -> Bool {
+            if resource.receiveShutdown && resource.sendShutdown {
+                return Darwin.shutdown(descriptor, SHUT_RDWR) == 0
+            }
+            if resource.receiveShutdown,
+               Darwin.shutdown(descriptor, SHUT_RD) != 0 {
+                return false
+            }
+            if resource.sendShutdown,
+               Darwin.shutdown(descriptor, SHUT_WR) != 0 {
+                return false
+            }
+            return true
+        }
+        guard applyShutdowns(descriptor: acceptedDescriptor, resource: accepted),
+              applyShutdowns(descriptor: clientDescriptor, resource: client) else {
+            throw ContinuumError.restoreUnavailable(
+                "Continuum could not replay a saved TCP half-close."
+            )
+        }
+        keepDescriptors = true
+        return (acceptedDescriptor, clientDescriptor)
     }
 
     private static func runtimeTCPEndpoint(

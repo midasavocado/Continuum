@@ -557,26 +557,52 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             by: \.resourceID
         )
         let supportedStatusMask = O_ACCMODE | O_NONBLOCK | O_ASYNC
+        let listenerAddresses = descriptorGraph.sockets.compactMap {
+            $0.kind == .tcpListener ? $0.localAddress : nil
+        }
+        guard Set(listenerAddresses).count == listenerAddresses.count else {
+            return false
+        }
         guard descriptorGraph.sockets.allSatisfy({ socket in
-            socket.kind == .tcpConnected
-                && (socket.domain == AF_INET || socket.domain == AF_INET6)
+            let common = (socket.domain == AF_INET || socket.domain == AF_INET6)
                 && socket.type == SOCK_STREAM
                 && socket.protocol == IPPROTO_TCP
                 && socket.receiveQueueBytes == 0
                 && socket.sendQueueBytes == 0
                 && socket.localAddress != nil
-                && socket.remoteAddress != nil
-                && socket.peerResourceID != nil
-                && socket.peerResourceID != socket.id
-                && socketByID[socket.peerResourceID!]?.peerResourceID == socket.id
-                && socketByID[socket.peerResourceID!]?.localAddress
-                    == socket.remoteAddress
-                && socketByID[socket.peerResourceID!]?.remoteAddress
-                    == socket.localAddress
-                && socket.listenerResourceID == nil
                 && socket.externalPath == nil
-                && socket.options.isEmpty
                 && handlesBySocket[socket.id]?.isEmpty == false
+            guard common else { return false }
+            if socket.kind == .tcpListener {
+                let optionNames = socket.options.map(\.name)
+                return socket.remoteAddress == nil
+                    && socket.peerResourceID == nil
+                    && socket.listenerResourceID == nil
+                    && socket.backlog.map { $0 > 0 } == true
+                    && Set(optionNames) == Set([
+                        SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF, SO_SNDBUF,
+                    ])
+                    && optionNames.count == 4
+            }
+            guard socket.kind == .tcpConnected,
+                  let peerID = socket.peerResourceID,
+                  let peer = socketByID[peerID] else { return false }
+            let listenerIsValid = socket.listenerResourceID.map { listenerID in
+                socketByID[listenerID]?.kind == .tcpListener
+                    && socketByID[listenerID]?.localAddress == socket.localAddress
+                    && peer.listenerResourceID == nil
+            } ?? true
+            return socket.remoteAddress != nil
+                && peerID != socket.id
+                && peer.peerResourceID == socket.id
+                && peer.localAddress == socket.remoteAddress
+                && peer.remoteAddress == socket.localAddress
+                && listenerIsValid
+                && socket.options.count == 4
+                && Set(socket.options.map(\.name)) == Set([
+                    SO_REUSEADDR, SO_REUSEPORT, SO_RCVBUF, SO_SNDBUF,
+                ])
+                && socket.tcpNoDelay != nil
         }), socketHandles.allSatisfy({ handle in
             capturedProcessIdentifiers.contains(handle.processIdentifier)
                 && handle.fileDescriptor >= 0
@@ -1061,6 +1087,11 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 ($0.resource_identity, UUID())
             }
         )
+        let rawSocketsByIdentity = Dictionary(
+            uniqueKeysWithValues: graph.sockets.map {
+                ($0.resource_identity, $0)
+            }
+        )
 
         let handles = try graph.handles.map { handle in
             let resourceID: UUID?
@@ -1135,6 +1166,94 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             } else {
                 externalPath = nil
             }
+            var options: [DurableSocketOption] = []
+            func option(_ name: Int32, _ value: Int32) -> DurableSocketOption {
+                var nativeValue = value
+                return withUnsafeBytes(of: &nativeValue) {
+                    DurableSocketOption(
+                        level: SOL_SOCKET,
+                        name: name,
+                        value: Data($0)
+                    )
+                }
+            }
+            if kind == .tcpListener {
+                let allowedOptions = SO_ACCEPTCONN | SO_REUSEADDR | SO_REUSEPORT
+                guard socket.socket_options & ~allowedOptions == 0,
+                      socket.linger_ticks == 0,
+                      socket.receive_low_water_bytes == 1,
+                      socket.send_low_water_bytes == 2_048,
+                      socket.receive_timeout_ticks == 0,
+                      socket.send_timeout_ticks == 0,
+                      socket.receive_buffer_bytes > 0,
+                      socket.send_buffer_bytes > 0 else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "A TCP listener uses socket options Continuum cannot reproduce exactly."
+                    )
+                }
+                options = [
+                    option(
+                        SO_REUSEADDR,
+                        socket.socket_options & SO_REUSEADDR == 0 ? 0 : 1
+                    ),
+                    option(
+                        SO_REUSEPORT,
+                        socket.socket_options & SO_REUSEPORT == 0 ? 0 : 1
+                    ),
+                    option(SO_RCVBUF, socket.receive_buffer_bytes),
+                    option(SO_SNDBUF, socket.send_buffer_bytes),
+                ]
+            } else if kind == .tcpConnected {
+                // XNU tcp_var.h: TF_NOOPT 0x00008 and TF_NOPUSH 0x01000
+                // correspond to observable TCP_NOOPT/TCP_NOPUSH settings that
+                // this first listener slice does not replay.
+                guard socket.tcp_flags & (0x00008 | 0x01000) == 0 else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "A connected TCP socket uses protocol options Continuum cannot reproduce exactly."
+                    )
+                }
+                let expectedInheritedOptions: Int32
+                if socket.listener_identity == 0 {
+                    expectedInheritedOptions = 0
+                } else if let listener = rawSocketsByIdentity[
+                    socket.listener_identity
+                ] {
+                    expectedInheritedOptions = listener.socket_options
+                        & (SO_REUSEADDR | SO_REUSEPORT)
+                } else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "A connected TCP socket references a missing listener."
+                    )
+                }
+                guard socket.socket_options == expectedInheritedOptions else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "A connected TCP socket uses options Continuum cannot reproduce exactly."
+                    )
+                }
+                guard socket.linger_ticks == 0,
+                      socket.receive_low_water_bytes == 1,
+                      socket.send_low_water_bytes == 2_048,
+                      socket.receive_timeout_ticks == 0,
+                      socket.send_timeout_ticks == 0,
+                      socket.receive_buffer_bytes > 0,
+                      socket.send_buffer_bytes > 0 else {
+                    throw ContinuumError.runtimeUnsupported(
+                        "A connected TCP socket uses tuning Continuum cannot reproduce exactly."
+                    )
+                }
+                options = [
+                    option(
+                        SO_REUSEADDR,
+                        socket.socket_options & SO_REUSEADDR == 0 ? 0 : 1
+                    ),
+                    option(
+                        SO_REUSEPORT,
+                        socket.socket_options & SO_REUSEPORT == 0 ? 0 : 1
+                    ),
+                    option(SO_RCVBUF, socket.receive_buffer_bytes),
+                    option(SO_SNDBUF, socket.send_buffer_bytes),
+                ]
+            }
             return DurableSocketResource(
                 id: id,
                 kind: kind,
@@ -1156,7 +1275,11 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 listenerResourceID: socket.listener_identity == 0
                     ? nil
                     : socketIDs[socket.listener_identity],
-                externalPath: externalPath
+                externalPath: externalPath,
+                options: options,
+                tcpNoDelay: kind == .tcpConnected
+                    ? socket.tcp_no_delay != 0
+                    : nil
             )
         }
 

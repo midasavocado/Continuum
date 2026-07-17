@@ -12589,6 +12589,18 @@ static continuum_status continuum_descriptor_graph_add_socket(
     resource.receive_queue_bytes = socket->soi_rcv.sbi_cc;
     resource.send_queue_bytes = socket->soi_snd.sbi_cc;
     resource.backlog = socket->soi_qlimit;
+    resource.socket_options = (int32_t)(uint16_t)socket->soi_options;
+    resource.receive_buffer_bytes = (int32_t)socket->soi_rcv.sbi_hiwat;
+    resource.send_buffer_bytes = (int32_t)socket->soi_snd.sbi_hiwat;
+    resource.receive_low_water_bytes = (int32_t)socket->soi_rcv.sbi_lowat;
+    resource.send_low_water_bytes = (int32_t)socket->soi_snd.sbi_lowat;
+    resource.receive_timeout_ticks = (int32_t)socket->soi_rcv.sbi_timeo;
+    resource.send_timeout_ticks = (int32_t)socket->soi_snd.sbi_timeo;
+    resource.linger_ticks = (int32_t)socket->soi_linger;
+    // XNU's public tcp_sockinfo exposes TF_NODELAY in tcpsi_flags. The flag's
+    // kernel ABI value is 0x00004 in bsd/netinet/tcp_var.h.
+    resource.tcp_flags = socket->soi_proto.pri_tcp.tcpsi_flags;
+    resource.tcp_no_delay = (resource.tcp_flags & UINT32_C(0x00004)) != 0;
 
     continuum_status status = CONTINUUM_STATUS_OK;
     if ((socket->soi_family == AF_INET || socket->soi_family == AF_INET6)
@@ -12886,6 +12898,30 @@ static continuum_status continuum_descriptor_graph_validate(
             }
             if (peer < 0) return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
             socket->peer_identity = graph->sockets[peer].resource_identity;
+            ssize_t listener = -1;
+            for (size_t candidate = 0;
+                 candidate < graph->socket_count;
+                 candidate += 1) {
+                const continuum_remote_socket_resource_info *other =
+                    &graph->sockets[candidate];
+                if (other->kind == CONTINUUM_REMOTE_SOCKET_TCP_LISTENER
+                    && other->domain == socket->domain
+                    && continuum_descriptor_address_equal(
+                        socket->local_address,
+                        socket->local_address_length,
+                        other->local_address,
+                        other->local_address_length
+                    )) {
+                    if (listener >= 0) {
+                        return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
+                    }
+                    listener = (ssize_t)candidate;
+                }
+            }
+            if (listener >= 0) {
+                socket->listener_identity =
+                    graph->sockets[listener].resource_identity;
+            }
         } else if (socket->kind == CONTINUUM_REMOTE_SOCKET_UNIX_CONNECTED) {
             if (continuum_descriptor_socket_index(graph, socket->peer_identity) < 0) {
                 const int externally_reconnectable =

@@ -729,6 +729,16 @@ typedef struct continuum_remote_socket_resource_info {
     uint64_t receive_queue_bytes;
     uint64_t send_queue_bytes;
     int32_t backlog;
+    int32_t socket_options;
+    int32_t receive_buffer_bytes;
+    int32_t send_buffer_bytes;
+    int32_t receive_low_water_bytes;
+    int32_t send_low_water_bytes;
+    int32_t receive_timeout_ticks;
+    int32_t send_timeout_ticks;
+    int32_t linger_ticks;
+    uint32_t tcp_flags;
+    uint8_t tcp_no_delay;
     uint8_t local_address[CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX];
     uint8_t remote_address[CONTINUUM_REMOTE_DESCRIPTOR_ADDRESS_MAX];
 } continuum_remote_socket_resource_info;

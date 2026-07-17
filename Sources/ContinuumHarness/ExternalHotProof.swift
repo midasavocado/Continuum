@@ -550,11 +550,19 @@ enum ExternalHotProof {
             DurableCheckpointImage.self,
             from: manifest.data
         )
+        let listenerResource = durableImage.descriptorGraph?.sockets.first {
+            $0.kind == .tcpListener
+        }
         try require(
             durableImage.members.count == 2
                 && durableImage.writableFiles.isEmpty
                 && durableImage.establishedTCPEndpoints?.count == 4
-                && durableImage.descriptorGraph?.sockets.count == 2
+                && durableImage.descriptorGraph?.sockets.count == 3
+                && listenerResource?.backlog == 1
+                && listenerResource?.options.count == 4
+                && durableImage.descriptorGraph?.sockets.filter({
+                    $0.listenerResourceID == listenerResource?.id
+                }).count == 1
                 && durableImage.descriptorGraph?.kqueues.count == 1
                 && durableImage.descriptorGraph?.kqueues.first?
                     .registrations.count == 2,
@@ -648,10 +656,18 @@ enum ExternalHotProof {
             root: replacementRoot,
             child: replacementChild
         )
+        try verifyListenerForestAliases(root: replacementRoot)
 
         try Data("WRITE\n".utf8).write(to: commandURL, options: .atomic)
         try await waitForPipeForestObservation("PIPE_OK", at: observationURL)
         try await waitForPipeForestObservation("TCP_OK", at: observationURL)
+        guard let listenerAddress = listenerResource?.localAddress else {
+            throw ExternalHotProofFailure.invariant(
+                "durable listener lost its exact loopback address"
+            )
+        }
+        try sendPipeForestListenerMarker(to: listenerAddress)
+        try await waitForPipeForestObservation("LISTENER_OK", at: observationURL)
         let restoredSentinel = try Data(contentsOf: sentinelURL)
         let restoredSentinelInode = try fileInode(sentinelURL)
         try require(
@@ -687,6 +703,8 @@ enum ExternalHotProof {
         print("  kqueue:       EVFILT_READ delivered the restored pipe byte")
         print("  TCP aliases:  root 220/221 <-> child 230/231")
         print("  TCP byte:     0xB8 crossed the restored loopback stream")
+        print("  TCP listener: aliases 240/241 accepted a new 0xC9 marker")
+        print("  TCP tuple:    listener exact; linked client port may remap after TIME_WAIT")
         print("  local files:  post-capture sentinel unchanged")
     }
 
@@ -830,6 +848,49 @@ enum ExternalHotProof {
                 && childSocket.psi.soi_rcv.sbi_cc == 0
                 && childSocket.psi.soi_snd.sbi_cc == 0,
             "restored fixed socket aliases did not share one empty loopback stream"
+        )
+    }
+
+    private static func verifyListenerForestAliases(root: Int32) throws {
+        let listener = try pipeForestSocketInfo(processID: root, descriptor: 240)
+        let alias = try pipeForestSocketInfo(processID: root, descriptor: 241)
+        try require(
+            listener.psi.soi_so == alias.psi.soi_so
+                && listener.psi.soi_proto.pri_tcp.tcpsi_state == TSI_S_LISTEN
+                && listener.psi.soi_qlen == 0
+                && listener.psi.soi_incqlen == 0
+                && Int32(listener.psi.soi_options) & SO_REUSEADDR != 0
+                && listener.psi.soi_rcv.sbi_hiwat == 1024 * 1024
+                && listener.psi.soi_snd.sbi_hiwat == 1024 * 1024,
+            "restored listener aliases or exact socket options changed"
+        )
+    }
+
+    private static func sendPipeForestListenerMarker(to address: Data) throws {
+        let domain: Int32
+        if address.count == MemoryLayout<sockaddr_in>.size {
+            domain = AF_INET
+        } else if address.count == MemoryLayout<sockaddr_in6>.size {
+            domain = AF_INET6
+        } else {
+            throw ExternalHotProofFailure.invariant(
+                "durable listener address has an unsupported native size"
+            )
+        }
+        let descriptor = Darwin.socket(domain, SOCK_STREAM, IPPROTO_TCP)
+        try require(descriptor >= 0, "could not create listener proof client")
+        defer { Darwin.close(descriptor) }
+        let connected = address.withUnsafeBytes { bytes in
+            Darwin.connect(
+                descriptor,
+                bytes.baseAddress!.assumingMemoryBound(to: sockaddr.self),
+                socklen_t(bytes.count)
+            )
+        }
+        var marker: UInt8 = 0xC9
+        try require(
+            connected == 0 && Darwin.write(descriptor, &marker, 1) == 1,
+            "restored listener did not accept a new exact-address client"
         )
     }
 

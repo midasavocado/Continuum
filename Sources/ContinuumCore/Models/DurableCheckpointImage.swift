@@ -3,7 +3,7 @@ import Foundation
 /// Versioned, pointer-free description of a process-tree checkpoint. Large
 /// byte ranges live in encrypted content-addressed chunks referenced here.
 public struct DurableCheckpointImage: Codable, Hashable, Sendable {
-    public static let currentFormatVersion = 6
+    public static let currentFormatVersion = 7
 
     public let formatVersion: Int
     public let checkpointID: CheckpointID
@@ -136,6 +136,7 @@ public struct DurableSocketResource: Codable, Hashable, Sendable {
     public let listenerResourceID: UUID?
     public let externalPath: String?
     public let options: [DurableSocketOption]
+    public let tcpNoDelay: Bool?
 
     public init(
         id: UUID,
@@ -153,7 +154,8 @@ public struct DurableSocketResource: Codable, Hashable, Sendable {
         peerResourceID: UUID? = nil,
         listenerResourceID: UUID? = nil,
         externalPath: String? = nil,
-        options: [DurableSocketOption] = []
+        options: [DurableSocketOption] = [],
+        tcpNoDelay: Bool? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -171,6 +173,7 @@ public struct DurableSocketResource: Codable, Hashable, Sendable {
         self.listenerResourceID = listenerResourceID
         self.externalPath = externalPath
         self.options = options
+        self.tcpNoDelay = tcpNoDelay
     }
 }
 
