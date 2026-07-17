@@ -23,6 +23,10 @@ struct ContinuumHarnessMain {
                 try await ExternalHotProof.run(targetPath: target, cycles: cycles)
             case let .guiColdProof(target):
                 try await GUIColdProof.run(targetPath: target)
+            case let .pipeForestColdProof(target):
+                try await ExternalHotProof.runPipeForestColdProof(
+                    targetPath: target
+                )
             case let .setupApp(target, root, checkOnly):
                 try await ManagedAppSetupCommand.run(
                     targetPath: target,
@@ -52,6 +56,7 @@ private enum HarnessCommand: Equatable {
     case transactionProof
     case externalHotProof(target: String, cycles: Int)
     case guiColdProof(target: String)
+    case pipeForestColdProof(target: String)
     case setupApp(target: String, root: String?, checkOnly: Bool)
     case help
 
@@ -67,6 +72,8 @@ private enum HarnessCommand: Equatable {
                          Rewind the included cooperative proof target at least 100 times.
       gui-cold-proof --target <path>
                          Kill and cold-restore a real AppKit window into a new PID.
+      pipe-forest-cold-proof --target <path>
+                         Kill and cold-restore a root/helper pipe forest.
       setup-app --target <path> [--root <path>] [--check-only]
                          Run the same generic managed-copy setup used by the app.
       help               Show this help.
@@ -83,6 +90,9 @@ private enum HarnessCommand: Equatable {
         }
         if name == "gui-cold-proof" {
             return try parseGUIColdProof(arguments.dropFirst())
+        }
+        if name == "pipe-forest-cold-proof" {
+            return try parsePipeForestColdProof(arguments.dropFirst())
         }
         if name == "setup-app" {
             return try parseSetupApp(arguments.dropFirst())
@@ -144,6 +154,18 @@ private enum HarnessCommand: Equatable {
             )
         }
         return .guiColdProof(target: values[1])
+    }
+
+    private static func parsePipeForestColdProof(
+        _ arguments: ArraySlice<String>
+    ) throws -> Self {
+        let values = Array(arguments)
+        guard values.count == 2, values[0] == "--target" else {
+            throw HarnessFailure.usage(
+                "pipe-forest-cold-proof requires --target <path>"
+            )
+        }
+        return .pipeForestColdProof(target: values[1])
     }
 
     private static func parseExternalHotProof(_ arguments: ArraySlice<String>) throws -> Self {

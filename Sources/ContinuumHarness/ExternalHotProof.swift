@@ -362,6 +362,424 @@ enum ExternalHotProof {
         print("  safety state B was captured before the first rewind and restored last")
     }
 
+    static func runPipeForestColdProof(targetPath: String) async throws {
+        guard FileManager.default.isExecutableFile(atPath: targetPath) else {
+            throw HarnessFailure.usage(
+                "pipe forest proof target is not executable: \(targetPath)"
+            )
+        }
+        guard let bootstrapPath = ProcessInfo.processInfo.environment[
+            "CONTINUUM_BOOTSTRAP_LIBRARY_PATH"
+        ], FileManager.default.fileExists(atPath: bootstrapPath) else {
+            throw HarnessFailure.usage(
+                "CONTINUUM_BOOTSTRAP_LIBRARY_PATH must name the built bootstrap dylib"
+            )
+        }
+
+        let proofRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "continuum-pipe-forest-cold-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: proofRoot,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: proofRoot) }
+        let observationURL = proofRoot.appendingPathComponent("observations.log")
+        let commandURL = URL(
+            fileURLWithPath: observationURL.path + ".command"
+        )
+        let sentinelURL = proofRoot.appendingPathComponent("sentinel.bin")
+        let savedSentinel = Data("saved-before-capture".utf8)
+        let futureSentinel = Data("newer-after-capture-must-survive".utf8)
+        try savedSentinel.write(to: sentinelURL, options: .atomic)
+        let sentinelInode = try fileInode(sentinelURL)
+
+        var ptyMaster: Int32 = -1
+        var ptySlave: Int32 = -1
+        try require(
+            openpty(&ptyMaster, &ptySlave, nil, nil, nil) == 0,
+            "could not create the original managed PTY"
+        )
+        defer {
+            if ptyMaster >= 0 { Darwin.close(ptyMaster) }
+            if ptySlave >= 0 { Darwin.close(ptySlave) }
+        }
+
+        var environment = ProcessInfo.processInfo.environment.map {
+            "\($0.key)=\($0.value)"
+        }.filter {
+            !$0.hasPrefix("DYLD_SHARED_REGION=")
+                && !$0.hasPrefix("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=")
+                && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
+                && !$0.hasPrefix("CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=")
+                && !$0.hasPrefix("DYLD_INSERT_LIBRARIES=")
+                && !$0.hasPrefix("MallocLargeCache=")
+        }
+        environment.append("DYLD_SHARED_REGION=private")
+        environment.append("CONTINUUM_DETERMINISTIC_ADDRESS_SPACE=1")
+        environment.append("CONTINUUM_BOOTSTRAP_STOP=1")
+        environment.append("CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=1")
+        environment.append("MallocLargeCache=0")
+        environment.append("DYLD_INSERT_LIBRARIES=\(bootstrapPath)")
+        let arguments = [
+            targetPath,
+            "--continuum-pipe-forest-root",
+            observationURL.path,
+        ]
+        var originalRoot: Int32 = 0
+        let launchStatus = withCStringArray(arguments) { argumentEntries in
+            withCStringArray(environment) { environmentEntries in
+                targetPath.withCString { executable in
+                    FileManager.default.currentDirectoryPath.withCString {
+                        workingDirectory in
+                        let remaps = [
+                            continuum_spawn_descriptor_remap(
+                                source_descriptor: ptySlave,
+                                target_descriptor: STDIN_FILENO
+                            ),
+                            continuum_spawn_descriptor_remap(
+                                source_descriptor: ptySlave,
+                                target_descriptor: STDOUT_FILENO
+                            ),
+                            continuum_spawn_descriptor_remap(
+                                source_descriptor: ptySlave,
+                                target_descriptor: STDERR_FILENO
+                            ),
+                        ]
+                        return remaps.withUnsafeBufferPointer { buffer in
+                            continuum_spawn_process_with_remaps(
+                                executable,
+                                argumentEntries,
+                                environmentEntries,
+                                workingDirectory,
+                                buffer.baseAddress,
+                                buffer.count,
+                                1,
+                                &originalRoot
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        Darwin.close(ptySlave)
+        ptySlave = -1
+        try require(
+            launchStatus == CONTINUUM_STATUS_OK
+                && originalRoot > 0 && ptyMaster >= 0,
+            "managed spawn could not launch the original pipe forest root"
+        )
+        var originalChild: Int32 = 0
+        var originalsReaped = false
+        defer {
+            if !originalsReaped, originalRoot > 0 {
+                if originalChild > 0 { kill(originalChild, SIGKILL) }
+                // A failed capture may leave the cooperative safepoint active.
+                // Test cleanup must not wait for target signal handlers.
+                kill(originalRoot, SIGKILL)
+                var status: Int32 = 0
+                _ = waitpid(originalRoot, &status, 0)
+            }
+        }
+        try check(
+            continuum_wait_for_process_stop(originalRoot, 5_000),
+            operation: "wait for original root bootstrap stop"
+        )
+        try require(
+            kill(originalRoot, SIGCONT) == 0,
+            "could not release the original root bootstrap stop"
+        )
+        let ready = try await waitForPipeForestReady(at: observationURL)
+        try require(
+            ready.root == originalRoot && ready.child > 0,
+            "target reported the wrong original forest identities"
+        )
+        originalChild = ready.child
+        try require(
+            pipeForestParentProcessIdentifier(originalChild) == originalRoot,
+            "the original helper was not a direct child of the root"
+        )
+        fputs(
+            "pipe-forest proof: capturing original forest root=\(originalRoot) child=\(originalChild)\n",
+            stderr
+        )
+        fflush(stderr)
+
+        let service = HotProcessCheckpointService(
+            maximumCapturedBytes: fullProcessCaptureBudget,
+            maximumRetainedSnapshots: 2,
+            usesInjectedSafepoints: true,
+            bootstrapLibraryURL: URL(fileURLWithPath: bootstrapPath)
+        )
+        let app = AppIdentity(
+            bundleIdentifier: nil,
+            displayName: "Continuum Pipe Forest Proof",
+            bundleURL: nil,
+            executableURL: URL(fileURLWithPath: targetPath),
+            version: "proof",
+            signingIdentifier: nil,
+            teamIdentifier: nil,
+            isApplePlatformBinary: false
+        )
+        let capture = try await service.capture(
+            app: app,
+            processIdentifiers: [originalRoot, originalChild],
+            kind: .manual,
+            branchID: UUID()
+        )
+        fputs("pipe-forest proof: durable capture complete\n", stderr)
+        fflush(stderr)
+        let storeKey = Data(repeating: 0xA7, count: 32)
+        let storeURL = proofRoot.appendingPathComponent("store", isDirectory: true)
+        let store = try EncryptedSnapshotStore(
+            rootURL: storeURL,
+            encryptionKey: storeKey
+        )
+        let snapshot = try await store.save(capture)
+        let reopenedStore = try EncryptedSnapshotStore(
+            rootURL: storeURL,
+            encryptionKey: storeKey
+        )
+        let manifest = try await reopenedStore.artifact(
+            for: snapshot.id,
+            logicalName: "durable-checkpoint-v3.json"
+        )
+        let durableImage = try JSONDecoder().decode(
+            DurableCheckpointImage.self,
+            from: manifest.data
+        )
+        try require(
+            durableImage.members.count == 2
+                && durableImage.writableFiles.isEmpty,
+            "durable pipe forest stored file contents or lost a process"
+        )
+
+        try replaceFileBytesPreservingInode(at: sentinelURL, with: futureSentinel)
+        try require(kill(originalChild, SIGKILL) == 0, "could not kill original helper")
+        try require(kill(originalRoot, SIGKILL) == 0, "could not kill original root")
+        var originalStatus: Int32 = 0
+        try require(
+            waitpid(originalRoot, &originalStatus, 0) == originalRoot,
+            "could not reap the original root"
+        )
+        originalsReaped = true
+        for _ in 0..<200 where pipeForestProcessExists(originalChild) {
+            usleep(10_000)
+        }
+        try require(
+            !pipeForestProcessExists(originalRoot)
+                && !pipeForestProcessExists(originalChild),
+            "the complete original forest was not exited and reaped"
+        )
+
+        let fileSafetyURL = proofRoot.appendingPathComponent(
+            "file-safety",
+            isDirectory: true
+        )
+        let restorer = ColdProcessRestorer(
+            bootstrapLibraryURL: URL(fileURLWithPath: bootstrapPath),
+            fileSafetyRootURL: fileSafetyURL
+        )
+        let preparation = try await restorer.prepareProcessForest(
+            from: snapshot.id,
+            repository: reopenedStore
+        )
+        fputs("pipe-forest proof: cold preparation complete\n", stderr)
+        fflush(stderr)
+        var committed = false
+        defer {
+            if !committed {
+                Task { try? await restorer.discardProcessForest(preparation.id) }
+            }
+        }
+        let rootMember = preparation.members.first {
+            $0.capturedProcessIdentifier == originalRoot
+        }
+        let childMember = preparation.members.first {
+            $0.capturedProcessIdentifier == originalChild
+        }
+        guard let rootMember, let childMember else {
+            throw ExternalHotProofFailure.invariant(
+                "cold preparation lost the root/helper mapping"
+            )
+        }
+        let replacementRoot = rootMember.replacementProcessIdentifier
+        let replacementChild = childMember.replacementProcessIdentifier
+        try require(
+            replacementRoot != originalRoot
+                && replacementRoot != originalChild
+                && replacementChild != originalRoot
+                && replacementChild != originalChild
+                && replacementRoot != replacementChild
+                && childMember.replacementParentProcessIdentifier != nil,
+            "cold preparation did not create a new exact parent/child forest"
+        )
+        let commit = try await restorer.commitProcessForest(preparation.id)
+        committed = true
+        var replacementsReaped = false
+        defer {
+            if !replacementsReaped {
+                kill(replacementChild, SIGKILL)
+                kill(replacementRoot, SIGKILL)
+                var status: Int32 = 0
+                _ = waitpid(replacementRoot, &status, 0)
+            }
+        }
+        try require(
+            commit.rootProcessIdentifier == replacementRoot
+                && Set(commit.processIdentifiers)
+                    == Set([replacementRoot, replacementChild])
+                && pipeForestParentProcessIdentifier(replacementChild)
+                    == replacementRoot,
+            "committed forest identities or parentage changed"
+        )
+        try verifyPipeForestAliases(
+            root: replacementRoot,
+            child: replacementChild
+        )
+
+        try Data("WRITE\n".utf8).write(to: commandURL, options: .atomic)
+        try await waitForPipeForestObservation("BYTE_OK", at: observationURL)
+        let restoredSentinel = try Data(contentsOf: sentinelURL)
+        let restoredSentinelInode = try fileInode(sentinelURL)
+        try require(
+            restoredSentinel == futureSentinel
+                && restoredSentinelInode == sentinelInode
+                && !FileManager.default.fileExists(atPath: fileSafetyURL.path),
+            "process restore changed the post-capture sentinel or created file rollback"
+        )
+
+        try require(kill(replacementChild, SIGKILL) == 0, "could not stop restored helper")
+        try require(kill(replacementRoot, SIGKILL) == 0, "could not stop restored root")
+        var replacementStatus: Int32 = 0
+        try require(
+            waitpid(replacementRoot, &replacementStatus, 0) == replacementRoot,
+            "could not reap restored root"
+        )
+        replacementsReaped = true
+        for _ in 0..<200 where pipeForestProcessExists(replacementChild) {
+            usleep(10_000)
+        }
+        try require(
+            !pipeForestProcessExists(replacementRoot)
+                && !pipeForestProcessExists(replacementChild),
+            "restored forest cleanup left a process behind"
+        )
+
+        print("pipe-forest-cold-proof: PASS")
+        print("  originals:    root=\(originalRoot), child=\(originalChild) (reaped)")
+        print("  replacements: root=\(replacementRoot), child=\(replacementChild)")
+        print("  parentage:    direct child preserved")
+        print("  pipe aliases: root 200/201 <-> child 210/211")
+        print("  pipe byte:    0xA7 crossed the restored pipe")
+        print("  local files:  post-capture sentinel unchanged")
+    }
+
+    private static func waitForPipeForestReady(
+        at url: URL
+    ) async throws -> (root: Int32, child: Int32) {
+        for _ in 0..<200 {
+            if let text = try? String(contentsOf: url, encoding: .utf8),
+               let line = text.split(separator: "\n").first(where: {
+                   $0.hasPrefix("ROOT_READY ")
+               }) {
+                let fields = line.split(separator: " ")
+                if fields.count == 3,
+                   let root = Int32(fields[1]),
+                   let child = Int32(fields[2]) {
+                    return (root, child)
+                }
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw ExternalHotProofFailure.target(
+            "pipe forest did not publish its root/helper ready record"
+        )
+    }
+
+    private static func waitForPipeForestObservation(
+        _ expected: String,
+        at url: URL
+    ) async throws {
+        for _ in 0..<200 {
+            if let text = try? String(contentsOf: url, encoding: .utf8),
+               text.split(separator: "\n").contains(Substring(expected)) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let observations = (try? String(contentsOf: url, encoding: .utf8))
+            ?? "<unreadable>"
+        throw ExternalHotProofFailure.target(
+            "restored pipe did not publish \(expected); observations: \(observations)"
+        )
+    }
+
+    private static func pipeForestProcessExists(_ processID: Int32) -> Bool {
+        kill(processID, 0) == 0 || errno == EPERM
+    }
+
+    private static func pipeForestParentProcessIdentifier(
+        _ processID: Int32
+    ) -> Int32? {
+        var info = proc_bsdinfo()
+        let bytes = proc_pidinfo(
+            processID,
+            PROC_PIDTBSDINFO,
+            0,
+            &info,
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        guard bytes == MemoryLayout<proc_bsdinfo>.size else { return nil }
+        return Int32(info.pbi_ppid)
+    }
+
+    private static func pipeForestPipeInfo(
+        processID: Int32,
+        descriptor: Int32
+    ) throws -> pipe_fdinfo {
+        var info = pipe_fdinfo()
+        let bytes = proc_pidfdinfo(
+            processID,
+            descriptor,
+            PROC_PIDFDPIPEINFO,
+            &info,
+            Int32(MemoryLayout<pipe_fdinfo>.size)
+        )
+        guard bytes == MemoryLayout<pipe_fdinfo>.size else {
+            throw ExternalHotProofFailure.invariant(
+                "PID \(processID) did not restore pipe fd \(descriptor)"
+            )
+        }
+        return info
+    }
+
+    private static func verifyPipeForestAliases(
+        root: Int32,
+        child: Int32
+    ) throws {
+        let rootRead = try pipeForestPipeInfo(processID: root, descriptor: 200)
+        let rootAlias = try pipeForestPipeInfo(processID: root, descriptor: 201)
+        let childWrite = try pipeForestPipeInfo(processID: child, descriptor: 210)
+        let childAlias = try pipeForestPipeInfo(processID: child, descriptor: 211)
+        try require(
+            rootRead.pipeinfo.pipe_handle == rootAlias.pipeinfo.pipe_handle
+                && childWrite.pipeinfo.pipe_handle
+                    == childAlias.pipeinfo.pipe_handle
+                && rootRead.pipeinfo.pipe_handle
+                    != childWrite.pipeinfo.pipe_handle
+                && rootRead.pipeinfo.pipe_peerhandle
+                    == childWrite.pipeinfo.pipe_handle
+                && childWrite.pipeinfo.pipe_peerhandle
+                    == rootRead.pipeinfo.pipe_handle
+                && rootRead.pipeinfo.pipe_stat.vst_size == 0
+                && childWrite.pipeinfo.pipe_stat.vst_size == 0,
+            "restored fixed descriptor aliases did not share one reciprocal empty pipe"
+        )
+    }
+
     private static func verifyShippingHotBackend(
         target: ExternalTargetProcess,
         targetPID: Int32,
@@ -986,6 +1404,22 @@ enum ExternalHotProof {
         var pointers: [UnsafePointer<CChar>?] = allocated.map { pointer in
             pointer.map { UnsafePointer<CChar>($0) }
         }
+        pointers.append(nil)
+        return try pointers.withUnsafeBufferPointer { buffer in
+            try body(buffer.baseAddress)
+        }
+    }
+
+    private static func withMutableCStringArray<Result>(
+        _ strings: [String],
+        _ body: (
+            UnsafePointer<UnsafeMutablePointer<CChar>?>?
+        ) throws -> Result
+    ) rethrows -> Result {
+        var pointers: [UnsafeMutablePointer<CChar>?] = strings.map { value in
+            value.withCString { strdup($0) }
+        }
+        defer { pointers.forEach { free($0) } }
         pointers.append(nil)
         return try pointers.withUnsafeBufferPointer { buffer in
             try body(buffer.baseAddress)

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -18,6 +19,230 @@
 extern char **environ;
 static const char *self_executable = NULL;
 #define COLD_RAW_THREAD_STACK_SIZE (1024U * 1024U)
+#define PIPE_FOREST_ROOT_READ_FD 200
+#define PIPE_FOREST_ROOT_READ_ALIAS_FD 201
+#define PIPE_FOREST_CHILD_WRITE_FD 210
+#define PIPE_FOREST_CHILD_WRITE_ALIAS_FD 211
+#define PIPE_FOREST_BYTE UINT8_C(0xA7)
+
+static char pipe_forest_observation_path[PATH_MAX];
+static char pipe_forest_command_path[PATH_MAX];
+static int pipe_forest_is_child = 0;
+
+static int pipe_forest_set_paths(const char *observation_path) {
+    int length = snprintf(
+        pipe_forest_command_path,
+        sizeof(pipe_forest_command_path),
+        "%s.command",
+        observation_path
+    );
+    if (strlen(observation_path) >= sizeof(pipe_forest_observation_path)
+        || length <= 0
+        || (size_t)length >= sizeof(pipe_forest_command_path)) {
+        return 0;
+    }
+    strcpy(pipe_forest_observation_path, observation_path);
+    return 1;
+}
+
+static void pipe_forest_append(const char *bytes, size_t length) {
+    int descriptor = open(
+        pipe_forest_observation_path,
+        O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+        S_IRUSR | S_IWUSR
+    );
+    if (descriptor < 0) {
+        return;
+    }
+    (void)write(descriptor, bytes, length);
+    (void)fsync(descriptor);
+    (void)close(descriptor);
+}
+
+static void pipe_forest_exchange(int signal_number) {
+    (void)signal_number;
+    if (pipe_forest_is_child) {
+        const uint8_t byte = PIPE_FOREST_BYTE;
+        (void)write(PIPE_FOREST_CHILD_WRITE_FD, &byte, sizeof(byte));
+        return;
+    }
+    uint8_t byte = 0;
+    if (read(PIPE_FOREST_ROOT_READ_FD, &byte, sizeof(byte)) == sizeof(byte)
+        && byte == PIPE_FOREST_BYTE) {
+        static const char success[] = "BYTE_OK\n";
+        pipe_forest_append(success, sizeof(success) - 1);
+    }
+}
+
+static void pipe_forest_reap_child_and_exit(int signal_number) {
+    (void)signal_number;
+    int status = 0;
+    while (waitpid(-1, &status, 0) < 0 && errno == EINTR) {}
+    _exit(EXIT_SUCCESS);
+}
+
+static void pipe_forest_record_child_exit(int signal_number) {
+    (void)signal_number;
+    int status = 0;
+    pid_t child = waitpid(-1, &status, WNOHANG);
+    if (child <= 0) {
+        return;
+    }
+    char observation[96];
+    int length = WIFSIGNALED(status)
+        ? snprintf(
+            observation,
+            sizeof(observation),
+            "CHILD_EXIT %d signal=%d\n",
+            child,
+            WTERMSIG(status)
+        )
+        : snprintf(
+            observation,
+            sizeof(observation),
+            "CHILD_EXIT %d status=%d\n",
+            child,
+            WIFEXITED(status) ? WEXITSTATUS(status) : -1
+        );
+    if (length > 0 && (size_t)length < sizeof(observation)) {
+        pipe_forest_append(observation, (size_t)length);
+    }
+}
+
+static int install_pipe_forest_handler(int signal_number, void (*handler)(int)) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handler;
+    sigemptyset(&action.sa_mask);
+    return sigaction(signal_number, &action, NULL) == 0;
+}
+
+static int run_pipe_forest_child(const char *observation_path) {
+    if (!pipe_forest_set_paths(observation_path)) {
+        return EXIT_FAILURE;
+    }
+    pipe_forest_is_child = 1;
+    if (fcntl(PIPE_FOREST_CHILD_WRITE_FD, F_GETFD) < 0
+        || fcntl(PIPE_FOREST_CHILD_WRITE_ALIAS_FD, F_GETFD) < 0
+        || !install_pipe_forest_handler(SIGWINCH, pipe_forest_exchange)) {
+        return EXIT_FAILURE;
+    }
+    static const char ready[] = "CHILD_READY\n";
+    pipe_forest_append(ready, sizeof(ready) - 1);
+    for (;;) {
+        if (access(pipe_forest_command_path, F_OK) == 0) {
+            const uint8_t byte = PIPE_FOREST_BYTE;
+            (void)write(PIPE_FOREST_CHILD_WRITE_FD, &byte, sizeof(byte));
+            (void)unlink(pipe_forest_command_path);
+        }
+        usleep(10000);
+    }
+}
+
+static int run_pipe_forest_root(const char *executable, const char *observation_path) {
+    if (!pipe_forest_set_paths(observation_path)) {
+        return EXIT_FAILURE;
+    }
+    (void)unsetenv("CONTINUUM_BOOTSTRAP_STOP");
+    if (setsid() < 0
+        || ioctl(STDIN_FILENO, TIOCSCTTY, 0) != 0
+        || tcsetpgrp(STDIN_FILENO, getpgrp()) != 0) {
+        return EXIT_FAILURE;
+    }
+    int endpoints[2] = {-1, -1};
+    if (pipe(endpoints) != 0
+        || dup2(endpoints[0], PIPE_FOREST_ROOT_READ_FD) < 0
+        || dup2(endpoints[0], PIPE_FOREST_ROOT_READ_ALIAS_FD) < 0
+        || fcntl(PIPE_FOREST_ROOT_READ_FD, F_SETFL, O_NONBLOCK) != 0
+        || fcntl(PIPE_FOREST_ROOT_READ_FD, F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(PIPE_FOREST_ROOT_READ_ALIAS_FD, F_SETFD, FD_CLOEXEC) != 0
+        || fcntl(endpoints[1], F_SETFD, FD_CLOEXEC) != 0) {
+        if (endpoints[0] >= 0) close(endpoints[0]);
+        if (endpoints[1] >= 0) close(endpoints[1]);
+        return EXIT_FAILURE;
+    }
+    close(endpoints[0]);
+
+    posix_spawn_file_actions_t actions;
+    int actions_initialized = posix_spawn_file_actions_init(&actions) == 0;
+    int actions_valid = actions_initialized
+        && posix_spawn_file_actions_adddup2(
+            &actions,
+            endpoints[1],
+            PIPE_FOREST_CHILD_WRITE_FD
+        ) == 0
+        && posix_spawn_file_actions_adddup2(
+            &actions,
+            endpoints[1],
+            PIPE_FOREST_CHILD_WRITE_ALIAS_FD
+        ) == 0
+        && posix_spawn_file_actions_addclose(
+            &actions,
+            PIPE_FOREST_ROOT_READ_FD
+        ) == 0
+        && posix_spawn_file_actions_addclose(
+            &actions,
+            PIPE_FOREST_ROOT_READ_ALIAS_FD
+        ) == 0;
+    if (!actions_valid) {
+        if (actions_initialized) {
+            posix_spawn_file_actions_destroy(&actions);
+        }
+        close(endpoints[1]);
+        return EXIT_FAILURE;
+    }
+    char *const arguments[] = {
+        (char *)executable,
+        "--continuum-pipe-forest-child",
+        (char *)observation_path,
+        NULL
+    };
+    pid_t child = 0;
+    int spawn_result = posix_spawn(
+        &child,
+        executable,
+        &actions,
+        NULL,
+        arguments,
+        environ
+    );
+    posix_spawn_file_actions_destroy(&actions);
+    close(endpoints[1]);
+    if (spawn_result != 0
+        || !install_pipe_forest_handler(SIGWINCH, pipe_forest_exchange)
+        || !install_pipe_forest_handler(SIGCHLD, pipe_forest_record_child_exit)
+        || !install_pipe_forest_handler(SIGTERM, pipe_forest_reap_child_and_exit)) {
+        if (child > 0) {
+            kill(child, SIGKILL);
+            (void)waitpid(child, NULL, 0);
+        }
+        return EXIT_FAILURE;
+    }
+
+    char ready[96];
+    int length = snprintf(
+        ready,
+        sizeof(ready),
+        "ROOT_READY %d %d\n",
+        getpid(),
+        child
+    );
+    if (length <= 0 || (size_t)length >= sizeof(ready)) {
+        kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+        return EXIT_FAILURE;
+    }
+    pipe_forest_append(ready, (size_t)length);
+    for (;;) {
+        uint8_t byte = 0;
+        if (read(PIPE_FOREST_ROOT_READ_FD, &byte, sizeof(byte)) == sizeof(byte)
+            && byte == PIPE_FOREST_BYTE) {
+            static const char success[] = "BYTE_OK\n";
+            pipe_forest_append(success, sizeof(success) - 1);
+        }
+        usleep(10000);
+    }
+}
 
 #if defined(__arm64__)
 static volatile uint64_t cold_raw_thread_counter = 0;
@@ -466,6 +691,14 @@ static int run_server(target_state *target) {
 
 int main(int argc, char **argv) {
     self_executable = argv[0];
+    if (argc > 2
+        && strcmp(argv[1], "--continuum-pipe-forest-child") == 0) {
+        return run_pipe_forest_child(argv[2]);
+    }
+    if (argc > 2
+        && strcmp(argv[1], "--continuum-pipe-forest-root") == 0) {
+        return run_pipe_forest_root(argv[0], argv[2]);
+    }
     if (argc > 1 && strcmp(argv[1], "--continuum-idle-child") == 0) {
         while (getppid() != 1) {
             usleep(100000);

@@ -98,7 +98,34 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 }
                 safepointProcessIdentifiers.append(processIdentifier)
             }
-            usleep(250_000)
+            var pendingSafepoints = Set(captureMembers)
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !pendingSafepoints.isEmpty, ContinuousClock.now < deadline {
+                for processIdentifier in Array(pendingSafepoints) {
+                    var isActive: UInt8 = 0
+                    let status = bootstrapLibraryPath.withCString {
+                        continuum_remote_process_safepoint_is_active(
+                            processIdentifier,
+                            $0,
+                            &isActive
+                        )
+                    }
+                    guard status == CONTINUUM_STATUS_OK else {
+                        throw ContinuumError.runtimeUnsupported(
+                            "Continuum could not authenticate process \(processIdentifier)'s checkpoint boundary: \(statusDescription(status))."
+                        )
+                    }
+                    if isActive != 0 {
+                        pendingSafepoints.remove(processIdentifier)
+                    }
+                }
+                if !pendingSafepoints.isEmpty { usleep(10_000) }
+            }
+            guard pendingSafepoints.isEmpty else {
+                throw ContinuumError.runtimeUnsupported(
+                    "The app and its helpers did not reach a checkpoint boundary within two seconds."
+                )
+            }
         }
         defer {
             for processIdentifier in safepointProcessIdentifiers {
@@ -1615,6 +1642,9 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
             0,
             &count
         )
+        if ProcessInfo.processInfo.environment["CONTINUUM_CAPTURE_TRACE"] != nil {
+            fputs("continuum resources phase=writable-count status=\(status.rawValue) count=\(count)\n", stderr)
+        }
         guard status == CONTINUUM_STATUS_OK else { return status }
 
         var rawEntries = Array(
@@ -1629,6 +1659,9 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
                 buffer.count,
                 &returnedCount
             )
+        }
+        if ProcessInfo.processInfo.environment["CONTINUUM_CAPTURE_TRACE"] != nil {
+            fputs("continuum resources phase=writable-copy status=\(status.rawValue) returned=\(returnedCount)\n", stderr)
         }
         guard status == CONTINUUM_STATUS_OK, returnedCount == count else {
             return status == CONTINUUM_STATUS_OK
@@ -1650,6 +1683,9 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
             0,
             &endpointCount
         )
+        if ProcessInfo.processInfo.environment["CONTINUUM_CAPTURE_TRACE"] != nil {
+            fputs("continuum resources phase=tcp-count status=\(status.rawValue) count=\(endpointCount)\n", stderr)
+        }
         guard status == CONTINUUM_STATUS_OK else { return status }
         var capturedEndpoints = Array(
             repeating: continuum_remote_tcp_endpoint_info(),
@@ -1679,6 +1715,9 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
             0,
             &ptyDescriptorCount
         )
+        if ProcessInfo.processInfo.environment["CONTINUUM_CAPTURE_TRACE"] != nil {
+            fputs("continuum resources phase=pty-count status=\(status.rawValue) count=\(ptyDescriptorCount)\n", stderr)
+        }
         guard status == CONTINUUM_STATUS_OK else { return status }
         var capturedPTYDescriptors = Array(
             repeating: continuum_remote_pty_descriptor_info(),
@@ -1715,6 +1754,9 @@ private final class HotResourceInventoryCallbackBox: @unchecked Sendable {
                 snapshot,
                 &rawGraph
             )
+        }
+        if ProcessInfo.processInfo.environment["CONTINUUM_CAPTURE_TRACE"] != nil {
+            fputs("continuum resources phase=descriptor-graph status=\(status.rawValue)\n", stderr)
         }
         guard status == CONTINUUM_STATUS_OK, let rawGraph else {
             return status == CONTINUUM_STATUS_OK

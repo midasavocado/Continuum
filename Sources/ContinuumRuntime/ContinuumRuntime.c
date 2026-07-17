@@ -553,6 +553,31 @@ continuum_status continuum_spawn_process(
     );
 }
 
+continuum_status continuum_spawn_process_with_remaps(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
+    int disable_aslr,
+    int32_t *out_process_id
+) {
+    return continuum_spawn_process_suspended_internal(
+        executable_path,
+        arguments,
+        environment,
+        working_directory,
+        -1,
+        descriptor_remaps,
+        descriptor_remap_count,
+        NULL,
+        disable_aslr != 0,
+        0,
+        out_process_id
+    );
+}
+
 continuum_status
 continuum_spawn_process_suspended_with_inherited_descriptor_remaps_and_topology(
     const char *executable_path,
@@ -1348,6 +1373,17 @@ continuum_status continuum_brokered_pair_abort(
                 pair->child_start_microseconds,
                 0)) {
             (void)kill(pair->child_process_id, SIGKILL);
+        } else if (continuum_broker_process_matches(
+                pair->child_process_id,
+                getpid(),
+                pair->child_start_seconds,
+                pair->child_start_microseconds,
+                0)) {
+            continuum_broker_kill_and_reap_traced_child(
+                pair->child_process_id,
+                clock_gettime_nsec_np(CLOCK_MONOTONIC)
+                    + (uint64_t)timeout_milliseconds * UINT64_C(1000000)
+            );
         }
         if (continuum_broker_process_matches(
                 pair->root_process_id,
@@ -1973,6 +2009,18 @@ static continuum_status continuum_collect_quartzcore_ranges(
     mach_port_t task,
     continuum_vm_range_set *out_ranges
 ) {
+    // malloc_get_all_zones derives remote allocator globals from this
+    // process's libmalloc slide. That is not valid for Continuum targets
+    // launched with a private dyld shared region. QuartzCore ranges are only
+    // an optional derived-graphics optimization; VM tags remain the reliable
+    // remote classification, so do not run the allocator probe cross-task.
+    if (task != mach_task_self()) {
+        if (out_ranges == NULL) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        memset(out_ranges, 0, sizeof(*out_ranges));
+        return CONTINUUM_STATUS_OK;
+    }
     return continuum_collect_named_malloc_zone_ranges(
         task,
         "QuartzCore",
@@ -2121,6 +2169,7 @@ struct continuum_remote_session {
     int has_reconstructed_thread_set;
     uint8_t replacement_stop_kind;
     uint8_t has_brokered_stop_authorization;
+    uint8_t owns_ptrace_attachment;
     int32_t brokered_expected_parent_process_id;
     uint64_t brokered_start_seconds;
     uint64_t brokered_start_microseconds;
@@ -2550,9 +2599,27 @@ static continuum_status continuum_validate_session_identity(
     if (status != CONTINUUM_STATUS_OK) {
         return status;
     }
-    return continuum_identity_equal(&session->identity, &current)
-        ? CONTINUUM_STATUS_OK
-        : CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    if (continuum_identity_equal(&session->identity, &current)) {
+        return CONTINUUM_STATUS_OK;
+    }
+    if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+        fprintf(
+            stderr,
+            "continuum identity pid=%d expected-start=%llu.%06llu "
+            "actual-start=%llu.%06llu expected-executable=%llu:%llu "
+            "actual-executable=%llu:%llu\n",
+            session->identity.process_id,
+            (unsigned long long)session->identity.start_seconds,
+            (unsigned long long)session->identity.start_microseconds,
+            (unsigned long long)current.start_seconds,
+            (unsigned long long)current.start_microseconds,
+            (unsigned long long)session->identity.executable_device,
+            (unsigned long long)session->identity.executable_inode,
+            (unsigned long long)current.executable_device,
+            (unsigned long long)current.executable_inode
+        );
+    }
+    return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
 }
 
 static continuum_status continuum_query_region(
@@ -3532,6 +3599,17 @@ static continuum_status continuum_capture_image_layout_digest(
         byte_count,
         entries
     );
+    if (status == CONTINUUM_STATUS_OK
+        && getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+        fprintf(
+            stderr,
+            "continuum image-layout count=%u dyld=0x%llx cache=0x%llx slide=0x%llx\n",
+            all_images.infoArrayCount,
+            (unsigned long long)(uintptr_t)all_images.dyldImageLoadAddress,
+            (unsigned long long)(uintptr_t)all_images.sharedCacheBaseAddress,
+            (unsigned long long)all_images.sharedCacheSlide
+        );
+    }
     if (status == CONTINUUM_STATUS_OK) {
         for (uint32_t index = 0;
              index < all_images.infoArrayCount;
@@ -4998,6 +5076,14 @@ static continuum_status continuum_capture_process_snapshot_suspended(
         session->task,
         &snapshot->threads
     );
+    if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+        fprintf(
+            stderr,
+            "continuum capture pid=%d phase=threads status=%d\n",
+            session->identity.process_id,
+            status
+        );
+    }
     if (status != CONTINUUM_STATUS_OK) {
         continuum_remote_process_snapshot_destroy(snapshot);
         return status;
@@ -5239,6 +5325,16 @@ static continuum_status continuum_capture_process_snapshot_suspended(
             &snapshot->info.immutable_layout_digest,
             0
         );
+        if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+            fprintf(
+                stderr,
+                "continuum capture pid=%d phase=image-layout status=%d regions=%zu bytes=%llu\n",
+                session->identity.process_id,
+                status,
+                snapshot->region_count,
+                (unsigned long long)snapshot->info.captured_bytes
+            );
+        }
     }
     if (status == CONTINUUM_STATUS_OK
         && !snapshot->has_isolated_app_state) {
@@ -5283,7 +5379,12 @@ static void continuum_prewarm_process_snapshot(
     volatile uint8_t sink = 0;
     for (size_t index = 0; index < snapshot->region_count; index += 1) {
         const continuum_remote_process_region *region = &snapshot->regions[index];
-        if (region->bytes == NULL || region->length == 0) {
+        // malloc-backed captures were already faulted in by
+        // mach_vm_read_overwrite. Only a future COW-backed capture can need
+        // prewarming before the target resumes.
+        if (!region->is_cow_mapping
+            || region->bytes == NULL
+            || region->length == 0) {
             continue;
         }
         (void)madvise(region->bytes, (size_t)region->length, MADV_WILLNEED);
@@ -6980,10 +7081,51 @@ continuum_status continuum_brokered_pair_authorize_remote_session(
         )) {
         return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
     }
-    session->replacement_stop_kind = role == CONTINUUM_BROKERED_PROCESS_CHILD
-        ? CONTINUUM_REPLACEMENT_STOP_BROKER_SIGNAL
-        : CONTINUUM_REPLACEMENT_STOP_DIRECT_PTRACE;
+    if (role == CONTINUUM_BROKERED_PROCESS_CHILD) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        int attach_result = ptrace(PT_ATTACH, process_id, NULL, 0);
+#pragma clang diagnostic pop
+        if (attach_result != 0) {
+            return CONTINUUM_STATUS_ACCESS_DENIED;
+        }
+        uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+            + UINT64_C(5000000000);
+        for (;;) {
+            struct proc_bsdinfo process_info;
+            memset(&process_info, 0, sizeof(process_info));
+            int copied = proc_pidinfo(
+                process_id,
+                PROC_PIDTBSDINFO,
+                0,
+                &process_info,
+                (int)sizeof(process_info)
+            );
+            if (copied == (int)sizeof(process_info)
+                && process_info.pbi_ppid == (uint32_t)getpid()
+                && process_info.pbi_status == SSTOP
+                && process_info.pbi_start_tvsec == start_seconds
+                && process_info.pbi_start_tvusec == start_microseconds) {
+                break;
+            }
+            if (copied != (int)sizeof(process_info)
+                || clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) {
+                continuum_broker_kill_and_reap_traced_child(
+                    process_id,
+                    clock_gettime_nsec_np(CLOCK_MONOTONIC)
+                        + UINT64_C(1000000000)
+                );
+                return copied == (int)sizeof(process_info)
+                    ? CONTINUUM_STATUS_SUSPEND_FAILED
+                    : CONTINUUM_STATUS_TARGET_EXITED;
+            }
+            usleep(1000);
+        }
+    }
+    session->replacement_stop_kind =
+        CONTINUUM_REPLACEMENT_STOP_DIRECT_PTRACE;
     session->has_brokered_stop_authorization = 1;
+    session->owns_ptrace_attachment = 1;
     session->brokered_expected_parent_process_id = expected_parent;
     session->brokered_start_seconds = start_seconds;
     session->brokered_start_microseconds = start_microseconds;
@@ -7018,8 +7160,7 @@ static continuum_status continuum_validate_stopped_replacement_session(
             ? CONTINUUM_STATUS_OK
             : CONTINUUM_STATUS_ACCESS_DENIED;
     }
-    if (process_info.pbi_ppid
-            != (uint32_t)session->brokered_expected_parent_process_id
+    if (process_info.pbi_ppid != (uint32_t)getpid()
         || process_info.pbi_start_tvsec != session->brokered_start_seconds
         || process_info.pbi_start_tvusec
             != session->brokered_start_microseconds) {
@@ -10099,6 +10240,7 @@ continuum_status continuum_remote_session_release_entry_stopped_child(
             ? status
             : CONTINUUM_STATUS_ROLLBACK_FAILED;
     }
+    session->owns_ptrace_attachment = 0;
     for (uint32_t worker = 0;
          worker < prepared_worker_count;
          worker += 1) {
@@ -10944,6 +11086,15 @@ static continuum_status continuum_capture_process_group_attempt(
             maximum_captured_bytes - captured_bytes,
             &group->members[index].snapshot
         );
+        if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+            fprintf(
+                stderr,
+                "continuum capture member=%zu pid=%d phase=memory status=%d\n",
+                index,
+                group->members[index].session->identity.process_id,
+                status
+            );
+        }
         if (status != CONTINUUM_STATUS_OK) {
             break;
         }
@@ -10963,6 +11114,13 @@ static continuum_status continuum_capture_process_group_attempt(
 
     if (status == CONTINUUM_STATUS_OK && resource_callback != NULL) {
         status = resource_callback(group, resource_context);
+        if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+            fprintf(
+                stderr,
+                "continuum capture phase=resources status=%d\n",
+                status
+            );
+        }
     }
 
     continuum_status resume_status = continuum_resume_process_group(
@@ -11377,6 +11535,72 @@ continuum_status continuum_remote_process_group_copy_pty_safepoint_status(
         }
     }
     return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_remote_process_safepoint_is_active(
+    int32_t process_id,
+    const char *bootstrap_library_path,
+    uint8_t *out_is_active
+) {
+    if (process_id <= 0 || bootstrap_library_path == NULL
+        || bootstrap_library_path[0] == '\0' || out_is_active == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_is_active = 0;
+
+    continuum_bootstrap_identity identity;
+    continuum_status status = continuum_inspect_local_bootstrap_library(
+        bootstrap_library_path,
+        &identity
+    );
+    if (status != CONTINUUM_STATUS_OK
+        || identity.pty_safepoint_status_offset == 0) {
+        return status == CONTINUUM_STATUS_OK
+            ? CONTINUUM_STATUS_VALIDATION_FAILED
+            : status;
+    }
+
+    continuum_remote_session *session = NULL;
+    status = continuum_remote_session_open(process_id, &session);
+    if (status != CONTINUUM_STATUS_OK) return status;
+
+    mach_vm_address_t image_base = 0;
+    status = continuum_find_authenticated_bootstrap_base(
+        session,
+        bootstrap_library_path,
+        identity.image_uuid,
+        &image_base
+    );
+    uint64_t report_address = 0;
+    if (status == CONTINUUM_STATUS_OK
+        && !continuum_add_u64(
+            image_base,
+            identity.pty_safepoint_status_offset,
+            &report_address
+        )) {
+        status = CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    continuum_bootstrap_pty_safepoint_wire_status report;
+    memset(&report, 0, sizeof(report));
+    if (status == CONTINUUM_STATUS_OK) {
+        status = continuum_read_task_bytes(
+            session->task,
+            report_address,
+            sizeof(report),
+            &report
+        );
+    }
+    if (status == CONTINUUM_STATUS_OK
+        && report.magic == CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC
+        && report.version == 2
+        && report.structure_size == sizeof(report)
+        && report.generation != 0
+        && report.safepoint_thread_identifier != 0
+        && report.safepoint_active == 1) {
+        *out_is_active = 1;
+    }
+    continuum_remote_session_destroy(session);
+    return status;
 }
 
 continuum_status continuum_remote_process_group_copy_member_info(
@@ -12754,6 +12978,18 @@ static continuum_status continuum_descriptor_graph_merge_bootstrap_flags(
             );
         }
         if (status != CONTINUUM_STATUS_OK) break;
+        if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+            fprintf(
+                stderr,
+                "continuum descriptor pid=%d pty-gen=%llu desc-gen=%llu pty-active=%u desc-active=%u desc-count=%u\n",
+                member->session->identity.process_id,
+                (unsigned long long)pty_report.generation,
+                (unsigned long long)descriptor_report->generation,
+                pty_report.safepoint_active,
+                descriptor_report->safepoint_active,
+                descriptor_report->descriptor_count
+            );
+        }
         if (pty_report.magic != CONTINUUM_BOOTSTRAP_PTY_STATUS_MAGIC
             || pty_report.version != 2
             || pty_report.structure_size != sizeof(pty_report)
@@ -12796,6 +13032,15 @@ static continuum_status continuum_descriptor_graph_merge_bootstrap_flags(
             }
         }
         if (expected_count != descriptor_report->descriptor_count) {
+            if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+                fprintf(
+                    stderr,
+                    "continuum descriptor pid=%d expected-count=%zu report-count=%u\n",
+                    process_id,
+                    expected_count,
+                    descriptor_report->descriptor_count
+                );
+            }
             status = CONTINUUM_STATUS_VALIDATION_FAILED;
             break;
         }
@@ -12804,6 +13049,17 @@ static continuum_status continuum_descriptor_graph_merge_bootstrap_flags(
              entry_index += 1) {
             const continuum_bootstrap_descriptor_status_wire_entry *entry =
                 &descriptor_report->descriptors[entry_index];
+            if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+                fprintf(
+                    stderr,
+                    "continuum descriptor pid=%d fd=%d fd-flags=%d status-flags=%d kind=%u\n",
+                    process_id,
+                    entry->file_descriptor,
+                    entry->descriptor_flags,
+                    entry->status_flags,
+                    entry->kind
+                );
+            }
             continuum_remote_descriptor_handle_info *match = NULL;
             if (entry->file_descriptor < 0 || entry->descriptor_flags < 0
                 || entry->status_flags < 0
@@ -12980,6 +13236,15 @@ static continuum_status continuum_capture_descriptor_graph_internal(
             bootstrap_library_path,
             graph
         );
+        if (getenv("CONTINUUM_CAPTURE_TRACE") != NULL) {
+            fprintf(
+                stderr,
+                "continuum descriptor phase=merge status=%d handles=%zu pipes=%zu\n",
+                status,
+                graph->handle_count,
+                graph->pipe_count
+            );
+        }
     }
     if (status == CONTINUUM_STATUS_OK) {
         status = continuum_descriptor_graph_validate(graph);
@@ -14285,6 +14550,16 @@ continuum_status continuum_remote_session_restore(
 void continuum_remote_session_destroy(continuum_remote_session *session) {
     if (session == NULL) {
         return;
+    }
+    if (session->owns_ptrace_attachment
+        && continuum_validate_session_identity(session)
+            == CONTINUUM_STATUS_OK) {
+        continuum_broker_kill_and_reap_traced_child(
+            session->identity.process_id,
+            clock_gettime_nsec_np(CLOCK_MONOTONIC)
+                + UINT64_C(1000000000)
+        );
+        session->owns_ptrace_attachment = 0;
     }
     if (session->owns_task_port && session->task != MACH_PORT_NULL) {
         (void)continuum_discharge_owned_suspensions(

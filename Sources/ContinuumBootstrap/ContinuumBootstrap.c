@@ -40,8 +40,6 @@ static volatile sig_atomic_t continuum_preservation_active = 0;
 static volatile sig_atomic_t continuum_rehydrate_stop_requested = 0;
 static volatile sig_atomic_t continuum_rehydrate_idle_boundaries = 0;
 static CFRunLoopObserverRef continuum_safepoint_observer = NULL;
-static int continuum_safepoint_wakeup_pipe[2] = {-1, -1};
-static volatile sig_atomic_t continuum_safepoint_pipe_ready = 0;
 static volatile int continuum_safepoint_claimed = 0;
 static malloc_zone_t *continuum_app_state_zone = NULL;
 static uintptr_t continuum_main_text_start = 0;
@@ -1641,14 +1639,6 @@ static void continuum_release_safepoint(int signal_number) {
 static void continuum_request_safepoint(int signal_number) {
     (void)signal_number;
     continuum_safepoint_requested = 1;
-    if (continuum_safepoint_pipe_ready) {
-        const uint8_t wakeup = 1;
-        (void)write(
-            continuum_safepoint_wakeup_pipe[1],
-            &wakeup,
-            sizeof(wakeup)
-        );
-    }
 }
 
 static void continuum_publish_pty_safepoint_status(void) {
@@ -1706,6 +1696,16 @@ static void continuum_publish_pty_safepoint_status(void) {
             if (kind != 0) {
                 int descriptor_flags = fcntl(descriptor, F_GETFD);
                 int status_flags = fcntl(descriptor, F_GETFL);
+                if (status_flags >= 0
+                    && kind == CONTINUUM_BOOTSTRAP_DESCRIPTOR_PIPE) {
+                    /*
+                     * Darwin exposes kernel-only fileglob history such as
+                     * FWASWRITTEN through F_GETFL. Those bits describe what
+                     * happened to a pipe; F_SETFL cannot recreate them. Keep
+                     * only the access mode and user-settable pipe behavior.
+                     */
+                    status_flags &= O_ACCMODE | O_NONBLOCK | O_ASYNC;
+                }
                 if (descriptor_flags < 0 || status_flags < 0
                     || exported_descriptor_count
                         >= CONTINUUM_BOOTSTRAP_DESCRIPTOR_STATUS_LIMIT) {
@@ -1816,19 +1816,16 @@ static void continuum_run_loop_safepoint(
 
 static void *continuum_cli_safepoint_coordinator(void *context) {
     (void)context;
+    sigset_t requests;
+    sigemptyset(&requests);
+    sigaddset(&requests, SIGUSR2);
     for (;;) {
-        uint8_t wakeup = 0;
-        ssize_t result = read(
-            continuum_safepoint_wakeup_pipe[0],
-            &wakeup,
-            sizeof(wakeup)
-        );
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result != sizeof(wakeup)) {
+        int signal_number = 0;
+        if (sigwait(&requests, &signal_number) != 0
+            || signal_number != SIGUSR2) {
             return NULL;
         }
+        continuum_safepoint_requested = 1;
         continuum_run_loop_safepoint(NULL, 0, NULL);
     }
 }
@@ -1839,29 +1836,26 @@ static void continuum_bootstrap_enable_safepoints(void) {
         return;
     }
 
-    int pipe_ready = pipe(continuum_safepoint_wakeup_pipe) == 0;
-    if (pipe_ready) {
-        int write_flags = fcntl(
-            continuum_safepoint_wakeup_pipe[1], F_GETFL);
-        pipe_ready = write_flags >= 0
-            && fcntl(
-                continuum_safepoint_wakeup_pipe[1],
-                F_SETFL,
-                write_flags | O_NONBLOCK) == 0
-            && fcntl(
-                continuum_safepoint_wakeup_pipe[0],
-                F_SETFD,
-                FD_CLOEXEC) == 0
-            && fcntl(
-                continuum_safepoint_wakeup_pipe[1],
-                F_SETFD,
-                FD_CLOEXEC) == 0;
-    }
-    if (!pipe_ready && continuum_safepoint_wakeup_pipe[0] >= 0) {
-        close(continuum_safepoint_wakeup_pipe[0]);
-        close(continuum_safepoint_wakeup_pipe[1]);
-        continuum_safepoint_wakeup_pipe[0] = -1;
-        continuum_safepoint_wakeup_pipe[1] = -1;
+    const int is_cli_process = objc_getClass("NSApplication") == Nil;
+
+    // A managed executable may inherit its launching worker thread's signal
+    // mask across exec. CLI processes consume checkpoint requests on one
+    // dedicated coordinator with sigwait; future threads inherit that blocked
+    // request signal. GUI processes keep the main-run-loop handler path.
+    (void)signal(SIGUSR1, continuum_release_safepoint);
+    sigset_t control_signals;
+    sigemptyset(&control_signals);
+    sigaddset(&control_signals, SIGUSR1);
+    (void)pthread_sigmask(SIG_UNBLOCK, &control_signals, NULL);
+    if (is_cli_process) {
+        sigemptyset(&control_signals);
+        sigaddset(&control_signals, SIGUSR2);
+        (void)pthread_sigmask(SIG_BLOCK, &control_signals, NULL);
+    } else {
+        (void)signal(SIGUSR2, continuum_request_safepoint);
+        sigemptyset(&control_signals);
+        sigaddset(&control_signals, SIGUSR2);
+        (void)pthread_sigmask(SIG_UNBLOCK, &control_signals, NULL);
     }
     CFRunLoopObserverContext context = {
         .version = 0,
@@ -1885,7 +1879,7 @@ static void continuum_bootstrap_enable_safepoints(void) {
             kCFRunLoopCommonModes
         );
     }
-    if (pipe_ready && objc_getClass("NSApplication") == Nil) {
+    if (is_cli_process) {
         pthread_t coordinator;
         if (pthread_create(
                 &coordinator,
@@ -1893,21 +1887,8 @@ static void continuum_bootstrap_enable_safepoints(void) {
                 continuum_cli_safepoint_coordinator,
                 NULL) == 0) {
             (void)pthread_detach(coordinator);
-            continuum_safepoint_pipe_ready = 1;
-        } else {
-            close(continuum_safepoint_wakeup_pipe[0]);
-            close(continuum_safepoint_wakeup_pipe[1]);
-            continuum_safepoint_wakeup_pipe[0] = -1;
-            continuum_safepoint_wakeup_pipe[1] = -1;
         }
-    } else if (pipe_ready) {
-        close(continuum_safepoint_wakeup_pipe[0]);
-        close(continuum_safepoint_wakeup_pipe[1]);
-        continuum_safepoint_wakeup_pipe[0] = -1;
-        continuum_safepoint_wakeup_pipe[1] = -1;
     }
-    (void)signal(SIGUSR1, continuum_release_safepoint);
-    (void)signal(SIGUSR2, continuum_request_safepoint);
 }
 
 __attribute__((visibility("default"), noinline, noreturn))

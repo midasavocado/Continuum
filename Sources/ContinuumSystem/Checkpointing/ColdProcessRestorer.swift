@@ -827,6 +827,7 @@ public actor ColdProcessRestorer {
         var environment = launch.environment.filter {
             !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
                 && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD=")
+                && !$0.hasPrefix("CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=")
                 && !$0.hasPrefix("CONTINUUM_BROKER_")
         }
         environment.append("CONTINUUM_BOOTSTRAP_STOP=1")
@@ -857,7 +858,8 @@ public actor ColdProcessRestorer {
             writableFiles: image.writableFiles,
             writableFileDescriptors: image.writableFileDescriptors.filter {
                 $0.processIdentifier == process.processIdentifier
-            }
+            },
+            descriptorGraph: image.descriptorGraph
         )
         return ManifestOverlayRepository(
             base: repository,
@@ -1154,13 +1156,14 @@ public actor ColdProcessRestorer {
         // Recreating captured writable descriptors would couple a process
         // restore to stale vnode identities and can mutate current files.
         let rootDescriptors: [DurableWritableFileDescriptor] = []
+        let pipeDescriptorHandles = Self.pipeDescriptorHandles(
+            in: image,
+            processIdentifier: process.processIdentifier
+        )
         if prelaunchedBootstrapDescriptor == nil {
             let descriptorPlan = try Self.bootstrapDescriptorPlan(
                 rootDescriptors,
-                pipeHandles: Self.pipeDescriptorHandles(
-                    in: image,
-                    processIdentifier: process.processIdentifier
-                )
+                pipeHandles: pipeDescriptorHandles
             )
             try Self.writeBootstrapDescriptorPlan(
                 descriptorPlan,
@@ -1182,6 +1185,7 @@ public actor ColdProcessRestorer {
             !$0.hasPrefix("CONTINUUM_BOOTSTRAP_STOP=")
                 && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_PATH=")
                 && !$0.hasPrefix("CONTINUUM_BOOTSTRAP_DESCRIPTOR_FD=")
+                && !$0.hasPrefix("CONTINUUM_ENABLE_CHECKPOINT_SAFEPOINTS=")
                 && !$0.hasPrefix("DYLD_INSERT_LIBRARIES=")
                 && (!usesDeterministicAddressSpace
                     || (!$0.hasPrefix("DYLD_SHARED_REGION=")
@@ -1274,7 +1278,8 @@ public actor ColdProcessRestorer {
             from: descriptor,
             expectedProcessIdentifier: replacementProcessIdentifier,
             localIdentity: localBootstrapIdentity,
-            expectedRestoredDescriptorCount: rootDescriptors.count
+            expectedRestoredDescriptorCount:
+                rootDescriptors.count + pipeDescriptorHandles.count
         )
         try requireRuntimeOK(
             continuum_remote_session_open(replacementProcessIdentifier, &session),
@@ -3334,6 +3339,14 @@ public actor ColdProcessRestorer {
         }
         let contents = String(decoding: bytes.prefix(count), as: UTF8.self)
         let fields = contents.split(whereSeparator: { $0.isWhitespace })
+        if ProcessInfo.processInfo.environment["CONTINUUM_CAPTURE_TRACE"] != nil {
+            fputs(
+                "continuum bootstrap report expected-pid=\(expectedProcessIdentifier) "
+                    + "expected-descriptors=\(expectedRestoredDescriptorCount) "
+                    + "contents=\(contents.debugDescription)\n",
+                stderr
+            )
+        }
         guard fields.count == 6,
               fields[0] == "CONTINUUM_BOOTSTRAP_V4",
               Int(fields[5]) == expectedRestoredDescriptorCount,

@@ -169,8 +169,8 @@ continuum_status continuum_brokered_pair_advance_to_entry_stops(
 );
 
 /// Binds a stopped replacement session to the authenticated pair identity and
-/// records whether its stop is controller-ptrace-owned (root) or a brokered
-/// signal stop (child). This must precede remote reconstruction.
+/// transfers controller ptrace ownership for either role and authenticates the
+/// resulting stop. This must precede remote reconstruction.
 continuum_status continuum_brokered_pair_authorize_remote_session(
     continuum_brokered_pair *pair,
     continuum_remote_session *session,
@@ -218,6 +218,19 @@ continuum_status continuum_spawn_process(
     const char *const arguments[],
     const char *const environment[],
     const char *working_directory,
+    int disable_aslr,
+    int32_t *out_process_id
+);
+
+/// Normal managed launch with exact inherited descriptor remaps. This is the
+/// running counterpart of the suspended cold-restore spawn contract.
+continuum_status continuum_spawn_process_with_remaps(
+    const char *executable_path,
+    const char *const arguments[],
+    const char *const environment[],
+    const char *working_directory,
+    const continuum_spawn_descriptor_remap descriptor_remaps[],
+    size_t descriptor_remap_count,
     int disable_aslr,
     int32_t *out_process_id
 );
@@ -1178,6 +1191,15 @@ continuum_status continuum_remote_process_group_copy_pty_safepoint_status(
     const continuum_remote_process_group_snapshot *snapshot,
     const char *bootstrap_library_path,
     continuum_remote_pty_safepoint_status *out_status
+);
+
+/// Polls the authenticated Bootstrap report without suspending the target.
+/// A successful call with `out_is_active == 0` means the cooperative
+/// coordinator has not reached its checkpoint boundary yet.
+continuum_status continuum_remote_process_safepoint_is_active(
+    int32_t process_id,
+    const char *bootstrap_library_path,
+    uint8_t *out_is_active
 );
 
 /// Captures the process group and invokes `callback` during the same coherent
