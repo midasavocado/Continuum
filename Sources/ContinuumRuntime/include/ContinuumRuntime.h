@@ -163,7 +163,9 @@ continuum_status continuum_brokered_forest_process_identities(
 
 /// Advances descendants first, detaches every ptrace handoff descendants
 /// first, then validates the complete stopped PPID/SID/PGID map. A failure
-/// performs authenticated cleanup and consumes the forest capability.
+/// performs authenticated cleanup and consumes the forest capability. If that
+/// cleanup fails, it returns `CONTINUUM_STATUS_ROLLBACK_FAILED` and retains the
+/// capability so the caller can retry `abort`.
 continuum_status continuum_brokered_forest_advance_to_entry_stops(
     continuum_brokered_forest *forest,
     uint32_t timeout_milliseconds

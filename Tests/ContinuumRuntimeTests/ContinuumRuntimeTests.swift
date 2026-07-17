@@ -3769,7 +3769,12 @@ final class ContinuumRuntimeTests: XCTestCase {
             15_000
         )
         guard advanceStatus == CONTINUUM_STATUS_OK else {
-            ownsForest = false
+            if advanceStatus == CONTINUUM_STATUS_ROLLBACK_FAILED {
+                ownsForest = continuum_brokered_forest_abort(forest, 3_000)
+                    != CONTINUUM_STATUS_OK
+            } else {
+                ownsForest = false
+            }
             return XCTFail("Could not advance forest: \(advanceStatus)")
         }
         XCTAssertEqual(

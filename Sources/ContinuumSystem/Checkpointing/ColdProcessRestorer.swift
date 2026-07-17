@@ -1055,7 +1055,13 @@ public actor ColdProcessRestorer {
             15_000
         )
         guard advanceStatus == CONTINUUM_STATUS_OK else {
-            // Advance consumes the failed forest after authenticated cleanup.
+            if advanceStatus == CONTINUUM_STATUS_ROLLBACK_FAILED,
+               continuum_brokered_forest_abort(forest, 5_000)
+                    != CONTINUUM_STATUS_OK {
+                pendingBrokeredForestCleanups.append(
+                    PendingBrokeredForestCleanup(handle: forest)
+                )
+            }
             try requireRuntimeOK(
                 advanceStatus,
                 operation: "advance the process forest to entry stops"

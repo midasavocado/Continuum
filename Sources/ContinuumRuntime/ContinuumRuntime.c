@@ -1821,8 +1821,11 @@ continuum_status continuum_brokered_forest_advance_to_entry_stops(
     }
     if (status != CONTINUUM_STATUS_OK) {
         forest->state = CONTINUUM_BROKER_PAIR_FAILED;
-        (void)continuum_brokered_forest_abort(forest, 2000);
-        return status;
+        continuum_status rollback_status =
+            continuum_brokered_forest_abort(forest, 2000);
+        return rollback_status == CONTINUUM_STATUS_OK
+            ? status
+            : CONTINUUM_STATUS_ROLLBACK_FAILED;
     }
     forest->state = CONTINUUM_BROKER_PAIR_ENTRY_STOPPED;
     return CONTINUUM_STATUS_OK;
