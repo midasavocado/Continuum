@@ -212,6 +212,11 @@ public actor ColdProcessRestorer {
         let presentationMasters: [PreparedPresentationMaster]
     }
 
+    private struct BootstrapResourceHandles {
+        let pipes: [DurableDescriptorHandle]
+        let sockets: [DurableDescriptorHandle]
+    }
+
     private struct BrokerLaunchPreparation {
         let descriptor: Int32
         let remaps: [continuum_spawn_descriptor_remap]
@@ -534,7 +539,7 @@ public actor ColdProcessRestorer {
             remaps: descriptorGraph.remapsByCapturedProcess[
                 root.processIdentifier
             ] ?? [],
-            pipeHandles: Self.pipeDescriptorHandles(
+            resourceHandles: Self.bootstrapResourceHandles(
                 in: image,
                 processIdentifier: root.processIdentifier
             )
@@ -544,7 +549,7 @@ public actor ColdProcessRestorer {
             remaps: descriptorGraph.remapsByCapturedProcess[
                 child.processIdentifier
             ] ?? [],
-            pipeHandles: Self.pipeDescriptorHandles(
+            resourceHandles: Self.bootstrapResourceHandles(
                 in: image,
                 processIdentifier: child.processIdentifier
             )
@@ -778,7 +783,7 @@ public actor ColdProcessRestorer {
     private func makeBrokerLaunchPreparation(
         launch: DurableLaunchContract,
         remaps: [continuum_spawn_descriptor_remap],
-        pipeHandles: [DurableDescriptorHandle]
+        resourceHandles: BootstrapResourceHandles
     ) throws -> BrokerLaunchPreparation {
         var template = Array(
             "/private/tmp/com.midas.continuum-broker-XXXXXX".utf8CString
@@ -816,7 +821,8 @@ public actor ColdProcessRestorer {
         }
         let plan = try Self.bootstrapDescriptorPlan(
             [],
-            pipeHandles: pipeHandles
+            pipeHandles: resourceHandles.pipes,
+            socketHandles: resourceHandles.sockets
         )
         try Self.writeBootstrapDescriptorPlan(plan, to: descriptor)
         var brokerRemaps = remaps
@@ -1156,14 +1162,15 @@ public actor ColdProcessRestorer {
         // Recreating captured writable descriptors would couple a process
         // restore to stale vnode identities and can mutate current files.
         let rootDescriptors: [DurableWritableFileDescriptor] = []
-        let pipeDescriptorHandles = Self.pipeDescriptorHandles(
+        let resourceHandles = Self.bootstrapResourceHandles(
             in: image,
             processIdentifier: process.processIdentifier
         )
         if prelaunchedBootstrapDescriptor == nil {
             let descriptorPlan = try Self.bootstrapDescriptorPlan(
                 rootDescriptors,
-                pipeHandles: pipeDescriptorHandles
+                pipeHandles: resourceHandles.pipes,
+                socketHandles: resourceHandles.sockets
             )
             try Self.writeBootstrapDescriptorPlan(
                 descriptorPlan,
@@ -1279,7 +1286,8 @@ public actor ColdProcessRestorer {
             expectedProcessIdentifier: replacementProcessIdentifier,
             localIdentity: localBootstrapIdentity,
             expectedRestoredDescriptorCount:
-                rootDescriptors.count + pipeDescriptorHandles.count
+                rootDescriptors.count + resourceHandles.pipes.count
+                    + resourceHandles.sockets.count
         )
         try requireRuntimeOK(
             continuum_remote_session_open(replacementProcessIdentifier, &session),
@@ -2494,20 +2502,63 @@ public actor ColdProcessRestorer {
     private func prepareDescriptorGraph(
         for image: DurableCheckpointImage
     ) throws -> PreparedDescriptorGraph {
-        let endpoints = image.establishedTCPEndpoints ?? []
+        // Format-five images use the normalized graph as the sole socket source
+        // of truth. Endpoint-per-fd records remain only for legacy images.
+        let endpoints = image.descriptorGraph == nil
+            ? image.establishedTCPEndpoints ?? []
+            : []
         let ptyDescriptors = image.ptyDescriptors ?? []
         let durableGraph = image.descriptorGraph
+        let socketIDs = Set(durableGraph?.sockets.map(\.id) ?? [])
+        let pipeIDs = Set(durableGraph?.pipes.map(\.id) ?? [])
+        let kqueueIDs = Set(durableGraph?.kqueues.map(\.id) ?? [])
+        let socketHandles = durableGraph?.handles.filter {
+            socketIDs.contains($0.resourceID)
+        } ?? []
         let pipeHandles = durableGraph?.handles.filter { handle in
-            durableGraph?.pipes.contains(where: { $0.id == handle.resourceID })
-                == true
+            pipeIDs.contains(handle.resourceID)
         } ?? []
         guard durableGraph?.kqueues.isEmpty != false else {
             throw ContinuumError.restoreUnavailable(
                 "This snapshot contains kqueues that Continuum cannot rebuild yet."
             )
         }
+        if let durableGraph {
+            let allResourceIDs = socketIDs.union(pipeIDs).union(kqueueIDs)
+            guard socketIDs.count == durableGraph.sockets.count,
+                  pipeIDs.count == durableGraph.pipes.count,
+                  kqueueIDs.count == durableGraph.kqueues.count,
+                  allResourceIDs.count == socketIDs.count + pipeIDs.count
+                    + kqueueIDs.count,
+                  durableGraph.handles.allSatisfy({
+                      allResourceIDs.contains($0.resourceID)
+                  }) else {
+                throw ContinuumError.integrityFailure(
+                    "The durable descriptor graph contains duplicate or unknown resources."
+                )
+            }
+            guard durableGraph.sockets.allSatisfy({
+                $0.kind == .tcpConnected
+                    && ($0.domain == AF_INET || $0.domain == AF_INET6)
+                    && $0.type == SOCK_STREAM
+                    && $0.protocol == IPPROTO_TCP
+                    && $0.receiveQueueBytes == 0
+                    && $0.sendQueueBytes == 0
+                    && $0.localAddress != nil
+                    && $0.remoteAddress != nil
+                    && $0.peerResourceID != nil
+                    && $0.listenerResourceID == nil
+                    && $0.externalPath == nil
+                    && $0.options.isEmpty
+            }) else {
+                throw ContinuumError.restoreUnavailable(
+                    "This snapshot contains listeners, Unix sockets, queued TCP data, or socket options that Continuum cannot rebuild yet."
+                )
+            }
+        }
         guard !endpoints.isEmpty || !ptyDescriptors.isEmpty
-                || durableGraph?.pipes.isEmpty == false else {
+                || durableGraph?.pipes.isEmpty == false
+                || durableGraph?.sockets.isEmpty == false else {
             return PreparedDescriptorGraph(
                 remapsByCapturedProcess: [:],
                 controllerDescriptors: [],
@@ -2547,12 +2598,23 @@ public actor ColdProcessRestorer {
                 )
             }
         }
+        for handle in socketHandles {
+            guard capturedProcesses.contains(handle.processIdentifier),
+                  handle.fileDescriptor >= 0,
+                  targetDescriptorsByProcess[handle.processIdentifier,
+                    default: []].insert(handle.fileDescriptor).inserted else {
+                throw ContinuumError.integrityFailure(
+                    "The durable socket graph contains an invalid or duplicate descriptor."
+                )
+            }
+        }
 
         let maximumTarget = (endpoints.map(\.fileDescriptor)
             + ptyDescriptors.map(\.fileDescriptor)
-            + pipeHandles.map(\.fileDescriptor)).max() ?? 255
+            + pipeHandles.map(\.fileDescriptor)
+            + socketHandles.map(\.fileDescriptor)).max() ?? 255
         let descriptorCount = endpoints.count + ptyDescriptors.count
-            + pipeHandles.count
+            + pipeHandles.count + socketHandles.count
         guard maximumTarget < Int32.max - Int32(descriptorCount * 2 + 16) else {
             throw ContinuumError.integrityFailure(
                 "The durable TCP descriptor numbers exceed process limits."
@@ -2752,6 +2814,152 @@ public actor ColdProcessRestorer {
                 }
             }
 
+            if let durableGraph, !durableGraph.sockets.isEmpty {
+                let socketByID = Dictionary(
+                    uniqueKeysWithValues: durableGraph.sockets.map { ($0.id, $0) }
+                )
+                let handlesByResource = Dictionary(
+                    grouping: socketHandles,
+                    by: \.resourceID
+                )
+                guard socketByID.keys.allSatisfy({
+                    handlesByResource[$0]?.isEmpty == false
+                }) else {
+                    throw ContinuumError.integrityFailure(
+                        "The durable socket graph contains an unowned resource."
+                    )
+                }
+
+                var restoredSocketIDs: Set<UUID> = []
+                for first in durableGraph.sockets.sorted(by: {
+                    $0.id.uuidString < $1.id.uuidString
+                }) where !restoredSocketIDs.contains(first.id) {
+                    guard let peerID = first.peerResourceID,
+                          let second = socketByID[peerID],
+                          second.peerResourceID == first.id,
+                          second.id != first.id,
+                          first.domain == second.domain,
+                          first.type == second.type,
+                          first.protocol == second.protocol,
+                          first.localAddress == second.remoteAddress,
+                          first.remoteAddress == second.localAddress,
+                          let firstHandles = handlesByResource[first.id],
+                          let secondHandles = handlesByResource[second.id],
+                          let firstHandle = firstHandles.first,
+                          let secondHandle = secondHandles.first else {
+                        throw ContinuumError.integrityFailure(
+                            "The durable TCP graph contains a nonreciprocal peer."
+                        )
+                    }
+                    let supportedStatusMask = O_ACCMODE | O_NONBLOCK | O_ASYNC
+                    guard firstHandles.allSatisfy({
+                        $0.statusFlags == firstHandle.statusFlags
+                            && ($0.descriptorFlags == 0
+                                || $0.descriptorFlags == FD_CLOEXEC)
+                    }), secondHandles.allSatisfy({
+                        $0.statusFlags == secondHandle.statusFlags
+                            && ($0.descriptorFlags == 0
+                                || $0.descriptorFlags == FD_CLOEXEC)
+                    }), firstHandle.statusFlags & O_ACCMODE == O_RDWR,
+                    secondHandle.statusFlags & O_ACCMODE == O_RDWR,
+                    firstHandle.statusFlags & ~supportedStatusMask == 0,
+                    secondHandle.statusFlags & ~supportedStatusMask == 0 else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved TCP stream uses descriptor flags Continuum cannot replay yet."
+                        )
+                    }
+
+                    var firstRuntime = try Self.runtimeTCPEndpoint(
+                        first,
+                        handle: firstHandle
+                    )
+                    var secondRuntime = try Self.runtimeTCPEndpoint(
+                        second,
+                        handle: secondHandle
+                    )
+                    var firstDescriptor: Int32 = -1
+                    var secondDescriptor: Int32 = -1
+                    let status = continuum_recreate_closed_loopback_tcp_pair(
+                        &firstRuntime,
+                        &secondRuntime,
+                        &firstDescriptor,
+                        &secondDescriptor
+                    )
+                    guard status == CONTINUUM_STATUS_OK,
+                          firstDescriptor >= 0,
+                          secondDescriptor >= 0 else {
+                        if firstDescriptor >= 0 { Darwin.close(firstDescriptor) }
+                        if secondDescriptor >= 0 { Darwin.close(secondDescriptor) }
+                        let detail = continuum_status_string(status).map {
+                            String(cString: $0)
+                        } ?? "status \(status.rawValue)"
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not recreate a closed local TCP stream: \(detail)."
+                        )
+                    }
+                    guard fcntl(
+                        firstDescriptor,
+                        F_SETFL,
+                        firstHandle.statusFlags & (O_NONBLOCK | O_ASYNC)
+                    ) == 0,
+                    fcntl(
+                        secondDescriptor,
+                        F_SETFL,
+                        secondHandle.statusFlags & (O_NONBLOCK | O_ASYNC)
+                    ) == 0 else {
+                        Darwin.close(firstDescriptor)
+                        Darwin.close(secondDescriptor)
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not replay saved TCP status flags."
+                        )
+                    }
+
+                    let promotedFirst = fcntl(
+                        firstDescriptor,
+                        F_DUPFD_CLOEXEC,
+                        nextControllerDescriptor
+                    )
+                    if promotedFirst >= 0 {
+                        nextControllerDescriptor = promotedFirst + 1
+                    }
+                    let promotedSecond = promotedFirst < 0 ? -1 : fcntl(
+                        secondDescriptor,
+                        F_DUPFD_CLOEXEC,
+                        nextControllerDescriptor
+                    )
+                    Darwin.close(firstDescriptor)
+                    Darwin.close(secondDescriptor)
+                    guard promotedFirst >= 0, promotedSecond >= 0 else {
+                        if promotedFirst >= 0 { Darwin.close(promotedFirst) }
+                        if promotedSecond >= 0 { Darwin.close(promotedSecond) }
+                        throw ContinuumError.restoreUnavailable(
+                            "Continuum could not isolate recreated TCP descriptors for relaunch."
+                        )
+                    }
+                    nextControllerDescriptor = promotedSecond + 1
+                    controllerDescriptors.append(contentsOf: [
+                        promotedFirst, promotedSecond,
+                    ])
+
+                    for handle in firstHandles {
+                        remapsByProcess[handle.processIdentifier, default: []]
+                            .append(continuum_spawn_descriptor_remap(
+                                source_descriptor: promotedFirst,
+                                target_descriptor: handle.fileDescriptor
+                            ))
+                    }
+                    for handle in secondHandles {
+                        remapsByProcess[handle.processIdentifier, default: []]
+                            .append(continuum_spawn_descriptor_remap(
+                                source_descriptor: promotedSecond,
+                                target_descriptor: handle.fileDescriptor
+                            ))
+                    }
+                    restoredSocketIDs.insert(first.id)
+                    restoredSocketIDs.insert(second.id)
+                }
+            }
+
             while let firstIndex = remaining.min() {
                 let first = endpoints[firstIndex]
                 let matches = remaining.filter { candidateIndex in
@@ -2932,6 +3140,45 @@ public actor ColdProcessRestorer {
             controllerDescriptors: controllerDescriptors,
             presentationMasters: presentationMasters
         )
+    }
+
+    private static func runtimeTCPEndpoint(
+        _ socket: DurableSocketResource,
+        handle: DurableDescriptorHandle
+    ) throws -> continuum_remote_tcp_endpoint_info {
+        var result = continuum_remote_tcp_endpoint_info()
+        let addressCapacity = MemoryLayout.size(ofValue: result.local_address)
+        guard socket.kind == .tcpConnected,
+              let localAddress = socket.localAddress,
+              let remoteAddress = socket.remoteAddress,
+              !localAddress.isEmpty,
+              !remoteAddress.isEmpty,
+              localAddress.count <= addressCapacity,
+              remoteAddress.count <= addressCapacity else {
+            throw ContinuumError.integrityFailure(
+                "A durable TCP resource contains invalid native address bytes."
+            )
+        }
+        result.process_id = handle.processIdentifier
+        result.file_descriptor = handle.fileDescriptor
+        result.domain = socket.domain
+        result.socket_type = socket.type
+        result.protocol = socket.protocol
+        result.tcp_state = Int32(TSI_S_ESTABLISHED)
+        result.socket_state = 0
+        result.local_address_length = UInt32(localAddress.count)
+        result.remote_address_length = UInt32(remoteAddress.count)
+        result.receive_shutdown = socket.receiveShutdown ? 1 : 0
+        result.send_shutdown = socket.sendShutdown ? 1 : 0
+        result.receive_queue_bytes = socket.receiveQueueBytes
+        result.send_queue_bytes = socket.sendQueueBytes
+        withUnsafeMutableBytes(of: &result.local_address) { destination in
+            destination.copyBytes(from: localAddress)
+        }
+        withUnsafeMutableBytes(of: &result.remote_address) { destination in
+            destination.copyBytes(from: remoteAddress)
+        }
+        return result
     }
 
     private static func runtimeTCPEndpoint(
@@ -3646,21 +3893,30 @@ public actor ColdProcessRestorer {
 
     private static func bootstrapDescriptorPlan(
         _ descriptors: [DurableWritableFileDescriptor],
-        pipeHandles: [DurableDescriptorHandle] = []
+        pipeHandles: [DurableDescriptorHandle] = [],
+        socketHandles: [DurableDescriptorHandle] = []
     ) throws -> Data {
-        guard descriptors.count + pipeHandles.count <= 1_024 else {
+        let resourceCount = pipeHandles.count + socketHandles.count
+        guard descriptors.count + resourceCount <= 1_024 else {
             throw ContinuumError.restoreUnavailable(
                 "The root process owns too many descriptors for cold reconstruction."
             )
         }
         var seenDescriptors: Set<Int32> = []
-        var lines = pipeHandles.isEmpty
-            ? ["CONTINUUM_FD_PLAN_V1 \(descriptors.count)"]
-            : [
+        var lines: [String]
+        if !socketHandles.isEmpty {
+            lines = [
+                "CONTINUUM_FD_PLAN_V3 \(descriptors.count) \(resourceCount)",
+            ]
+        } else if !pipeHandles.isEmpty {
+            lines = [
                 "CONTINUUM_FD_PLAN_V2 \(descriptors.count) "
                     + "\(pipeHandles.count)",
             ]
-        lines.reserveCapacity(descriptors.count + pipeHandles.count + 1)
+        } else {
+            lines = ["CONTINUUM_FD_PLAN_V1 \(descriptors.count)"]
+        }
+        lines.reserveCapacity(descriptors.count + resourceCount + 1)
         for descriptor in descriptors {
             guard descriptor.fileDescriptor >= 0,
                   descriptor.offset >= 0,
@@ -3698,9 +3954,29 @@ public actor ColdProcessRestorer {
                     "The durable pipe-descriptor plan is invalid."
                 )
             }
+            let prefix = socketHandles.isEmpty ? "PIPE" : "RESOURCE 1"
             lines.append(
-                "PIPE \(handle.fileDescriptor) \(handle.descriptorFlags) "
+                "\(prefix) \(handle.fileDescriptor) \(handle.descriptorFlags) "
                     + "\(handle.statusFlags)"
+            )
+        }
+        for handle in socketHandles.sorted(by: {
+            $0.fileDescriptor < $1.fileDescriptor
+        }) {
+            let accessMode = handle.statusFlags & O_ACCMODE
+            guard handle.fileDescriptor >= 0,
+                  seenDescriptors.insert(handle.fileDescriptor).inserted,
+                  handle.descriptorFlags == 0
+                    || handle.descriptorFlags == FD_CLOEXEC,
+                  accessMode == O_RDWR,
+                  handle.statusFlags & ~supportedStatusMask == 0 else {
+                throw ContinuumError.integrityFailure(
+                    "The durable socket-descriptor plan is invalid."
+                )
+            }
+            lines.append(
+                "RESOURCE 2 \(handle.fileDescriptor) "
+                    + "\(handle.descriptorFlags) \(handle.statusFlags)"
             )
         }
         guard let plan = (lines.joined(separator: "\n") + "\n")
@@ -3713,16 +3989,22 @@ public actor ColdProcessRestorer {
         return plan
     }
 
-    private static func pipeDescriptorHandles(
+    private static func bootstrapResourceHandles(
         in image: DurableCheckpointImage,
         processIdentifier: Int32
-    ) -> [DurableDescriptorHandle] {
-        guard let graph = image.descriptorGraph else { return [] }
-        let pipeIDs = Set(graph.pipes.map(\.id))
-        return graph.handles.filter {
-            $0.processIdentifier == processIdentifier
-                && pipeIDs.contains($0.resourceID)
+    ) -> BootstrapResourceHandles {
+        guard let graph = image.descriptorGraph else {
+            return BootstrapResourceHandles(pipes: [], sockets: [])
         }
+        let pipeIDs = Set(graph.pipes.map(\.id))
+        let socketIDs = Set(graph.sockets.map(\.id))
+        let owned = graph.handles.filter {
+            $0.processIdentifier == processIdentifier
+        }
+        return BootstrapResourceHandles(
+            pipes: owned.filter { pipeIDs.contains($0.resourceID) },
+            sockets: owned.filter { socketIDs.contains($0.resourceID) }
+        )
     }
 
     private static func writeBootstrapDescriptorPlan(

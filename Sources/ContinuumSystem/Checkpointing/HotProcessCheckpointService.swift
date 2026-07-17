@@ -297,7 +297,6 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 ),
                 coldRestoreCertified: coldRestoreCertified(
                     in: rawSnapshot,
-                    endpoints: establishedTCPEndpoints,
                     ptyDescriptors: ptyDescriptors,
                     descriptorGraph: descriptorGraph
                 )
@@ -430,7 +429,6 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
 
     private func coldRestoreCertified(
         in snapshot: OpaquePointer,
-        endpoints: [DurableTCPEndpoint],
         ptyDescriptors: [DurablePTYDescriptor],
         descriptorGraph: DurableDescriptorGraph
     ) -> Bool {
@@ -511,26 +509,6 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             }
             guard pthreadCount > 0 else { return false }
         }
-        for endpoint in endpoints {
-            guard endpoint.receiveQueueBytes == 0,
-                  endpoint.sendQueueBytes == 0 else {
-                return false
-            }
-            let reverseMatches = endpoints.filter { candidate in
-                candidate.processIdentifier != endpoint.processIdentifier
-                    || candidate.fileDescriptor != endpoint.fileDescriptor
-            }.filter { candidate in
-                candidate.domain == endpoint.domain
-                    && candidate.socketType == endpoint.socketType
-                    && candidate.socketProtocol == endpoint.socketProtocol
-                    && candidate.localAddress == endpoint.remoteAddress
-                    && candidate.remoteAddress == endpoint.localAddress
-            }
-            // Zero matches means a remote peer that cannot be rewound. More
-            // than one means aliased descriptors whose shared kernel identity
-            // is not represented by the durable format yet.
-            guard reverseMatches.count == 1 else { return false }
-        }
         guard ptyDescriptors.allSatisfy({ descriptor in
             descriptor.inputQueueBytes == 0
                 && descriptor.outputQueueBytes == 0
@@ -543,8 +521,18 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
             return false
         }
         guard descriptorGraph.kqueues.isEmpty else { return false }
-        guard Set(descriptorGraph.pipes.map(\.id)).count
-                == descriptorGraph.pipes.count else {
+        let socketIDs = Set(descriptorGraph.sockets.map(\.id))
+        let pipeIDs = Set(descriptorGraph.pipes.map(\.id))
+        let kqueueIDs = Set(descriptorGraph.kqueues.map(\.id))
+        let allResourceIDs = socketIDs.union(pipeIDs).union(kqueueIDs)
+        guard socketIDs.count == descriptorGraph.sockets.count,
+              pipeIDs.count == descriptorGraph.pipes.count,
+              kqueueIDs.count == descriptorGraph.kqueues.count,
+              allResourceIDs.count == socketIDs.count + pipeIDs.count
+                + kqueueIDs.count,
+              descriptorGraph.handles.allSatisfy({
+                  allResourceIDs.contains($0.resourceID)
+              }) else {
             return false
         }
         let pipeByID = Dictionary(
@@ -552,6 +540,50 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         )
         let pipeHandles = descriptorGraph.handles.filter {
             pipeByID[$0.resourceID] != nil
+        }
+        let socketByID = Dictionary(
+            uniqueKeysWithValues: descriptorGraph.sockets.map { ($0.id, $0) }
+        )
+        let socketHandles = descriptorGraph.handles.filter {
+            socketByID[$0.resourceID] != nil
+        }
+        let handlesBySocket = Dictionary(
+            grouping: socketHandles,
+            by: \.resourceID
+        )
+        let supportedStatusMask = O_ACCMODE | O_NONBLOCK | O_ASYNC
+        guard descriptorGraph.sockets.allSatisfy({ socket in
+            socket.kind == .tcpConnected
+                && (socket.domain == AF_INET || socket.domain == AF_INET6)
+                && socket.type == SOCK_STREAM
+                && socket.protocol == IPPROTO_TCP
+                && socket.receiveQueueBytes == 0
+                && socket.sendQueueBytes == 0
+                && socket.localAddress != nil
+                && socket.remoteAddress != nil
+                && socket.peerResourceID != nil
+                && socket.peerResourceID != socket.id
+                && socketByID[socket.peerResourceID!]?.peerResourceID == socket.id
+                && socketByID[socket.peerResourceID!]?.localAddress
+                    == socket.remoteAddress
+                && socketByID[socket.peerResourceID!]?.remoteAddress
+                    == socket.localAddress
+                && socket.listenerResourceID == nil
+                && socket.externalPath == nil
+                && socket.options.isEmpty
+                && handlesBySocket[socket.id]?.isEmpty == false
+        }), socketHandles.allSatisfy({ handle in
+            capturedProcessIdentifiers.contains(handle.processIdentifier)
+                && handle.fileDescriptor >= 0
+                && (handle.descriptorFlags == 0
+                    || handle.descriptorFlags == FD_CLOEXEC)
+                && handle.statusFlags & O_ACCMODE == O_RDWR
+                && handle.statusFlags & ~supportedStatusMask == 0
+                && handlesBySocket[handle.resourceID]?.allSatisfy({
+                    $0.statusFlags == handle.statusFlags
+                }) == true
+        }) else {
+            return false
         }
         let handlesByPipe = Dictionary(grouping: pipeHandles, by: \.resourceID)
         guard descriptorGraph.pipes.allSatisfy({ pipe in
@@ -561,8 +593,12 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 && handlesByPipe[pipe.id]?.isEmpty == false
         }), pipeHandles.allSatisfy({ handle in
             capturedProcessIdentifiers.contains(handle.processIdentifier)
+                && handle.fileDescriptor >= 0
                 && (handle.descriptorFlags == 0
                     || handle.descriptorFlags == FD_CLOEXEC)
+                && (handle.statusFlags & O_ACCMODE == O_RDONLY
+                    || handle.statusFlags & O_ACCMODE == O_WRONLY)
+                && handle.statusFlags & ~supportedStatusMask == 0
                 && handlesByPipe[handle.resourceID]?.allSatisfy({
                     $0.statusFlags == handle.statusFlags
                 }) == true

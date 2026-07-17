@@ -552,8 +552,10 @@ enum ExternalHotProof {
         )
         try require(
             durableImage.members.count == 2
-                && durableImage.writableFiles.isEmpty,
-            "durable pipe forest stored file contents or lost a process"
+                && durableImage.writableFiles.isEmpty
+                && durableImage.establishedTCPEndpoints?.count == 4
+                && durableImage.descriptorGraph?.sockets.count == 2,
+            "durable pipe/TCP forest stored file contents or lost a resource"
         )
 
         try replaceFileBytesPreservingInode(at: sentinelURL, with: futureSentinel)
@@ -639,9 +641,14 @@ enum ExternalHotProof {
             root: replacementRoot,
             child: replacementChild
         )
+        try verifySocketForestAliases(
+            root: replacementRoot,
+            child: replacementChild
+        )
 
         try Data("WRITE\n".utf8).write(to: commandURL, options: .atomic)
-        try await waitForPipeForestObservation("BYTE_OK", at: observationURL)
+        try await waitForPipeForestObservation("PIPE_OK", at: observationURL)
+        try await waitForPipeForestObservation("TCP_OK", at: observationURL)
         let restoredSentinel = try Data(contentsOf: sentinelURL)
         let restoredSentinelInode = try fileInode(sentinelURL)
         try require(
@@ -674,6 +681,8 @@ enum ExternalHotProof {
         print("  parentage:    direct child preserved")
         print("  pipe aliases: root 200/201 <-> child 210/211")
         print("  pipe byte:    0xA7 crossed the restored pipe")
+        print("  TCP aliases:  root 220/221 <-> child 230/231")
+        print("  TCP byte:     0xB8 crossed the restored loopback stream")
         print("  local files:  post-capture sentinel unchanged")
     }
 
@@ -777,6 +786,46 @@ enum ExternalHotProof {
                 && rootRead.pipeinfo.pipe_stat.vst_size == 0
                 && childWrite.pipeinfo.pipe_stat.vst_size == 0,
             "restored fixed descriptor aliases did not share one reciprocal empty pipe"
+        )
+    }
+
+    private static func pipeForestSocketInfo(
+        processID: Int32,
+        descriptor: Int32
+    ) throws -> socket_fdinfo {
+        var info = socket_fdinfo()
+        let bytes = proc_pidfdinfo(
+            processID,
+            descriptor,
+            PROC_PIDFDSOCKETINFO,
+            &info,
+            Int32(MemoryLayout<socket_fdinfo>.size)
+        )
+        guard bytes == MemoryLayout<socket_fdinfo>.size else {
+            throw ExternalHotProofFailure.invariant(
+                "PID \(processID) did not restore socket fd \(descriptor)"
+            )
+        }
+        return info
+    }
+
+    private static func verifySocketForestAliases(
+        root: Int32,
+        child: Int32
+    ) throws {
+        let rootSocket = try pipeForestSocketInfo(processID: root, descriptor: 220)
+        let rootAlias = try pipeForestSocketInfo(processID: root, descriptor: 221)
+        let childSocket = try pipeForestSocketInfo(processID: child, descriptor: 230)
+        let childAlias = try pipeForestSocketInfo(processID: child, descriptor: 231)
+        try require(
+            rootSocket.psi.soi_so == rootAlias.psi.soi_so
+                && childSocket.psi.soi_so == childAlias.psi.soi_so
+                && rootSocket.psi.soi_so != childSocket.psi.soi_so
+                && rootSocket.psi.soi_rcv.sbi_cc == 0
+                && rootSocket.psi.soi_snd.sbi_cc == 0
+                && childSocket.psi.soi_rcv.sbi_cc == 0
+                && childSocket.psi.soi_snd.sbi_cc == 0,
+            "restored fixed socket aliases did not share one empty loopback stream"
         )
     }
 
