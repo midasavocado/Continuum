@@ -554,7 +554,10 @@ enum ExternalHotProof {
             durableImage.members.count == 2
                 && durableImage.writableFiles.isEmpty
                 && durableImage.establishedTCPEndpoints?.count == 4
-                && durableImage.descriptorGraph?.sockets.count == 2,
+                && durableImage.descriptorGraph?.sockets.count == 2
+                && durableImage.descriptorGraph?.kqueues.count == 1
+                && durableImage.descriptorGraph?.kqueues.first?
+                    .registrations.count == 2,
             "durable pipe/TCP forest stored file contents or lost a resource"
         )
 
@@ -681,6 +684,7 @@ enum ExternalHotProof {
         print("  parentage:    direct child preserved")
         print("  pipe aliases: root 200/201 <-> child 210/211")
         print("  pipe byte:    0xA7 crossed the restored pipe")
+        print("  kqueue:       EVFILT_READ delivered the restored pipe byte")
         print("  TCP aliases:  root 220/221 <-> child 230/231")
         print("  TCP byte:     0xB8 crossed the restored loopback stream")
         print("  local files:  post-capture sentinel unchanged")

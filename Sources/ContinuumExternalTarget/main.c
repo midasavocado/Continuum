@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -316,6 +317,37 @@ static int run_pipe_forest_root(const char *executable, const char *observation_
     }
     close(accepted);
 
+    int queue = kqueue();
+    struct kevent64_s registrations[2];
+    memset(registrations, 0, sizeof(registrations));
+    registrations[0].ident = PIPE_FOREST_ROOT_READ_FD;
+    registrations[0].filter = EVFILT_READ;
+    registrations[0].flags = EV_ADD;
+    registrations[0].udata = UINT64_C(0xA700);
+    registrations[1].ident = UINT64_C(0xB800);
+    registrations[1].filter = EVFILT_USER;
+    registrations[1].flags = EV_ADD;
+    registrations[1].udata = UINT64_C(0xB801);
+    if (queue < 0
+        || fcntl(
+            queue,
+            F_SETFD,
+            FD_CLOEXEC | FD_CLOFORK
+        ) != 0
+        || kevent64(
+            queue,
+            registrations,
+            2,
+            NULL,
+            0,
+            KEVENT_FLAG_NONE,
+            NULL
+        ) != 0) {
+        if (queue >= 0) close(queue);
+        kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+        return EXIT_FAILURE;
+    }
     char ready[96];
     int length = snprintf(
         ready,
@@ -334,7 +366,21 @@ static int run_pipe_forest_root(const char *executable, const char *observation_
     int tcp_reported = 0;
     for (;;) {
         uint8_t byte = 0;
-        if (read(PIPE_FOREST_ROOT_READ_FD, &byte, sizeof(byte)) == sizeof(byte)
+        struct kevent64_s event;
+        struct timespec timeout = {0, 0};
+        int event_count = kevent64(
+            queue,
+            NULL,
+            0,
+            &event,
+            1,
+            KEVENT_FLAG_NONE,
+            &timeout
+        );
+        if (event_count == 1
+            && event.filter == EVFILT_READ
+            && event.ident == PIPE_FOREST_ROOT_READ_FD
+            && read(PIPE_FOREST_ROOT_READ_FD, &byte, sizeof(byte)) == sizeof(byte)
             && byte == PIPE_FOREST_BYTE && !pipe_reported) {
             static const char success[] = "PIPE_OK\n";
             pipe_forest_append(success, sizeof(success) - 1);

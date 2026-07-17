@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/event.h>
 #include <sys/proc.h>
 #include <sys/ptrace.h>
 #include <sys/socket.h>
@@ -2125,7 +2126,8 @@ typedef struct continuum_bootstrap_descriptor_record {
 
 typedef enum continuum_bootstrap_resource_kind {
     CONTINUUM_BOOTSTRAP_RESOURCE_PIPE = 1,
-    CONTINUUM_BOOTSTRAP_RESOURCE_SOCKET = 2
+    CONTINUUM_BOOTSTRAP_RESOURCE_SOCKET = 2,
+    CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE = 3
 } continuum_bootstrap_resource_kind;
 
 typedef struct continuum_bootstrap_resource_descriptor_record {
@@ -2133,7 +2135,23 @@ typedef struct continuum_bootstrap_resource_descriptor_record {
     int target_descriptor;
     int descriptor_flags;
     int status_flags;
+    uint32_t kqueue_state;
+    uint32_t registration_count;
 } continuum_bootstrap_resource_descriptor_record;
+
+typedef struct continuum_bootstrap_kqueue_registration_record {
+    int queue_descriptor;
+    uint64_t ident;
+    int16_t filter;
+    uint16_t flags;
+    uint32_t fflags;
+    int64_t data;
+    uint64_t udata;
+    uint32_t qos;
+    int64_t saved_data;
+    uint32_t saved_fflags;
+    uint32_t status;
+} continuum_bootstrap_kqueue_registration_record;
 
 static int continuum_bootstrap_hex_value(char value) {
     if (value >= '0' && value <= '9') {
@@ -2206,15 +2224,27 @@ int continuum_bootstrap_apply_descriptor_plan(
 
     uint32_t count = 0;
     uint32_t resource_count = 0;
+    uint32_t registration_count = 0;
     int plan_version = 0;
     continuum_bootstrap_descriptor_record *records = NULL;
     continuum_bootstrap_resource_descriptor_record *resource_records = NULL;
+    continuum_bootstrap_kqueue_registration_record *registration_records = NULL;
     int maximum_target = 63;
     if (plan_length > 0) {
         char *context = NULL;
         char *line = strtok_r(plan, "\n", &context);
         char trailing = '\0';
         if (line != NULL
+            && sscanf(
+                line,
+                "CONTINUUM_FD_PLAN_V4 %u %u %u %c",
+                &count,
+                &resource_count,
+                &registration_count,
+                &trailing
+            ) == 3) {
+            plan_version = 4;
+        } else if (line != NULL
             && sscanf(
                 line,
                 "CONTINUUM_FD_PLAN_V3 %u %u %c",
@@ -2245,6 +2275,7 @@ int continuum_bootstrap_apply_descriptor_plan(
         if (plan_version == 0
             || count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS
             || resource_count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS
+            || registration_count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS
             || count > CONTINUUM_BOOTSTRAP_MAX_DESCRIPTORS - resource_count) {
             free(plan);
             close(descriptor);
@@ -2252,10 +2283,15 @@ int continuum_bootstrap_apply_descriptor_plan(
         }
         records = calloc(count, sizeof(*records));
         resource_records = calloc(resource_count, sizeof(*resource_records));
+        registration_records = calloc(
+            registration_count, sizeof(*registration_records)
+        );
         if ((count > 0 && records == NULL)
-            || (resource_count > 0 && resource_records == NULL)) {
+            || (resource_count > 0 && resource_records == NULL)
+            || (registration_count > 0 && registration_records == NULL)) {
             free(records);
             free(resource_records);
+            free(registration_records);
             free(plan);
             close(descriptor);
             return plan_version >= 2 ? -2 : -1;
@@ -2287,6 +2323,7 @@ int continuum_bootstrap_apply_descriptor_plan(
                 )) {
                 free(records);
                 free(resource_records);
+                free(registration_records);
                 free(plan);
                 close(descriptor);
                 return plan_version >= 2 ? -2 : -1;
@@ -2299,6 +2336,7 @@ int continuum_bootstrap_apply_descriptor_plan(
                     == records[index].target_descriptor) {
                     free(records);
                     free(resource_records);
+                    free(registration_records);
                     free(plan);
                     close(descriptor);
                     return plan_version >= 2 ? -2 : -1;
@@ -2323,15 +2361,29 @@ int continuum_bootstrap_apply_descriptor_plan(
                     &trailing
                 );
             } else {
-                parsed = line == NULL ? 0 : sscanf(
-                    line,
-                    "RESOURCE %d %d %d %d %c",
-                    &kind,
-                    &resource_records[index].target_descriptor,
-                    &resource_records[index].descriptor_flags,
-                    &resource_records[index].status_flags,
-                    &trailing
-                );
+                if (plan_version == 4) {
+                    parsed = line == NULL ? 0 : sscanf(
+                        line,
+                        "RESOURCE %d %d %d %d %u %u %c",
+                        &kind,
+                        &resource_records[index].target_descriptor,
+                        &resource_records[index].descriptor_flags,
+                        &resource_records[index].status_flags,
+                        &resource_records[index].kqueue_state,
+                        &resource_records[index].registration_count,
+                        &trailing
+                    );
+                } else {
+                    parsed = line == NULL ? 0 : sscanf(
+                        line,
+                        "RESOURCE %d %d %d %d %c",
+                        &kind,
+                        &resource_records[index].target_descriptor,
+                        &resource_records[index].descriptor_flags,
+                        &resource_records[index].status_flags,
+                        &trailing
+                    );
+                }
             }
             resource_records[index].kind =
                 (continuum_bootstrap_resource_kind)kind;
@@ -2339,14 +2391,24 @@ int continuum_bootstrap_apply_descriptor_plan(
             int descriptor_flags = resource_records[index].descriptor_flags;
             int status_flags = resource_records[index].status_flags;
             const int mutable_status_flags = O_NONBLOCK | O_ASYNC;
-            int expected_fields = plan_version == 2 ? 3 : 4;
+            int expected_fields = plan_version == 2 ? 3
+                : kind == CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE ? 6 : 4;
             if (parsed != expected_fields || target < 0
                 || (kind != CONTINUUM_BOOTSTRAP_RESOURCE_PIPE
-                    && kind != CONTINUUM_BOOTSTRAP_RESOURCE_SOCKET)
-                || (descriptor_flags & ~FD_CLOEXEC) != 0
-                || (status_flags & ~(O_ACCMODE | mutable_status_flags)) != 0) {
+                    && kind != CONTINUUM_BOOTSTRAP_RESOURCE_SOCKET
+                    && (plan_version != 4
+                        || kind != CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE))
+                || (descriptor_flags
+                    & ~(FD_CLOEXEC
+                        | (kind == CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE
+                            ? FD_CLOFORK : 0))) != 0
+                || (status_flags & ~(O_ACCMODE | mutable_status_flags)) != 0
+                || (kind == CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE
+                    && (status_flags != O_RDWR
+                        || resource_records[index].kqueue_state != 0x0010U))) {
                 free(records);
                 free(resource_records);
+                free(registration_records);
                 free(plan);
                 close(descriptor);
                 return -2;
@@ -2355,6 +2417,7 @@ int continuum_bootstrap_apply_descriptor_plan(
                 if (records[prior].target_descriptor == target) {
                     free(records);
                     free(resource_records);
+                    free(registration_records);
                     free(plan);
                     close(descriptor);
                     return -2;
@@ -2364,6 +2427,7 @@ int continuum_bootstrap_apply_descriptor_plan(
                 if (resource_records[prior].target_descriptor == target) {
                     free(records);
                     free(resource_records);
+                    free(registration_records);
                     free(plan);
                     close(descriptor);
                     return -2;
@@ -2371,9 +2435,110 @@ int continuum_bootstrap_apply_descriptor_plan(
             }
             if (target > maximum_target) maximum_target = target;
         }
+        uint32_t declared_registrations = 0;
+        for (uint32_t index = 0; index < resource_count; index += 1) {
+            if (resource_records[index].kind
+                == CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE) {
+                if (resource_records[index].registration_count
+                    > registration_count - declared_registrations) {
+                    free(records);
+                    free(resource_records);
+                    free(registration_records);
+                    free(plan);
+                    close(descriptor);
+                    return -2;
+                }
+                declared_registrations +=
+                    resource_records[index].registration_count;
+            }
+        }
+        if (declared_registrations != registration_count) {
+            free(records);
+            free(resource_records);
+            free(registration_records);
+            free(plan);
+            close(descriptor);
+            return -2;
+        }
+        for (uint32_t index = 0; index < registration_count; index += 1) {
+            line = strtok_r(NULL, "\n", &context);
+            unsigned long long ident = 0;
+            long long data = 0;
+            unsigned long long udata = 0;
+            long long saved_data = 0;
+            trailing = '\0';
+            int filter = 0;
+            unsigned int flags = 0;
+            int parsed = line == NULL ? 0 : sscanf(
+                line,
+                "KREG %d %llu %d %u %u %lld %llu %u %lld %u %u %c",
+                &registration_records[index].queue_descriptor,
+                &ident,
+                &filter,
+                &flags,
+                &registration_records[index].fflags,
+                &data,
+                &udata,
+                &registration_records[index].qos,
+                &saved_data,
+                &registration_records[index].saved_fflags,
+                &registration_records[index].status,
+                &trailing
+            );
+            registration_records[index].ident = ident;
+            registration_records[index].filter = (int16_t)filter;
+            registration_records[index].flags = (uint16_t)flags;
+            registration_records[index].data = data;
+            registration_records[index].udata = udata;
+            registration_records[index].saved_data = saved_data;
+            const uint16_t supported_flags = EV_ADD | EV_ENABLE | EV_DISABLE
+                | EV_ONESHOT | EV_CLEAR | EV_DISPATCH | EV_UDATA_SPECIFIC;
+            int found_queue = 0;
+            int found_read_descriptor = filter != EVFILT_READ;
+            for (uint32_t resource = 0; resource < resource_count; resource += 1) {
+                const continuum_bootstrap_resource_descriptor_record *candidate =
+                    &resource_records[resource];
+                if (candidate->kind == CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE
+                    && candidate->target_descriptor
+                        == registration_records[index].queue_descriptor) {
+                    found_queue = 1;
+                }
+                if ((candidate->kind == CONTINUUM_BOOTSTRAP_RESOURCE_PIPE
+                        || candidate->kind
+                            == CONTINUUM_BOOTSTRAP_RESOURCE_SOCKET)
+                    && candidate->target_descriptor == (int)ident) {
+                    found_read_descriptor = 1;
+                }
+            }
+            int valid_filter = filter == EVFILT_USER || filter == EVFILT_READ;
+            int valid_filter_state = filter == EVFILT_USER
+                ? (registration_records[index].fflags & 0xff000000U) == 0
+                    && (registration_records[index].saved_fflags
+                        & 0xff000000U) == 0
+                : registration_records[index].data == 0
+                    && registration_records[index].saved_data >= 0
+                    && (registration_records[index].fflags & ~NOTE_LOWAT) == 0
+                    && (registration_records[index].saved_fflags & ~NOTE_LOWAT)
+                        == 0;
+            if (parsed != 11 || !found_queue || !found_read_descriptor
+                || !valid_filter || !valid_filter_state
+                || flags > UINT16_MAX || filter < INT16_MIN || filter > INT16_MAX
+                || (flags & ~supported_flags) != 0
+                || (flags & (EV_DELETE | EV_RECEIPT)) != 0
+                || registration_records[index].qos != 0
+                || registration_records[index].status != 0) {
+                free(records);
+                free(resource_records);
+                free(registration_records);
+                free(plan);
+                close(descriptor);
+                return -2;
+            }
+        }
         if (strtok_r(NULL, "\n", &context) != NULL) {
             free(records);
             free(resource_records);
+            free(registration_records);
             free(plan);
             close(descriptor);
             return plan_version >= 2 ? -2 : -1;
@@ -2384,6 +2549,7 @@ int continuum_bootstrap_apply_descriptor_plan(
     if (maximum_target == INT_MAX) {
         free(records);
         free(resource_records);
+        free(registration_records);
         close(descriptor);
         return plan_version >= 2 ? -2 : -1;
     }
@@ -2396,6 +2562,7 @@ int continuum_bootstrap_apply_descriptor_plan(
     if (report_descriptor < 0) {
         free(records);
         free(resource_records);
+        free(registration_records);
         return plan_version >= 2 ? -2 : -1;
     }
 
@@ -2404,6 +2571,7 @@ int continuum_bootstrap_apply_descriptor_plan(
         if (access_mode != O_WRONLY && access_mode != O_RDWR) {
             free(records);
             free(resource_records);
+            free(registration_records);
             close(report_descriptor);
             return plan_version >= 2 ? -2 : -1;
         }
@@ -2428,6 +2596,7 @@ int continuum_bootstrap_apply_descriptor_plan(
             }
             free(records);
             free(resource_records);
+            free(registration_records);
             close(report_descriptor);
             return plan_version >= 2 ? -2 : -1;
         }
@@ -2440,29 +2609,47 @@ int continuum_bootstrap_apply_descriptor_plan(
     for (uint32_t index = 0; index < resource_count; index += 1) {
         const continuum_bootstrap_resource_descriptor_record *record =
             &resource_records[index];
+        if (record->kind == CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE) {
+            int created = kqueue();
+            if (created < 0
+                || (created != record->target_descriptor
+                    && dup2(created, record->target_descriptor) < 0)) {
+                if (created >= 0) close(created);
+                free(resource_records);
+                free(registration_records);
+                close(report_descriptor);
+                return -2;
+            }
+            if (created != record->target_descriptor) close(created);
+        }
         struct stat descriptor_metadata;
         int current_status_flags = fcntl(record->target_descriptor, F_GETFL);
         int desired_access_mode = record->status_flags & O_ACCMODE;
         int socket_type = 0;
         socklen_t socket_type_length = sizeof(socket_type);
-        int resource_matches = record->kind == CONTINUUM_BOOTSTRAP_RESOURCE_PIPE
-            ? fstat(record->target_descriptor, &descriptor_metadata) == 0
-                && S_ISFIFO(descriptor_metadata.st_mode)
-            : getsockopt(
-                record->target_descriptor,
-                SOL_SOCKET,
-                SO_TYPE,
-                &socket_type,
-                &socket_type_length
-            ) == 0 && socket_type == SOCK_STREAM;
+        int resource_matches = 1;
+        if (record->kind == CONTINUUM_BOOTSTRAP_RESOURCE_PIPE) {
+            resource_matches =
+                fstat(record->target_descriptor, &descriptor_metadata) == 0
+                && S_ISFIFO(descriptor_metadata.st_mode);
+        } else if (record->kind == CONTINUUM_BOOTSTRAP_RESOURCE_SOCKET) {
+            resource_matches = getsockopt(
+                    record->target_descriptor,
+                    SOL_SOCKET,
+                    SO_TYPE,
+                    &socket_type,
+                    &socket_type_length
+                ) == 0 && socket_type == SOCK_STREAM;
+        }
         if (!resource_matches
             || current_status_flags < 0
             || (current_status_flags & O_ACCMODE) != desired_access_mode
-            || fcntl(
-                record->target_descriptor,
-                F_SETFL,
-                record->status_flags & (O_NONBLOCK | O_ASYNC)
-            ) != 0
+            || (record->kind != CONTINUUM_BOOTSTRAP_RESOURCE_KQUEUE
+                && fcntl(
+                    record->target_descriptor,
+                    F_SETFL,
+                    record->status_flags & (O_NONBLOCK | O_ASYNC)
+                ) != 0)
             || fcntl(
                 record->target_descriptor,
                 F_SETFD,
@@ -2473,12 +2660,41 @@ int continuum_bootstrap_apply_descriptor_plan(
             || fcntl(record->target_descriptor, F_GETFD)
                 != record->descriptor_flags) {
             free(resource_records);
+            free(registration_records);
             close(report_descriptor);
             return -2;
         }
         *out_restored_count += 1;
     }
     free(resource_records);
+    for (uint32_t index = 0; index < registration_count; index += 1) {
+        const continuum_bootstrap_kqueue_registration_record *record =
+            &registration_records[index];
+        struct kevent64_s change;
+        memset(&change, 0, sizeof(change));
+        change.ident = record->ident;
+        change.filter = record->filter;
+        change.flags = record->flags | EV_ADD;
+        change.fflags = record->filter == EVFILT_USER
+            ? NOTE_FFCOPY | record->saved_fflags
+            : record->saved_fflags;
+        change.data = record->saved_data;
+        change.udata = record->udata;
+        if (kevent64(
+                record->queue_descriptor,
+                &change,
+                1,
+                NULL,
+                0,
+                KEVENT_FLAG_NONE,
+                NULL
+            ) != 0) {
+            free(registration_records);
+            close(report_descriptor);
+            return -2;
+        }
+    }
+    free(registration_records);
     if (ftruncate(report_descriptor, 0) != 0
         || lseek(report_descriptor, 0, SEEK_SET) != 0) {
         close(report_descriptor);

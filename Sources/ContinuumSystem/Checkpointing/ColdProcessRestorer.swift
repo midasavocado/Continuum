@@ -215,6 +215,12 @@ public actor ColdProcessRestorer {
     private struct BootstrapResourceHandles {
         let pipes: [DurableDescriptorHandle]
         let sockets: [DurableDescriptorHandle]
+        let kqueues: [BootstrapKqueue]
+    }
+
+    private struct BootstrapKqueue {
+        let resource: DurableKqueueResource
+        let handle: DurableDescriptorHandle
     }
 
     private struct BrokerLaunchPreparation {
@@ -822,7 +828,8 @@ public actor ColdProcessRestorer {
         let plan = try Self.bootstrapDescriptorPlan(
             [],
             pipeHandles: resourceHandles.pipes,
-            socketHandles: resourceHandles.sockets
+            socketHandles: resourceHandles.sockets,
+            kqueues: resourceHandles.kqueues
         )
         try Self.writeBootstrapDescriptorPlan(plan, to: descriptor)
         var brokerRemaps = remaps
@@ -1170,7 +1177,8 @@ public actor ColdProcessRestorer {
             let descriptorPlan = try Self.bootstrapDescriptorPlan(
                 rootDescriptors,
                 pipeHandles: resourceHandles.pipes,
-                socketHandles: resourceHandles.sockets
+                socketHandles: resourceHandles.sockets,
+                kqueues: resourceHandles.kqueues
             )
             try Self.writeBootstrapDescriptorPlan(
                 descriptorPlan,
@@ -1288,6 +1296,7 @@ public actor ColdProcessRestorer {
             expectedRestoredDescriptorCount:
                 rootDescriptors.count + resourceHandles.pipes.count
                     + resourceHandles.sockets.count
+                    + resourceHandles.kqueues.count
         )
         try requireRuntimeOK(
             continuum_remote_session_open(replacementProcessIdentifier, &session),
@@ -2502,7 +2511,7 @@ public actor ColdProcessRestorer {
     private func prepareDescriptorGraph(
         for image: DurableCheckpointImage
     ) throws -> PreparedDescriptorGraph {
-        // Format-five images use the normalized graph as the sole socket source
+        // Format-six images use the normalized graph as the sole socket source
         // of truth. Endpoint-per-fd records remain only for legacy images.
         let endpoints = image.descriptorGraph == nil
             ? image.establishedTCPEndpoints ?? []
@@ -2518,11 +2527,9 @@ public actor ColdProcessRestorer {
         let pipeHandles = durableGraph?.handles.filter { handle in
             pipeIDs.contains(handle.resourceID)
         } ?? []
-        guard durableGraph?.kqueues.isEmpty != false else {
-            throw ContinuumError.restoreUnavailable(
-                "This snapshot contains kqueues that Continuum cannot rebuild yet."
-            )
-        }
+        let kqueueHandles = durableGraph?.handles.filter { handle in
+            kqueueIDs.contains(handle.resourceID)
+        } ?? []
         if let durableGraph {
             let allResourceIDs = socketIDs.union(pipeIDs).union(kqueueIDs)
             guard socketIDs.count == durableGraph.sockets.count,
@@ -2555,10 +2562,16 @@ public actor ColdProcessRestorer {
                     "This snapshot contains listeners, Unix sockets, queued TCP data, or socket options that Continuum cannot rebuild yet."
                 )
             }
+            try validateColdKqueues(
+                graph: durableGraph,
+                handles: kqueueHandles,
+                capturedProcessIdentifiers: Set(image.members.map(\.processIdentifier))
+            )
         }
         guard !endpoints.isEmpty || !ptyDescriptors.isEmpty
                 || durableGraph?.pipes.isEmpty == false
-                || durableGraph?.sockets.isEmpty == false else {
+                || durableGraph?.sockets.isEmpty == false
+                || durableGraph?.kqueues.isEmpty == false else {
             return PreparedDescriptorGraph(
                 remapsByCapturedProcess: [:],
                 controllerDescriptors: [],
@@ -2608,13 +2621,25 @@ public actor ColdProcessRestorer {
                 )
             }
         }
+        for handle in kqueueHandles {
+            guard capturedProcesses.contains(handle.processIdentifier),
+                  handle.fileDescriptor >= 0,
+                  targetDescriptorsByProcess[handle.processIdentifier,
+                    default: []].insert(handle.fileDescriptor).inserted else {
+                throw ContinuumError.integrityFailure(
+                    "The durable kqueue graph contains an invalid or duplicate descriptor."
+                )
+            }
+        }
 
-        let maximumTarget = (endpoints.map(\.fileDescriptor)
-            + ptyDescriptors.map(\.fileDescriptor)
-            + pipeHandles.map(\.fileDescriptor)
-            + socketHandles.map(\.fileDescriptor)).max() ?? 255
+        var targetDescriptorNumbers = endpoints.map(\.fileDescriptor)
+        targetDescriptorNumbers.append(contentsOf: ptyDescriptors.map(\.fileDescriptor))
+        targetDescriptorNumbers.append(contentsOf: pipeHandles.map(\.fileDescriptor))
+        targetDescriptorNumbers.append(contentsOf: socketHandles.map(\.fileDescriptor))
+        targetDescriptorNumbers.append(contentsOf: kqueueHandles.map(\.fileDescriptor))
+        let maximumTarget = targetDescriptorNumbers.max() ?? 255
         let descriptorCount = endpoints.count + ptyDescriptors.count
-            + pipeHandles.count + socketHandles.count
+            + pipeHandles.count + socketHandles.count + kqueueHandles.count
         guard maximumTarget < Int32.max - Int32(descriptorCount * 2 + 16) else {
             throw ContinuumError.integrityFailure(
                 "The durable TCP descriptor numbers exceed process limits."
@@ -3326,6 +3351,87 @@ public actor ColdProcessRestorer {
         }
     }
 
+    private func validateColdKqueues(
+        graph: DurableDescriptorGraph,
+        handles: [DurableDescriptorHandle],
+        capturedProcessIdentifiers: Set<Int32>
+    ) throws {
+        guard !graph.kqueues.isEmpty else { return }
+        let handlesByResource = Dictionary(grouping: handles, by: \.resourceID)
+        var handlesByProcessAndDescriptor: [String: DurableDescriptorHandle] = [:]
+        for handle in graph.handles {
+            let key = "\(handle.processIdentifier):\(handle.fileDescriptor)"
+            guard handlesByProcessAndDescriptor.updateValue(handle, forKey: key) == nil else {
+                throw ContinuumError.integrityFailure(
+                    "The durable descriptor graph contains duplicate process descriptors."
+                )
+            }
+        }
+        let pipesByID = Dictionary(
+            uniqueKeysWithValues: graph.pipes.map { ($0.id, $0) }
+        )
+        let socketsByID = Dictionary(
+            uniqueKeysWithValues: graph.sockets.map { ($0.id, $0) }
+        )
+        let supportedRegistrationFlags: UInt16 = 0x01BD
+        for queue in graph.kqueues {
+            guard queue.state & ~0x0002 == 0x0010,
+                  capturedProcessIdentifiers.contains(queue.processIdentifier),
+                  let queueHandles = handlesByResource[queue.id],
+                  queueHandles.count == 1,
+                  let queueHandle = queueHandles.first,
+                  queueHandle.processIdentifier == queue.processIdentifier,
+                  queueHandle.fileDescriptor >= 0,
+                  queueHandle.statusFlags == O_RDWR,
+                  queueHandle.descriptorFlags
+                    & ~(FD_CLOEXEC | FD_CLOFORK) == 0 else {
+                throw ContinuumError.restoreUnavailable(
+                    "This snapshot contains a shared, workloop, or non-KEV64 kqueue that Continuum cannot rebuild safely."
+                )
+            }
+            for registration in queue.registrations {
+                guard registration.status == 0,
+                      registration.qos == 0,
+                      registration.flags & ~supportedRegistrationFlags == 0,
+                      registration.flags & 0x0002 == 0,
+                      registration.flags & 0x0040 == 0 else {
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved kqueue contains an active event or unsupported registration flags."
+                    )
+                }
+                switch registration.filter {
+                case Int16(EVFILT_USER):
+                    guard registration.fflags & 0xFF00_0000 == 0,
+                          registration.savedFflags & 0xFF00_0000 == 0 else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved EVFILT_USER registration is triggered or uses unsupported control flags."
+                        )
+                    }
+                case Int16(EVFILT_READ):
+                    guard registration.ident <= UInt64(Int32.max),
+                          registration.fflags & ~UInt32(NOTE_LOWAT) == 0,
+                          registration.savedFflags & ~UInt32(NOTE_LOWAT) == 0,
+                          registration.data == 0,
+                          registration.savedData >= 0,
+                          let referenced = handlesByProcessAndDescriptor[
+                            "\(queue.processIdentifier):\(registration.ident)"
+                          ],
+                          (pipesByID[referenced.resourceID]?.queuedBytes == 0
+                            || socketsByID[referenced.resourceID]?.receiveQueueBytes == 0)
+                    else {
+                        throw ContinuumError.restoreUnavailable(
+                            "A saved EVFILT_READ registration references missing or queued descriptor state."
+                        )
+                    }
+                default:
+                    throw ContinuumError.restoreUnavailable(
+                        "A saved kqueue uses a filter Continuum cannot rebuild yet."
+                    )
+                }
+            }
+        }
+    }
+
     private static func regionIntersectsPreparedPthread(
         _ region: DurableMemoryRegion,
         entries: [continuum_pthread_reconstruction_plan_entry]
@@ -3894,17 +4000,28 @@ public actor ColdProcessRestorer {
     private static func bootstrapDescriptorPlan(
         _ descriptors: [DurableWritableFileDescriptor],
         pipeHandles: [DurableDescriptorHandle] = [],
-        socketHandles: [DurableDescriptorHandle] = []
+        socketHandles: [DurableDescriptorHandle] = [],
+        kqueues: [BootstrapKqueue] = []
     ) throws -> Data {
         let resourceCount = pipeHandles.count + socketHandles.count
-        guard descriptors.count + resourceCount <= 1_024 else {
+            + kqueues.count
+        let registrationCount = kqueues.reduce(0) {
+            $0 + $1.resource.registrations.count
+        }
+        guard descriptors.count + resourceCount <= 1_024,
+              registrationCount <= 1_024 else {
             throw ContinuumError.restoreUnavailable(
-                "The root process owns too many descriptors for cold reconstruction."
+                "The process owns too many descriptors or kqueue registrations for cold reconstruction."
             )
         }
         var seenDescriptors: Set<Int32> = []
         var lines: [String]
-        if !socketHandles.isEmpty {
+        if !kqueues.isEmpty {
+            lines = [
+                "CONTINUUM_FD_PLAN_V4 \(descriptors.count) "
+                    + "\(resourceCount) \(registrationCount)",
+            ]
+        } else if !socketHandles.isEmpty {
             lines = [
                 "CONTINUUM_FD_PLAN_V3 \(descriptors.count) \(resourceCount)",
             ]
@@ -3979,6 +4096,41 @@ public actor ColdProcessRestorer {
                     + "\(handle.descriptorFlags) \(handle.statusFlags)"
             )
         }
+        for queue in kqueues.sorted(by: {
+            $0.handle.fileDescriptor < $1.handle.fileDescriptor
+        }) {
+            let handle = queue.handle
+            guard handle.fileDescriptor >= 0,
+                  seenDescriptors.insert(handle.fileDescriptor).inserted,
+                  handle.descriptorFlags
+                    & ~(FD_CLOEXEC | FD_CLOFORK) == 0,
+                  handle.statusFlags == O_RDWR,
+                  queue.resource.state & ~0x0002 == 0x0010 else {
+                throw ContinuumError.integrityFailure(
+                    "The durable kqueue-descriptor plan is invalid."
+                )
+            }
+            lines.append(
+                "RESOURCE 3 \(handle.fileDescriptor) "
+                    + "\(handle.descriptorFlags) \(handle.statusFlags) "
+                    + "16 "
+                    + "\(queue.resource.registrations.count)"
+            )
+        }
+        for queue in kqueues.sorted(by: {
+            $0.handle.fileDescriptor < $1.handle.fileDescriptor
+        }) {
+            for registration in queue.resource.registrations {
+                lines.append(
+                    "KREG \(queue.handle.fileDescriptor) \(registration.ident) "
+                        + "\(registration.filter) \(registration.flags) "
+                        + "\(registration.fflags) \(registration.data) "
+                        + "\(registration.udata) \(registration.qos) "
+                        + "\(registration.savedData) "
+                        + "\(registration.savedFflags) \(registration.status)"
+                )
+            }
+        }
         guard let plan = (lines.joined(separator: "\n") + "\n")
                 .data(using: .utf8),
               plan.count <= 1_024 * 1_024 else {
@@ -3994,7 +4146,9 @@ public actor ColdProcessRestorer {
         processIdentifier: Int32
     ) -> BootstrapResourceHandles {
         guard let graph = image.descriptorGraph else {
-            return BootstrapResourceHandles(pipes: [], sockets: [])
+            return BootstrapResourceHandles(
+                pipes: [], sockets: [], kqueues: []
+            )
         }
         let pipeIDs = Set(graph.pipes.map(\.id))
         let socketIDs = Set(graph.sockets.map(\.id))
@@ -4003,7 +4157,14 @@ public actor ColdProcessRestorer {
         }
         return BootstrapResourceHandles(
             pipes: owned.filter { pipeIDs.contains($0.resourceID) },
-            sockets: owned.filter { socketIDs.contains($0.resourceID) }
+            sockets: owned.filter { socketIDs.contains($0.resourceID) },
+            kqueues: graph.kqueues.compactMap { queue in
+                guard queue.processIdentifier == processIdentifier,
+                      let handle = owned.first(where: {
+                        $0.resourceID == queue.id
+                      }) else { return nil }
+                return BootstrapKqueue(resource: queue, handle: handle)
+            }
         )
     }
 

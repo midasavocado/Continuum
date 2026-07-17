@@ -61,6 +61,8 @@ extern int posix_spawnattr_disable_ptr_auth_a_keys_np(
 #define CONTINUUM_PROC_PIDFDKQUEUE_EXTINFO 9
 #define CONTINUUM_PROC_KQUEUE_WORKQ 0x0040U
 #define CONTINUUM_PROC_KQUEUE_WORKLOOP 0x0080U
+#define CONTINUUM_PROC_KQUEUE_SLEEP 0x0002U
+#define CONTINUUM_PROC_KQUEUE_KEV64 0x0010U
 #define CONTINUUM_KNOTE_ACTIVE 0x001U
 #define CONTINUUM_KNOTE_QUEUED 0x002U
 #define CONTINUUM_KNOTE_DISABLED 0x004U
@@ -12733,8 +12735,8 @@ static continuum_status continuum_descriptor_graph_add_kqueue(
     const struct kqueue_fdinfo *info
 ) {
     if (graph == NULL || info == NULL) return CONTINUUM_STATUS_INVALID_ARGUMENT;
-    if ((info->kqueueinfo.kq_state
-            & (CONTINUUM_PROC_KQUEUE_WORKQ | CONTINUUM_PROC_KQUEUE_WORKLOOP)) != 0
+    if ((info->kqueueinfo.kq_state & ~CONTINUUM_PROC_KQUEUE_SLEEP)
+            != CONTINUUM_PROC_KQUEUE_KEV64
         || (info->pfi.fi_status & PROC_FP_SHARED) != 0) {
         return CONTINUUM_STATUS_UNSUPPORTED_DESCRIPTOR;
     }
@@ -12742,20 +12744,17 @@ static continuum_status continuum_descriptor_graph_add_kqueue(
     const uint64_t identity = continuum_descriptor_kqueue_identity(
         process_id, file_descriptor
     );
-    int measured_bytes = proc_pidfdinfo(
+    int measured_count = proc_pidfdinfo(
         process_id,
         file_descriptor,
         CONTINUUM_PROC_PIDFDKQUEUE_EXTINFO,
         NULL,
         0
     );
-    if (measured_bytes < 0) return CONTINUUM_STATUS_MACH_ERROR;
-    if (measured_bytes % (int)sizeof(continuum_kevent_extinfo_private) != 0) {
-        return CONTINUUM_STATUS_VALIDATION_FAILED;
-    }
-    const size_t registration_count =
-        (size_t)measured_bytes / sizeof(continuum_kevent_extinfo_private);
-    if (registration_count > SIZE_MAX / sizeof(continuum_kevent_extinfo_private)) {
+    if (measured_count < 0) return CONTINUUM_STATUS_MACH_ERROR;
+    const size_t registration_count = (size_t)measured_count;
+    if (registration_count
+        > (size_t)INT_MAX / sizeof(continuum_kevent_extinfo_private)) {
         return CONTINUUM_STATUS_RANGE_ERROR;
     }
     continuum_kevent_extinfo_private *registrations = NULL;
@@ -12764,16 +12763,17 @@ static continuum_status continuum_descriptor_graph_add_kqueue(
             (size_t)registration_count, sizeof(*registrations)
         );
         if (registrations == NULL) return CONTINUUM_STATUS_OUT_OF_MEMORY;
-        int returned_bytes = proc_pidfdinfo(
+        int returned_count = proc_pidfdinfo(
             process_id,
             file_descriptor,
             CONTINUUM_PROC_PIDFDKQUEUE_EXTINFO,
             registrations,
-            measured_bytes
+            (int)(registration_count
+                * sizeof(continuum_kevent_extinfo_private))
         );
-        if (returned_bytes != measured_bytes) {
+        if (returned_count != measured_count) {
             free(registrations);
-            return returned_bytes < 0
+            return returned_count < 0
                 ? CONTINUUM_STATUS_MACH_ERROR
                 : CONTINUUM_STATUS_VALIDATION_FAILED;
         }
@@ -12818,6 +12818,7 @@ static continuum_status continuum_descriptor_graph_add_kqueue(
         registration.udata = raw->event.udata;
         registration.qos = raw->event.qos;
         registration.saved_data = (int64_t)raw->saved_data;
+        registration.saved_fflags = (uint32_t)raw->saved_fflags;
         registration.status = (uint32_t)raw->status;
         status = continuum_descriptor_graph_append(
             (void **)&graph->kqueue_registrations,

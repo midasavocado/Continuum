@@ -759,6 +759,7 @@ typedef struct continuum_remote_kqueue_registration_info {
     uint64_t udata;
     uint32_t qos;
     int64_t saved_data;
+    uint32_t saved_fflags;
     uint32_t status;
 } continuum_remote_kqueue_registration_info;
 

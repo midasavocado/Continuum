@@ -520,7 +520,6 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         }) else {
             return false
         }
-        guard descriptorGraph.kqueues.isEmpty else { return false }
         let socketIDs = Set(descriptorGraph.sockets.map(\.id))
         let pipeIDs = Set(descriptorGraph.pipes.map(\.id))
         let kqueueIDs = Set(descriptorGraph.kqueues.map(\.id))
@@ -546,6 +545,12 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
         )
         let socketHandles = descriptorGraph.handles.filter {
             socketByID[$0.resourceID] != nil
+        }
+        let kqueueByID = Dictionary(
+            uniqueKeysWithValues: descriptorGraph.kqueues.map { ($0.id, $0) }
+        )
+        let kqueueHandles = descriptorGraph.handles.filter {
+            kqueueByID[$0.resourceID] != nil
         }
         let handlesBySocket = Dictionary(
             grouping: socketHandles,
@@ -604,6 +609,86 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                 }) == true
         }) else {
             return false
+        }
+        guard coldKqueuesCertified(
+            descriptorGraph.kqueues,
+            handles: kqueueHandles,
+            allHandles: descriptorGraph.handles,
+            pipes: pipeByID,
+            sockets: socketByID,
+            capturedProcessIdentifiers: capturedProcessIdentifiers
+        ) else {
+            return false
+        }
+        return true
+    }
+
+    private func coldKqueuesCertified(
+        _ queues: [DurableKqueueResource],
+        handles: [DurableDescriptorHandle],
+        allHandles: [DurableDescriptorHandle],
+        pipes: [UUID: DurablePipeResource],
+        sockets: [UUID: DurableSocketResource],
+        capturedProcessIdentifiers: Set<Int32>
+    ) -> Bool {
+        let handlesByResource = Dictionary(grouping: handles, by: \.resourceID)
+        let supportedFlags: UInt16 = 0x01BD
+        let registrationsByProcess = Dictionary(grouping: queues) {
+            $0.processIdentifier
+        }
+        guard registrationsByProcess.values.allSatisfy({ processQueues in
+            processQueues.reduce(0) { count, queue in
+                count + queue.registrations.count
+            } <= 1_024
+        }) else {
+            return false
+        }
+        for queue in queues {
+            guard queue.state & ~0x0002 == 0x0010,
+                  capturedProcessIdentifiers.contains(queue.processIdentifier),
+                  let queueHandles = handlesByResource[queue.id],
+                  queueHandles.count == 1,
+                  let handle = queueHandles.first,
+                  handle.processIdentifier == queue.processIdentifier,
+                  handle.fileDescriptor >= 0,
+                  handle.statusFlags == O_RDWR,
+                  handle.descriptorFlags
+                    & ~(FD_CLOEXEC | FD_CLOFORK) == 0 else {
+                return false
+            }
+            for registration in queue.registrations {
+                guard registration.status == 0,
+                      registration.qos == 0,
+                      registration.flags & ~supportedFlags == 0,
+                      registration.flags & 0x0042 == 0 else {
+                    return false
+                }
+                switch registration.filter {
+                case Int16(EVFILT_USER):
+                    guard registration.fflags & 0xFF00_0000 == 0,
+                          registration.savedFflags & 0xFF00_0000 == 0 else {
+                        return false
+                    }
+                case Int16(EVFILT_READ):
+                    guard registration.ident <= UInt64(Int32.max),
+                          registration.fflags & ~UInt32(NOTE_LOWAT) == 0,
+                          registration.savedFflags & ~UInt32(NOTE_LOWAT) == 0,
+                          registration.data == 0,
+                          registration.savedData >= 0,
+                          let referenced = allHandles.first(where: {
+                            $0.processIdentifier == queue.processIdentifier
+                                && $0.fileDescriptor
+                                    == Int32(registration.ident)
+                          }),
+                          pipes[referenced.resourceID]?.queuedBytes == 0
+                            || sockets[referenced.resourceID]?.receiveQueueBytes == 0
+                    else {
+                        return false
+                    }
+                default:
+                    return false
+                }
+            }
         }
         return true
     }
@@ -1113,12 +1198,14 @@ public actor HotProcessCheckpointService: CheckpointCapturing {
                     udata: $0.udata,
                     qos: $0.qos,
                     savedData: $0.saved_data,
+                    savedFflags: $0.saved_fflags,
                     status: $0.status
                 )
             }
             return DurableKqueueResource(
                 id: id,
                 processIdentifier: kqueue.process_id,
+                state: kqueue.state,
                 registrations: registrations
             )
         }

@@ -256,6 +256,7 @@ final class ModelRoundTripTests: XCTestCase {
                     DurableKqueueResource(
                         id: kqueueID,
                         processIdentifier: 4242,
+                        state: 0x0010,
                         registrations: [
                             DurableKqueueRegistration(
                                 ident: 6,
@@ -266,6 +267,7 @@ final class ModelRoundTripTests: XCTestCase {
                                 udata: 0x1234,
                                 qos: 4,
                                 savedData: 0,
+                                savedFflags: 1,
                                 status: 1
                             )
                         ]

@@ -1459,6 +1459,159 @@ final class ContinuumRuntimeTests: XCTestCase {
         XCTAssertEqual(fcntl(target, F_GETFL), desiredStatus)
     }
 
+    func testBootstrapV4RecreatesInactiveUserAndEmptyReadKqueue() {
+        var endpoints: [Int32] = [-1, -1]
+        XCTAssertEqual(Darwin.pipe(&endpoints), 0)
+        guard endpoints[0] >= 0, endpoints[1] >= 0 else {
+            return XCTFail("Expected a pipe pair")
+        }
+        defer {
+            Darwin.close(endpoints[0])
+            Darwin.close(endpoints[1])
+        }
+
+        let readTarget = fcntl(endpoints[0], F_DUPFD_CLOEXEC, 320)
+        XCTAssertGreaterThanOrEqual(readTarget, 320)
+        guard readTarget >= 320 else { return }
+        defer { Darwin.close(readTarget) }
+        XCTAssertEqual(fcntl(readTarget, F_SETFD, 0), 0)
+        let readStatus = fcntl(readTarget, F_GETFL)
+        XCTAssertEqual(readStatus & O_ACCMODE, O_RDONLY)
+        let queueTarget = readTarget + 1
+
+        var temporaryPath = Array(
+            "/private/tmp/continuum-v4-kqueue-plan-XXXXXX\0".utf8
+        )
+        let planDescriptor = temporaryPath.withUnsafeMutableBufferPointer {
+            buffer in
+            mkstemp(
+                UnsafeMutablePointer<CChar>(OpaquePointer(buffer.baseAddress))
+            )
+        }
+        XCTAssertGreaterThanOrEqual(planDescriptor, 0)
+        guard planDescriptor >= 0 else { return }
+        temporaryPath.withUnsafeBufferPointer { buffer in
+            _ = unlink(UnsafePointer<CChar>(OpaquePointer(buffer.baseAddress)))
+        }
+        let plan = Array(
+            "CONTINUUM_FD_PLAN_V4 0 2 2\n"
+                .appending("RESOURCE 1 \(readTarget) 0 \(readStatus)\n")
+                .appending("RESOURCE 3 \(queueTarget) \(FD_CLOEXEC | FD_CLOFORK) \(O_RDWR) 16 2\n")
+                .appending("KREG \(queueTarget) \(readTarget) \(EVFILT_READ) \(EV_ADD) 0 0 17 0 1 0 0\n")
+                .appending("KREG \(queueTarget) 42 \(EVFILT_USER) \(EV_ADD) 0 0 23 0 0 0 0\n")
+                .utf8
+        )
+        let written = plan.withUnsafeBytes { bytes in
+            Darwin.write(planDescriptor, bytes.baseAddress, bytes.count)
+        }
+        XCTAssertEqual(written, plan.count)
+        XCTAssertEqual(lseek(planDescriptor, 0, SEEK_SET), 0)
+
+        var restoredCount: UInt32 = 0
+        let reportDescriptor = continuum_bootstrap_apply_descriptor_plan(
+            planDescriptor,
+            &restoredCount
+        )
+        XCTAssertGreaterThanOrEqual(reportDescriptor, 0)
+        guard reportDescriptor >= 0 else { return }
+        defer {
+            Darwin.close(reportDescriptor)
+            Darwin.close(queueTarget)
+        }
+        XCTAssertEqual(restoredCount, 2)
+        XCTAssertEqual(
+            fcntl(queueTarget, F_GETFD),
+            FD_CLOEXEC | FD_CLOFORK
+        )
+
+        var trigger = kevent64_s()
+        trigger.ident = 42
+        trigger.filter = Int16(EVFILT_USER)
+        trigger.fflags = UInt32(NOTE_TRIGGER)
+        XCTAssertEqual(kevent64(queueTarget, &trigger, 1, nil, 0, 0, nil), 0)
+        let byte: UInt8 = 0x5A
+        XCTAssertEqual(Darwin.write(endpoints[1], [byte], 1), 1)
+
+        var events = [kevent64_s](repeating: kevent64_s(), count: 2)
+        var timeout = timespec(tv_sec: 0, tv_nsec: 0)
+        let delivered = events.withUnsafeMutableBufferPointer { buffer in
+            kevent64(
+                queueTarget,
+                nil,
+                0,
+                buffer.baseAddress,
+                Int32(buffer.count),
+                0,
+                &timeout
+            )
+        }
+        XCTAssertEqual(delivered, 2)
+        XCTAssertEqual(
+            Set(events.prefix(Int(delivered)).map(\.ident)),
+            Set([UInt64(readTarget), 42])
+        )
+    }
+
+    func testBootstrapV4RejectsUnsafeKqueuePlans() {
+        func apply(_ plan: String) -> Int32 {
+            var temporaryPath = Array(
+                "/private/tmp/continuum-v4-unsafe-plan-XXXXXX\0".utf8
+            )
+            let descriptor = temporaryPath.withUnsafeMutableBufferPointer {
+                buffer in
+                mkstemp(
+                    UnsafeMutablePointer<CChar>(OpaquePointer(buffer.baseAddress))
+                )
+            }
+            guard descriptor >= 0 else { return -99 }
+            temporaryPath.withUnsafeBufferPointer { buffer in
+                _ = unlink(
+                    UnsafePointer<CChar>(OpaquePointer(buffer.baseAddress))
+                )
+            }
+            let bytes = Array(plan.utf8)
+            guard bytes.withUnsafeBytes({
+                Darwin.write(descriptor, $0.baseAddress, $0.count)
+            }) == bytes.count,
+            lseek(descriptor, 0, SEEK_SET) == 0 else {
+                Darwin.close(descriptor)
+                return -98
+            }
+            var restoredCount: UInt32 = 0
+            return continuum_bootstrap_apply_descriptor_plan(
+                descriptor,
+                &restoredCount
+            )
+        }
+
+        let header = "CONTINUUM_FD_PLAN_V4 0 1 1\n"
+        XCTAssertEqual(apply(
+            header
+                + "RESOURCE 3 340 1 2 16 1\n"
+                + "KREG 340 1 \(EVFILT_USER) \(EV_ADD) 0 0 0 0 0 0 1\n"
+        ), -2)
+        XCTAssertEqual(apply(
+            header
+                + "RESOURCE 3 340 1 2 16 1\n"
+                + "KREG 340 1 \(EVFILT_USER) \(EV_ADD) \(NOTE_TRIGGER) 0 0 0 0 0 0\n"
+        ), -2)
+        XCTAssertEqual(apply(
+            header
+                + "RESOURCE 3 340 1 2 16 1\n"
+                + "KREG 340 1 \(EVFILT_TIMER) \(EV_ADD) 0 0 0 0 0 0 0\n"
+        ), -2)
+        XCTAssertEqual(apply(
+            header
+                + "RESOURCE 3 340 1 2 16 1\n"
+                + "KREG 340 9 \(EVFILT_READ) \(EV_ADD) 0 0 0 0 0 0 0\n"
+        ), -2)
+        XCTAssertEqual(apply(
+            header
+                + "RESOURCE 3 340 1 2 128 1\n"
+                + "KREG 340 1 \(EVFILT_USER) \(EV_ADD) 0 0 0 0 0 0 0\n"
+        ), -2)
+    }
+
     func testRepeatedCreateCheckpointDestroy() {
         for value in UInt8(0)..<64 {
             let memory = UnsafeMutableRawPointer.allocate(byteCount: 512, alignment: 16)

@@ -3,7 +3,7 @@ import Foundation
 /// Versioned, pointer-free description of a process-tree checkpoint. Large
 /// byte ranges live in encrypted content-addressed chunks referenced here.
 public struct DurableCheckpointImage: Codable, Hashable, Sendable {
-    public static let currentFormatVersion = 5
+    public static let currentFormatVersion = 6
 
     public let formatVersion: Int
     public let checkpointID: CheckpointID
@@ -202,16 +202,34 @@ public struct DurablePipeResource: Codable, Hashable, Sendable {
 public struct DurableKqueueResource: Codable, Hashable, Sendable {
     public let id: UUID
     public let processIdentifier: Int32
+    public let state: UInt32
     public let registrations: [DurableKqueueRegistration]
 
     public init(
         id: UUID,
         processIdentifier: Int32,
+        state: UInt32 = 0,
         registrations: [DurableKqueueRegistration]
     ) {
         self.id = id
         self.processIdentifier = processIdentifier
+        self.state = state
         self.registrations = registrations
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, processIdentifier, state, registrations
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        processIdentifier = try values.decode(Int32.self, forKey: .processIdentifier)
+        state = try values.decodeIfPresent(UInt32.self, forKey: .state) ?? 0
+        registrations = try values.decode(
+            [DurableKqueueRegistration].self,
+            forKey: .registrations
+        )
     }
 }
 
@@ -224,6 +242,7 @@ public struct DurableKqueueRegistration: Codable, Hashable, Sendable {
     public let udata: UInt64
     public let qos: UInt32
     public let savedData: Int64
+    public let savedFflags: UInt32
     public let status: UInt32
 
     public init(
@@ -235,6 +254,7 @@ public struct DurableKqueueRegistration: Codable, Hashable, Sendable {
         udata: UInt64,
         qos: UInt32,
         savedData: Int64,
+        savedFflags: UInt32 = 0,
         status: UInt32
     ) {
         self.ident = ident
@@ -245,7 +265,30 @@ public struct DurableKqueueRegistration: Codable, Hashable, Sendable {
         self.udata = udata
         self.qos = qos
         self.savedData = savedData
+        self.savedFflags = savedFflags
         self.status = status
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case ident, filter, flags, fflags, data, udata, qos, savedData
+        case savedFflags, status
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        ident = try values.decode(UInt64.self, forKey: .ident)
+        filter = try values.decode(Int16.self, forKey: .filter)
+        flags = try values.decode(UInt16.self, forKey: .flags)
+        fflags = try values.decode(UInt32.self, forKey: .fflags)
+        data = try values.decode(Int64.self, forKey: .data)
+        udata = try values.decode(UInt64.self, forKey: .udata)
+        qos = try values.decode(UInt32.self, forKey: .qos)
+        savedData = try values.decode(Int64.self, forKey: .savedData)
+        savedFflags = try values.decodeIfPresent(
+            UInt32.self,
+            forKey: .savedFflags
+        ) ?? 0
+        status = try values.decode(UInt32.self, forKey: .status)
     }
 }
 
