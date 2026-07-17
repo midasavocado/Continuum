@@ -387,15 +387,12 @@ public actor ColdProcessRestorer {
         var brokeredForest: OpaquePointer?
         do {
             let orderedMembers = try Self.parentFirstMembers(image.members)
-            if orderedMembers.count == 2 {
+            if Self.shouldUseBrokeredPair(
+                orderedMembers,
+                rootProcessIdentifier: image.rootProcessIdentifier
+            ) {
                 let root = orderedMembers[0]
                 let child = orderedMembers[1]
-                guard root.processIdentifier == image.rootProcessIdentifier,
-                      child.parentProcessIdentifier == root.processIdentifier else {
-                    throw ContinuumError.restoreUnavailable(
-                        "The two-process restore component is not one root with one direct child."
-                    )
-                }
                 let prepared = try await prepareBrokeredPair(
                     root: root,
                     child: child,
@@ -4327,6 +4324,17 @@ public actor ColdProcessRestorer {
             result.window_size_known = 1
         }
         return result
+    }
+
+    static func shouldUseBrokeredPair(
+        _ orderedMembers: [DurableProcessImage],
+        rootProcessIdentifier: Int32
+    ) -> Bool {
+        guard orderedMembers.count == 2 else { return false }
+        let root = orderedMembers[0]
+        let child = orderedMembers[1]
+        return root.processIdentifier == rootProcessIdentifier
+            && child.parentProcessIdentifier == root.processIdentifier
     }
 
     private static func parentFirstMembers(

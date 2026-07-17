@@ -1,5 +1,6 @@
 import AppKit
 import ContinuumCore
+import CryptoKit
 import Foundation
 
 enum AppleTerminalPresentationProvider {
@@ -97,19 +98,51 @@ enum AppleTerminalPresentationProvider {
             appropriateFor: nil,
             create: true
         ).appendingPathComponent("Continuum/Terminal", isDirectory: true)
+        return try prepareManagedShell(source: source, base: base, signer: signManagedShell)
+    }
+
+    static func prepareManagedShell(
+        source: URL,
+        base: URL,
+        signer: (URL) throws -> Void
+    ) throws -> URL {
         try FileManager.default.createDirectory(
             at: base,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: NSNumber(value: 0o700)]
         )
-        let destination = base.appendingPathComponent("ContinuumZsh")
         let temporary = base.appendingPathComponent(".ContinuumZsh-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: temporary) }
         try FileManager.default.copyItem(at: source, to: temporary)
 
+        let sourceBytes = try Data(contentsOf: temporary, options: .mappedIfSafe)
+        let identity = SHA256.hash(data: sourceBytes)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let destination = base.appendingPathComponent("ContinuumZsh-\(identity)")
+        if FileManager.default.fileExists(atPath: destination.path) {
+            return destination
+        }
+
+        try signer(temporary)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o500)],
+            ofItemAtPath: temporary.path
+        )
+
+        do {
+            try FileManager.default.moveItem(at: temporary, to: destination)
+        } catch let error as CocoaError where error.code == .fileWriteFileExists {
+            // Another preparation installed these same source bytes first.
+            return destination
+        }
+        return destination
+    }
+
+    private static func signManagedShell(_ shell: URL) throws {
         let signer = Process()
         signer.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        signer.arguments = ["--force", "--sign", "-", temporary.path]
+        signer.arguments = ["--force", "--sign", "-", shell.path]
         let errorPipe = Pipe()
         signer.standardError = errorPipe
         try signer.run()
@@ -125,18 +158,6 @@ enum AppleTerminalPresentationProvider {
                     : "Continuum could not prepare its private shell copy."
             )
         }
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            _ = try FileManager.default.replaceItemAt(
-                destination,
-                withItemAt: temporary,
-                backupItemName: nil,
-                options: []
-            )
-        } else {
-            try FileManager.default.moveItem(at: temporary, to: destination)
-        }
-        return destination
     }
 
     private static func prepareCommandWrappers(managedExecURL: URL) throws -> URL {

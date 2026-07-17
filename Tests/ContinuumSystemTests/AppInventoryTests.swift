@@ -17,18 +17,27 @@ struct AppInventoryTests {
         #expect(root == 110)
     }
 
-    @Test("Prefers the selected terminal's foreground job over its shell")
-    func resolvesForegroundTerminalJob() {
+    @Test("Keeps the shell as root while including its foreground job")
+    func resolvesShellRootWithForegroundTerminalJob() {
+        let terminalProcessIdentifier: Int32 = 80
+        let descendants: Set<Int32> = [110, 211, 212]
+        let sessions: [Int32: Int32] = [110: 110, 211: 110, 212: 110]
+        let processGroups: [Int32: Int32] = [110: 110, 211: 211, 212: 211]
+        let foregroundProcessGroups: [Int32: Int32] = [110: 211, 211: 211, 212: 211]
         let root = MacAppInventoryService.terminalWorkloadRoot(
-            descendants: [110, 211, 212],
-            sessions: [110: 110, 211: 110, 212: 110],
+            descendants: descendants,
+            sessions: sessions,
             terminalDevices: [110: 7, 211: 7, 212: 7],
-            processGroups: [110: 110, 211: 211, 212: 211],
-            foregroundProcessGroups: [110: 211, 211: 211, 212: 211],
+            processGroups: processGroups,
+            foregroundProcessGroups: foregroundProcessGroups,
             selectedTerminalDevice: 7
         )
 
-        #expect(root == 211)
+        #expect(root == 110)
+        #expect(descendants.contains(211))
+        #expect(processGroups[211] == foregroundProcessGroups[110])
+        #expect(sessions[211] == root)
+        #expect(!descendants.contains(terminalProcessIdentifier))
     }
 
     @Test("Pairs only established loopback TCP peers")

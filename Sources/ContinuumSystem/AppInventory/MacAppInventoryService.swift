@@ -280,18 +280,6 @@ public struct MacAppInventoryService: AppInventoryProviding, Sendable {
         let matchingProcesses = descendants.filter {
             terminalDevices[$0] == selectedTerminalDevice
         }
-        let foregroundGroups = Set(matchingProcesses.compactMap {
-            foregroundProcessGroups[$0]
-        }.filter { $0 > 0 })
-        if foregroundGroups.count == 1,
-           let foregroundGroup = foregroundGroups.first {
-            let foregroundLeaders = matchingProcesses.filter {
-                $0 == foregroundGroup && processGroups[$0] == foregroundGroup
-            }
-            if foregroundLeaders.count == 1 {
-                return foregroundLeaders.first
-            }
-        }
         let sessionLeaders = matchingProcesses.filter {
             sessions[$0] == $0
         }
@@ -300,7 +288,29 @@ public struct MacAppInventoryService: AppInventoryProviding, Sendable {
         }
         let matchingSessions = Set(matchingProcesses.compactMap { sessions[$0] })
         let descendedLeaders = matchingSessions.filter { descendants.contains($0) }
-        return descendedLeaders.count == 1 ? descendedLeaders.first : nil
+        if descendedLeaders.count == 1 {
+            return descendedLeaders.first
+        }
+
+        // A foreground job identifies the active session, but it is not a
+        // restorable tree root: the shell/session leader owns that job and any
+        // other process groups in the selected tab.
+        let foregroundGroups = Set(matchingProcesses.compactMap {
+            foregroundProcessGroups[$0]
+        }.filter { $0 > 0 })
+        guard foregroundGroups.count == 1,
+              let foregroundGroup = foregroundGroups.first else {
+            return nil
+        }
+        let foregroundSessions = Set(matchingProcesses.compactMap {
+            processGroups[$0] == foregroundGroup ? sessions[$0] : nil
+        })
+        let foregroundSessionLeaders = foregroundSessions.filter {
+            descendants.contains($0)
+        }
+        return foregroundSessionLeaders.count == 1
+            ? foregroundSessionLeaders.first
+            : nil
     }
 
     static func dependencyRoots(
