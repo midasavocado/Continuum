@@ -10,6 +10,7 @@
 #include <mach-o/dyld_images.h>
 #include <mach-o/dyld.h>
 #include <mach/thread_info.h>
+#include <mach/vm_attributes.h>
 #include <mach/vm_region.h>
 #include <mach/vm_statistics.h>
 #include <mach-o/loader.h>
@@ -90,7 +91,7 @@ typedef struct continuum_kevent_extinfo_private {
 
 enum {
     CONTINUUM_BROKER_MAGIC = 0x4342524b,
-    CONTINUUM_BROKER_VERSION = 1,
+    CONTINUUM_BROKER_VERSION = 2,
     CONTINUUM_BROKER_SETUP = 1,
     CONTINUUM_BROKER_SPAWN_CHILD = 2,
     CONTINUUM_BROKER_RELEASE = 3,
@@ -107,6 +108,12 @@ enum {
     CONTINUUM_BROKER_CHILD_ENTRY_REACHED = 14,
     CONTINUUM_BROKER_CHILD_DETACH = 15,
     CONTINUUM_BROKER_CHILD_DETACHED = 16,
+    CONTINUUM_BROKER_FOREST_RELEASE = 17,
+    CONTINUUM_BROKER_FOREST_RELEASED = 18,
+    CONTINUUM_BROKER_FOREST_SET_FOREGROUND = 19,
+    CONTINUUM_BROKER_FOREST_FOREGROUND_SET = 20,
+    CONTINUUM_BROKER_FOREST_SET_PROCESS_GROUP = 21,
+    CONTINUUM_BROKER_FOREST_PROCESS_GROUP_SET = 22,
     CONTINUUM_BROKER_MAX_REMAPS = 64,
     CONTINUUM_BROKER_MAX_ARGUMENTS = 64,
     CONTINUUM_BROKER_MAX_ENVIRONMENT = 256,
@@ -129,6 +136,7 @@ typedef struct continuum_broker_setup {
     int32_t foreground_process_group_id;
     int32_t controlling_terminal_descriptor;
     uint32_t remap_count;
+    uint32_t forest_mode;
 } continuum_broker_setup;
 
 typedef struct continuum_broker_child {
@@ -169,6 +177,32 @@ struct continuum_brokered_pair {
     uint8_t child_released;
 };
 
+enum { CONTINUUM_BROKER_FOREST_MAX_PROCESSES = 32 };
+
+typedef struct continuum_brokered_forest_node {
+    int channel;
+    pid_t captured_process_id;
+    pid_t captured_parent_process_id;
+    pid_t replacement_process_id;
+    pid_t expected_replacement_parent_id;
+    pid_t session_id;
+    pid_t process_group_id;
+    uint64_t start_seconds;
+    uint64_t start_microseconds;
+    mach_port_t commit_task;
+    uint8_t is_root;
+    uint8_t traced;
+    uint8_t released;
+} continuum_brokered_forest_node;
+
+struct continuum_brokered_forest {
+    size_t process_count;
+    continuum_brokered_forest_node
+        nodes[CONTINUUM_BROKER_FOREST_MAX_PROCESSES];
+    uint8_t state;
+    uint8_t commit_suspended;
+};
+
 enum {
     CONTINUUM_BROKER_PAIR_PREPARED = 1,
     CONTINUUM_BROKER_PAIR_ENTRY_STOPPED = 2,
@@ -191,7 +225,7 @@ static continuum_status continuum_wait_for_child_signal_stop(
     uint64_t deadline,
     int expected_signal
 );
-static void continuum_broker_kill_and_reap_traced_child(
+static int continuum_broker_kill_and_reap_traced_child(
     pid_t process_id,
     uint64_t deadline
 );
@@ -370,10 +404,11 @@ static continuum_status continuum_spawn_process_suspended_internal(
     return CONTINUUM_STATUS_OK;
 }
 
-static void continuum_broker_kill_and_reap_traced_child(
+static int continuum_broker_kill_and_reap_traced_child(
     pid_t process_id,
     uint64_t deadline
 ) {
+    int terminated = 0;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     // Leave ptrace ownership while delivering SIGKILL, then reap the ordinary
@@ -388,7 +423,10 @@ static void continuum_broker_kill_and_reap_traced_child(
         pid_t waited = waitpid(
             process_id, &wait_status, WUNTRACED | WNOHANG);
         if (waited == process_id) {
-            if (WIFEXITED(wait_status) || WIFSIGNALED(wait_status)) break;
+            if (WIFEXITED(wait_status) || WIFSIGNALED(wait_status)) {
+                terminated = 1;
+                break;
+            }
             if (WIFSTOPPED(wait_status)) {
                 if (ptrace(
                         PT_DETACH,
@@ -400,6 +438,9 @@ static void continuum_broker_kill_and_reap_traced_child(
                     (void)kill(process_id, SIGKILL);
                 }
             }
+        } else if (waited < 0 && errno == ECHILD) {
+            terminated = 1;
+            break;
         } else if (waited < 0 && errno != EINTR) {
             break;
         }
@@ -407,6 +448,7 @@ static void continuum_broker_kill_and_reap_traced_child(
         usleep(1000);
     }
 #pragma clang diagnostic pop
+    return terminated;
 }
 
 continuum_status continuum_spawn_process_suspended(
@@ -711,6 +753,34 @@ static int continuum_broker_send_fds(
     return sent == 1;
 }
 
+static int continuum_broker_receive_fds(
+    int descriptor,
+    int *descriptors,
+    size_t count
+) {
+    if (count == 0) return 1;
+    char marker = 0;
+    char control[CMSG_SPACE(
+        sizeof(int) * CONTINUUM_BROKER_MAX_REMAPS)];
+    struct iovec iov = {.iov_base = &marker, .iov_len = 1};
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = (socklen_t)CMSG_SPACE(sizeof(int) * count);
+    ssize_t received;
+    do {
+        received = recvmsg(descriptor, &message, 0);
+    } while (received < 0 && errno == EINTR);
+    struct cmsghdr *entry = CMSG_FIRSTHDR(&message);
+    if (received != 1 || entry == NULL || entry->cmsg_level != SOL_SOCKET
+        || entry->cmsg_type != SCM_RIGHTS
+        || entry->cmsg_len != CMSG_LEN(sizeof(int) * count)) return 0;
+    memcpy(descriptors, CMSG_DATA(entry), sizeof(int) * count);
+    return 1;
+}
+
 static size_t continuum_broker_string_count(
     const char *const values[],
     size_t limit
@@ -822,7 +892,8 @@ static void continuum_broker_free_environment(char **environment) {
 static int continuum_broker_send_setup(
     int channel,
     const continuum_brokered_process_spec *spec,
-    int32_t mapped_process_group
+    int32_t mapped_process_group,
+    int forest_mode
 ) {
     continuum_broker_setup setup = {
         .create_session = spec->topology.create_session,
@@ -833,6 +904,7 @@ static int continuum_broker_send_setup(
         .foreground_process_group_id = spec->foreground_process_group_id,
         .controlling_terminal_descriptor = spec->topology.controlling_terminal_descriptor,
         .remap_count = (uint32_t)spec->descriptor_remap_count,
+        .forest_mode = forest_mode ? 1U : 0U,
     };
     continuum_broker_header header = {
         .magic = CONTINUUM_BROKER_MAGIC, .version = CONTINUUM_BROKER_VERSION,
@@ -1001,7 +1073,7 @@ continuum_status continuum_brokered_pair_prepare(
     }
     continuum_broker_reply root_reply;
     continuum_broker_reply child_reply;
-    int root_ready = continuum_broker_send_setup(channels[0], root, 0)
+    int root_ready = continuum_broker_send_setup(channels[0], root, 0, 0)
         && continuum_broker_receive_reply(channels[0], CONTINUUM_BROKER_READY, &root_reply)
         && root_reply.process_id == root_pid
         && root_reply.parent_process_id == getpid();
@@ -1131,6 +1203,836 @@ static continuum_status continuum_broker_wait_for_stop(
         }
         usleep(1000);
     }
+}
+
+static ssize_t continuum_broker_forest_find_captured(
+    const continuum_brokered_forest *forest,
+    pid_t captured_process_id
+) {
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        if (forest->nodes[index].captured_process_id
+            == captured_process_id) return (ssize_t)index;
+    }
+    return -1;
+}
+
+static int continuum_broker_forest_spawn_root(
+    const char *bootstrap_library_path,
+    const continuum_brokered_process_spec *root,
+    int *out_channel,
+    continuum_broker_reply *out_reply
+) {
+    int channels[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0) return 0;
+    int highest_target = channels[0];
+    for (size_t index = 0; index < root->descriptor_remap_count; index += 1) {
+        if (root->descriptor_remaps[index].target_descriptor
+            > highest_target) {
+            highest_target = root->descriptor_remaps[index].target_descriptor;
+        }
+    }
+    int safe = fcntl(
+        channels[1], F_DUPFD_CLOEXEC, highest_target + 1);
+    if (safe < 0) {
+        close(channels[0]); close(channels[1]);
+        return 0;
+    }
+    close(channels[1]);
+    channels[1] = safe;
+    char **environment = continuum_broker_launch_environment(
+        root->environment, bootstrap_library_path, channels[1]);
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    int actions_initialized = 0;
+    int attributes_initialized = 0;
+    int error = environment == NULL
+        ? ENOMEM : posix_spawn_file_actions_init(&actions);
+    actions_initialized = error == 0;
+    if (error == 0) {
+        error = posix_spawn_file_actions_addchdir_np(
+            &actions, root->working_directory);
+    }
+    if (error == 0) {
+        error = posix_spawn_file_actions_addinherit_np(
+            &actions, channels[1]);
+    }
+    if (error == 0) {
+        error = posix_spawnattr_init(&attributes);
+        attributes_initialized = error == 0;
+    }
+    if (error == 0) {
+        short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+        if (root->disable_aslr) flags |= CONTINUUM_POSIX_SPAWN_DISABLE_ASLR;
+        error = posix_spawnattr_setflags(&attributes, flags);
+    }
+    pid_t root_pid = 0;
+    if (error == 0) {
+        error = posix_spawn(
+            &root_pid, root->executable_path, &actions, &attributes,
+            (char *const *)root->arguments, environment);
+    }
+    if (environment != NULL) continuum_broker_free_environment(environment);
+    if (attributes_initialized) posix_spawnattr_destroy(&attributes);
+    if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
+    close(channels[1]);
+    if (error != 0 || root_pid <= 0
+        || !continuum_broker_send_setup(channels[0], root, 0, 1)
+        || !continuum_broker_receive_reply(
+            channels[0], CONTINUUM_BROKER_READY, out_reply)
+        || out_reply->process_id != root_pid
+        || out_reply->parent_process_id != getpid()) {
+        if (root_pid > 0) {
+            kill(root_pid, SIGKILL);
+            waitpid(root_pid, NULL, 0);
+        }
+        close(channels[0]);
+        return 0;
+    }
+    *out_channel = channels[0];
+    return 1;
+}
+
+static int continuum_broker_forest_node_liveness(
+    const continuum_brokered_forest_node *node
+) {
+    struct proc_bsdinfo info;
+    memset(&info, 0, sizeof(info));
+    int copied = proc_pidinfo(
+        node->replacement_process_id,
+        PROC_PIDTBSDINFO,
+        0,
+        &info,
+        (int)sizeof(info));
+    if (copied != (int)sizeof(info)
+        || info.pbi_uid != geteuid()
+        || info.pbi_start_tvsec != node->start_seconds
+        || info.pbi_start_tvusec != node->start_microseconds
+        || info.pbi_status == SZOMB) return 0;
+    return info.pbi_ppid == (uint32_t)node->expected_replacement_parent_id
+        ? 1 : -1;
+}
+
+static int continuum_broker_forest_exact_identity_is_absent(
+    const continuum_brokered_forest_node *node
+) {
+    struct proc_bsdinfo info;
+    memset(&info, 0, sizeof(info));
+    int copied = proc_pidinfo(
+        node->replacement_process_id,
+        PROC_PIDTBSDINFO,
+        0,
+        &info,
+        (int)sizeof(info));
+    if (copied != (int)sizeof(info)) {
+        errno = 0;
+        return kill(node->replacement_process_id, 0) != 0 && errno == ESRCH;
+    }
+    return info.pbi_uid != geteuid()
+        || info.pbi_start_tvsec != node->start_seconds
+        || info.pbi_start_tvusec != node->start_microseconds;
+}
+
+static int continuum_broker_wait_for_forest_node_termination(
+    const continuum_brokered_forest_node *node,
+    uint64_t deadline
+) {
+    for (;;) {
+        if (node->is_root) {
+            pid_t waited = waitpid(
+                node->replacement_process_id, NULL, WNOHANG);
+            if (waited == node->replacement_process_id
+                || (waited < 0 && errno == ECHILD)) return 1;
+            if (waited < 0 && errno != EINTR) return -1;
+        } else {
+            int liveness = continuum_broker_forest_node_liveness(node);
+            if (liveness <= 0) return liveness == 0 ? 1 : -1;
+        }
+        if (clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) return 0;
+        usleep(1000);
+    }
+}
+
+static continuum_status continuum_broker_forest_abort_prepared(
+    continuum_brokered_forest *forest,
+    uint32_t timeout_milliseconds
+) {
+    uint64_t timeout_nanoseconds =
+        (uint64_t)timeout_milliseconds * UINT64_C(1000000);
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+        + timeout_nanoseconds;
+    continuum_broker_header abort_header = {
+        .magic = CONTINUUM_BROKER_MAGIC,
+        .version = CONTINUUM_BROKER_VERSION,
+        .type = CONTINUUM_BROKER_ABORT,
+        .payload_length = 0,
+    };
+    for (size_t index = forest->process_count; index > 0; index -= 1) {
+        continuum_brokered_forest_node *node = &forest->nodes[index - 1];
+        int abort_sent = node->channel < 0;
+        if (node->channel >= 0) {
+            abort_sent = continuum_broker_write_all(
+                node->channel, &abort_header, sizeof(abort_header));
+            close(node->channel);
+            node->channel = -1;
+        }
+        if (node->replacement_process_id <= 0) continue;
+        int terminated = abort_sent
+            ? continuum_broker_wait_for_forest_node_termination(node, deadline)
+            : 0;
+        if (terminated > 0) continue;
+        if (terminated < 0) return CONTINUUM_STATUS_ROLLBACK_FAILED;
+
+        int liveness = continuum_broker_forest_node_liveness(node);
+        if (liveness < 0) return CONTINUUM_STATUS_ROLLBACK_FAILED;
+        if (liveness > 0
+            && kill(node->replacement_process_id, SIGKILL) != 0
+            && errno != ESRCH) {
+            return CONTINUUM_STATUS_ROLLBACK_FAILED;
+        }
+        uint64_t force_deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+            + timeout_nanoseconds;
+        if (continuum_broker_wait_for_forest_node_termination(
+                node, force_deadline) <= 0) {
+            return CONTINUUM_STATUS_ROLLBACK_FAILED;
+        }
+    }
+    uint64_t verification_deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+        + timeout_nanoseconds;
+    for (;;) {
+        int every_identity_absent = 1;
+        for (size_t index = 0; index < forest->process_count; index += 1) {
+            if (!continuum_broker_forest_exact_identity_is_absent(
+                    &forest->nodes[index])) {
+                every_identity_absent = 0;
+                break;
+            }
+        }
+        if (every_identity_absent) return CONTINUUM_STATUS_OK;
+        if (clock_gettime_nsec_np(CLOCK_MONOTONIC) >= verification_deadline) {
+            return CONTINUUM_STATUS_ROLLBACK_FAILED;
+        }
+        usleep(1000);
+    }
+}
+
+static continuum_status continuum_broker_forest_fail_prepare(
+    continuum_brokered_forest *forest,
+    continuum_brokered_forest **out_forest,
+    continuum_status preparation_status
+) {
+    continuum_status rollback_status =
+        continuum_broker_forest_abort_prepared(forest, 2000);
+    if (rollback_status == CONTINUUM_STATUS_OK) {
+        free(forest);
+        return preparation_status;
+    }
+    forest->state = CONTINUUM_BROKER_PAIR_PREPARED;
+    *out_forest = forest;
+    return CONTINUUM_STATUS_ROLLBACK_FAILED;
+}
+
+continuum_status continuum_brokered_forest_prepare(
+    const char *bootstrap_library_path,
+    const continuum_brokered_process_spec *processes,
+    size_t process_count,
+    continuum_brokered_forest **out_forest
+) {
+    if (out_forest == NULL) return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    *out_forest = NULL;
+    struct stat bootstrap_stat;
+    if (bootstrap_library_path == NULL
+        || bootstrap_library_path[0] == '\0'
+        || stat(bootstrap_library_path, &bootstrap_stat) != 0
+        || !S_ISREG(bootstrap_stat.st_mode)
+        || processes == NULL || process_count == 0
+        || process_count > CONTINUUM_BROKER_FOREST_MAX_PROCESSES) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    for (size_t index = 0; index < process_count; index += 1) {
+        if (processes[index].captured_parent_process_id <= 0) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+        for (size_t other = index + 1; other < process_count; other += 1) {
+            if (processes[index].captured_process_id
+                == processes[other].captured_process_id) {
+                return CONTINUUM_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    continuum_brokered_forest *forest = calloc(1, sizeof(*forest));
+    if (forest == NULL) return CONTINUUM_STATUS_OUT_OF_MEMORY;
+    for (size_t index = 0; index < CONTINUUM_BROKER_FOREST_MAX_PROCESSES;
+         index += 1) forest->nodes[index].channel = -1;
+    uint8_t added[CONTINUUM_BROKER_FOREST_MAX_PROCESSES] = {0};
+    while (forest->process_count < process_count) {
+        size_t before = forest->process_count;
+        for (size_t source = 0; source < process_count; source += 1) {
+            if (added[source]) continue;
+            ssize_t input_parent = -1;
+            for (size_t candidate = 0; candidate < process_count;
+                 candidate += 1) {
+                if (processes[candidate].captured_process_id
+                    == processes[source].captured_parent_process_id) {
+                    input_parent = (ssize_t)candidate;
+                    break;
+                }
+            }
+            ssize_t prepared_parent = continuum_broker_forest_find_captured(
+                forest, processes[source].captured_parent_process_id);
+            int is_root = input_parent < 0;
+            if (!is_root && prepared_parent < 0) continue;
+            if (!continuum_broker_validate_spec(&processes[source], is_root)
+                || (is_root
+                    && (!processes[source].topology.create_session
+                        || processes[source].topology.process_group_policy
+                            != CONTINUUM_SPAWN_PROCESS_GROUP_CREATE))) {
+                return continuum_broker_forest_fail_prepare(
+                    forest, out_forest, CONTINUUM_STATUS_INVALID_ARGUMENT);
+            }
+            continuum_brokered_process_spec mapped = processes[source];
+            if (!is_root && mapped.topology.process_group_policy
+                == CONTINUUM_SPAWN_PROCESS_GROUP_JOIN) {
+                mapped.topology.process_group_policy =
+                    CONTINUUM_SPAWN_PROCESS_GROUP_INHERIT;
+                mapped.topology.process_group_id = 0;
+            }
+            int channel = -1;
+            continuum_broker_reply reply;
+            memset(&reply, 0, sizeof(reply));
+            int ready = 0;
+            if (is_root) {
+                ready = continuum_broker_forest_spawn_root(
+                    bootstrap_library_path, &mapped, &channel, &reply);
+            } else {
+                continuum_brokered_forest_node *parent =
+                    &forest->nodes[prepared_parent];
+                ready = continuum_broker_send_child(
+                        parent->channel, bootstrap_library_path, &mapped)
+                    && continuum_broker_receive_reply(
+                        parent->channel,
+                        CONTINUUM_BROKER_CHILD_READY,
+                        &reply)
+                    && continuum_broker_receive_fds(
+                        parent->channel, &channel, 1)
+                    && reply.parent_process_id
+                        == parent->replacement_process_id
+                    && reply.process_id > 0;
+            }
+            if (!ready) {
+                if (channel >= 0) close(channel);
+                return continuum_broker_forest_fail_prepare(
+                    forest, out_forest, CONTINUUM_STATUS_SPAWN_FAILED);
+            }
+            struct proc_bsdinfo info;
+            memset(&info, 0, sizeof(info));
+            pid_t expected_parent = is_root
+                ? getpid()
+                : forest->nodes[prepared_parent].replacement_process_id;
+            if (proc_pidinfo(
+                    reply.process_id, PROC_PIDTBSDINFO, 0,
+                    &info, (int)sizeof(info)) != (int)sizeof(info)
+                || info.pbi_ppid != (uint32_t)expected_parent
+                || getsid(reply.process_id) != reply.session_id
+                || getpgid(reply.process_id) != reply.process_group_id) {
+                close(channel);
+                return continuum_broker_forest_fail_prepare(
+                    forest,
+                    out_forest,
+                    CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED);
+            }
+            continuum_brokered_forest_node *node =
+                &forest->nodes[forest->process_count++];
+            node->channel = channel;
+            node->captured_process_id = mapped.captured_process_id;
+            node->captured_parent_process_id =
+                mapped.captured_parent_process_id;
+            node->replacement_process_id = reply.process_id;
+            node->expected_replacement_parent_id = expected_parent;
+            node->session_id = reply.session_id;
+            node->process_group_id = reply.process_group_id;
+            node->start_seconds = info.pbi_start_tvsec;
+            node->start_microseconds = info.pbi_start_tvusec;
+            node->is_root = is_root ? 1 : 0;
+            added[source] = 1;
+        }
+        if (forest->process_count == before) {
+            return continuum_broker_forest_fail_prepare(
+                forest, out_forest, CONTINUUM_STATUS_INVALID_ARGUMENT);
+        }
+    }
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        const continuum_brokered_process_spec *captured = NULL;
+        for (size_t source = 0; source < process_count; source += 1) {
+            if (processes[source].captured_process_id
+                == forest->nodes[index].captured_process_id) {
+                captured = &processes[source];
+                break;
+            }
+        }
+        if (captured == NULL) {
+            return continuum_broker_forest_fail_prepare(
+                forest, out_forest, CONTINUUM_STATUS_INVALID_ARGUMENT);
+        }
+        if (captured->topology.process_group_policy
+            != CONTINUUM_SPAWN_PROCESS_GROUP_JOIN) continue;
+        ssize_t leader = continuum_broker_forest_find_captured(
+            forest, captured->topology.process_group_id);
+        if (leader < 0) {
+            return continuum_broker_forest_fail_prepare(
+                forest, out_forest, CONTINUUM_STATUS_INVALID_ARGUMENT);
+        }
+        int32_t replacement_group =
+            forest->nodes[leader].replacement_process_id;
+        continuum_broker_header header = {
+            .magic = CONTINUUM_BROKER_MAGIC,
+            .version = CONTINUUM_BROKER_VERSION,
+            .type = CONTINUUM_BROKER_FOREST_SET_PROCESS_GROUP,
+            .payload_length = sizeof(replacement_group),
+        };
+        continuum_broker_reply group_reply;
+        if (!continuum_broker_write_all(
+                forest->nodes[index].channel, &header, sizeof(header))
+            || !continuum_broker_write_all(
+                forest->nodes[index].channel,
+                &replacement_group,
+                sizeof(replacement_group))
+            || !continuum_broker_receive_reply(
+                forest->nodes[index].channel,
+                CONTINUUM_BROKER_FOREST_PROCESS_GROUP_SET,
+                &group_reply)
+            || group_reply.process_group_id != replacement_group) {
+            return continuum_broker_forest_fail_prepare(
+                forest, out_forest, CONTINUUM_STATUS_SPAWN_FAILED);
+        }
+        forest->nodes[index].process_group_id = replacement_group;
+    }
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        const continuum_brokered_process_spec *captured = NULL;
+        for (size_t source = 0; source < process_count; source += 1) {
+            if (processes[source].captured_process_id
+                == forest->nodes[index].captured_process_id) {
+                captured = &processes[source];
+                break;
+            }
+        }
+        if (captured == NULL
+            || captured->topology.controlling_terminal_descriptor < 0) {
+            continue;
+        }
+        ssize_t foreground = continuum_broker_forest_find_captured(
+            forest, captured->foreground_process_group_id);
+        if (foreground < 0) {
+            return continuum_broker_forest_fail_prepare(
+                forest, out_forest, CONTINUUM_STATUS_INVALID_ARGUMENT);
+        }
+        int32_t replacement_group =
+            forest->nodes[foreground].replacement_process_id;
+        continuum_broker_header header = {
+            .magic = CONTINUUM_BROKER_MAGIC,
+            .version = CONTINUUM_BROKER_VERSION,
+            .type = CONTINUUM_BROKER_FOREST_SET_FOREGROUND,
+            .payload_length = sizeof(replacement_group),
+        };
+        continuum_broker_reply foreground_reply;
+        if (!continuum_broker_write_all(
+                forest->nodes[index].channel, &header, sizeof(header))
+            || !continuum_broker_write_all(
+                forest->nodes[index].channel,
+                &replacement_group,
+                sizeof(replacement_group))
+            || !continuum_broker_receive_reply(
+                forest->nodes[index].channel,
+                CONTINUUM_BROKER_FOREST_FOREGROUND_SET,
+                &foreground_reply)) {
+            return continuum_broker_forest_fail_prepare(
+                forest, out_forest, CONTINUUM_STATUS_SPAWN_FAILED);
+        }
+    }
+    forest->state = CONTINUUM_BROKER_PAIR_PREPARED;
+    *out_forest = forest;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_brokered_forest_process_identities(
+    const continuum_brokered_forest *forest,
+    continuum_brokered_process_identity *identities,
+    size_t identity_capacity,
+    size_t *out_identity_count
+) {
+    if (forest == NULL || out_identity_count == NULL
+        || (identity_capacity > 0 && identities == NULL)) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_identity_count = forest->process_count;
+    if (identity_capacity < forest->process_count) {
+        return CONTINUUM_STATUS_RANGE_ERROR;
+    }
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        identities[index] = (continuum_brokered_process_identity){
+            .captured_process_id = forest->nodes[index].captured_process_id,
+            .replacement_process_id = forest->nodes[index].replacement_process_id,
+            .replacement_parent_process_id =
+                forest->nodes[index].expected_replacement_parent_id,
+            .replacement_session_id = forest->nodes[index].session_id,
+            .replacement_process_group_id = forest->nodes[index].process_group_id,
+        };
+    }
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_brokered_forest_advance_to_entry_stops(
+    continuum_brokered_forest *forest,
+    uint32_t timeout_milliseconds
+) {
+    if (forest == NULL || timeout_milliseconds == 0
+        || forest->state != CONTINUUM_BROKER_PAIR_PREPARED) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    uint64_t span = (uint64_t)timeout_milliseconds * UINT64_C(1000000);
+    if (UINT64_MAX - now < span) return CONTINUUM_STATUS_RANGE_ERROR;
+    uint64_t deadline = now + span;
+    continuum_status status = CONTINUUM_STATUS_OK;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    for (size_t position = forest->process_count;
+         status == CONTINUUM_STATUS_OK && position > 0;
+         position -= 1) {
+        continuum_brokered_forest_node *node = &forest->nodes[position - 1];
+        if (!continuum_broker_process_matches(
+                node->replacement_process_id,
+                node->expected_replacement_parent_id,
+                node->start_seconds,
+                node->start_microseconds,
+                0)) {
+            status = CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+            break;
+        }
+        struct timeval receive_timeout = {
+            .tv_sec = (time_t)(timeout_milliseconds / 1000),
+            .tv_usec =
+                (suseconds_t)(timeout_milliseconds % 1000) * 1000,
+        };
+        if (setsockopt(
+                node->channel, SOL_SOCKET, SO_RCVTIMEO,
+                &receive_timeout, sizeof(receive_timeout)) != 0
+            || ptrace(
+                PT_ATTACH, node->replacement_process_id, NULL, 0) != 0) {
+            status = CONTINUUM_STATUS_ACCESS_DENIED;
+            break;
+        }
+        node->traced = 1;
+        status = continuum_wait_for_child_signal_stop(
+            node->replacement_process_id, deadline, SIGSTOP);
+        continuum_broker_header release = {
+            .magic = CONTINUUM_BROKER_MAGIC,
+            .version = CONTINUUM_BROKER_VERSION,
+            .type = CONTINUUM_BROKER_FOREST_RELEASE,
+            .payload_length = 0,
+        };
+        if (status == CONTINUUM_STATUS_OK
+            && (!continuum_broker_write_all(
+                    node->channel, &release, sizeof(release))
+                || ptrace(
+                    PT_CONTINUE,
+                    node->replacement_process_id,
+                    (caddr_t)1,
+                    0) != 0)) {
+            status = CONTINUUM_STATUS_RESUME_FAILED;
+        }
+        continuum_broker_reply reply;
+        if (status == CONTINUUM_STATUS_OK
+            && !continuum_broker_receive_reply(
+                node->channel,
+                CONTINUUM_BROKER_FOREST_RELEASED,
+                &reply)) {
+            status = CONTINUUM_STATUS_SPAWN_FAILED;
+        }
+        if (node->channel >= 0) {
+            close(node->channel);
+            node->channel = -1;
+        }
+        if (status == CONTINUUM_STATUS_OK) {
+            status = continuum_wait_for_child_signal_stop(
+                node->replacement_process_id, deadline, SIGSTOP);
+        }
+        if (status == CONTINUUM_STATUS_OK) {
+            uint64_t current = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+            uint64_t remaining = deadline > current ? deadline - current : 0;
+            status = remaining == 0
+                ? CONTINUUM_STATUS_SUSPEND_FAILED
+                : continuum_advance_bootstrap_stopped_process_to_entry(
+                    node->replacement_process_id,
+                    (uint32_t)(remaining / UINT64_C(1000000) + 1),
+                    1,
+                    -1);
+        }
+    }
+    for (size_t position = forest->process_count;
+         status == CONTINUUM_STATUS_OK && position > 0;
+         position -= 1) {
+        continuum_brokered_forest_node *node = &forest->nodes[position - 1];
+        if (!node->traced
+            || kill(node->replacement_process_id, SIGSTOP) != 0
+            || ptrace(
+                PT_DETACH,
+                node->replacement_process_id,
+                (caddr_t)1,
+                0) != 0) {
+            status = CONTINUUM_STATUS_RESUME_FAILED;
+            break;
+        }
+        node->traced = 0;
+        for (;;) {
+            struct proc_bsdinfo info;
+            memset(&info, 0, sizeof(info));
+            int copied = proc_pidinfo(
+                node->replacement_process_id,
+                PROC_PIDTBSDINFO,
+                0,
+                &info,
+                (int)sizeof(info));
+            if (copied == (int)sizeof(info)
+                && info.pbi_status == SSTOP) break;
+            if (copied != (int)sizeof(info)
+                || clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) {
+                status = CONTINUUM_STATUS_SUSPEND_FAILED;
+                break;
+            }
+            usleep(1000);
+        }
+    }
+#pragma clang diagnostic pop
+    for (size_t index = 0;
+         status == CONTINUUM_STATUS_OK && index < forest->process_count;
+         index += 1) {
+        continuum_brokered_forest_node *node = &forest->nodes[index];
+        if (!continuum_broker_process_matches(
+                node->replacement_process_id,
+                node->expected_replacement_parent_id,
+                node->start_seconds,
+                node->start_microseconds,
+                1)
+            || getsid(node->replacement_process_id) != node->session_id
+            || getpgid(node->replacement_process_id)
+                != node->process_group_id) {
+            status = CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+        }
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        forest->state = CONTINUUM_BROKER_PAIR_FAILED;
+        (void)continuum_brokered_forest_abort(forest, 2000);
+        return status;
+    }
+    forest->state = CONTINUUM_BROKER_PAIR_ENTRY_STOPPED;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_brokered_forest_note_released_process(
+    continuum_brokered_forest *forest,
+    int32_t replacement_process_id
+) {
+    if (forest == NULL
+        || forest->state != CONTINUUM_BROKER_PAIR_ENTRY_STOPPED) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        if (forest->nodes[index].replacement_process_id
+            == replacement_process_id) {
+            if (forest->nodes[index].released) {
+                return CONTINUUM_STATUS_INVALID_ARGUMENT;
+            }
+            forest->nodes[index].released = 1;
+            return CONTINUUM_STATUS_OK;
+        }
+    }
+    return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+}
+
+continuum_status continuum_brokered_forest_begin_commit(
+    continuum_brokered_forest *forest
+) {
+    if (forest == NULL
+        || forest->state != CONTINUUM_BROKER_PAIR_ENTRY_STOPPED
+        || forest->commit_suspended) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    size_t suspended = 0;
+    continuum_status status = CONTINUUM_STATUS_OK;
+    for (; suspended < forest->process_count; suspended += 1) {
+        continuum_brokered_forest_node *node = &forest->nodes[suspended];
+        struct proc_bsdinfo info;
+        memset(&info, 0, sizeof(info));
+        if (proc_pidinfo(
+                node->replacement_process_id,
+                PROC_PIDTBSDINFO,
+                0,
+                &info,
+                (int)sizeof(info)) != (int)sizeof(info)
+            || info.pbi_uid != geteuid()
+            || info.pbi_start_tvsec != node->start_seconds
+            || info.pbi_start_tvusec != node->start_microseconds) {
+            status = CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+            break;
+        }
+        mach_port_t task = MACH_PORT_NULL;
+        kern_return_t result = task_for_pid(
+            mach_task_self(), node->replacement_process_id, &task);
+        if (result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_ACCESS_DENIED;
+            break;
+        }
+        result = task_suspend(task);
+        if (result != KERN_SUCCESS) {
+            mach_port_deallocate(mach_task_self(), task);
+            status = CONTINUUM_STATUS_SUSPEND_FAILED;
+            break;
+        }
+        node->commit_task = task;
+    }
+    if (status != CONTINUUM_STATUS_OK) {
+        while (suspended > 0) {
+            suspended -= 1;
+            continuum_brokered_forest_node *node =
+                &forest->nodes[suspended];
+            if (node->commit_task != MACH_PORT_NULL) {
+                (void)task_resume(node->commit_task);
+                mach_port_deallocate(
+                    mach_task_self(), node->commit_task);
+                node->commit_task = MACH_PORT_NULL;
+            }
+        }
+        return status;
+    }
+    forest->commit_suspended = 1;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_brokered_forest_finish(
+    continuum_brokered_forest *forest
+) {
+    if (forest == NULL
+        || forest->state != CONTINUUM_BROKER_PAIR_ENTRY_STOPPED) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        if (!forest->nodes[index].released) {
+            return CONTINUUM_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if (!forest->commit_suspended) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    for (size_t index = forest->process_count; index > 0; index -= 1) {
+        continuum_brokered_forest_node *node = &forest->nodes[index - 1];
+        if (node->commit_task == MACH_PORT_NULL
+            || task_resume(node->commit_task) != KERN_SUCCESS) {
+            return CONTINUUM_STATUS_RESUME_FAILED;
+        }
+        mach_port_deallocate(mach_task_self(), node->commit_task);
+        node->commit_task = MACH_PORT_NULL;
+    }
+    free(forest);
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_brokered_forest_abort(
+    continuum_brokered_forest *forest,
+    uint32_t timeout_milliseconds
+) {
+    if (forest == NULL || timeout_milliseconds == 0) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+        + (uint64_t)timeout_milliseconds * UINT64_C(1000000);
+    if (forest->state == CONTINUUM_BROKER_PAIR_PREPARED) {
+        continuum_status status = continuum_broker_forest_abort_prepared(
+            forest, timeout_milliseconds);
+        if (status == CONTINUUM_STATUS_OK) free(forest);
+        return status;
+    }
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        if (forest->nodes[index].channel >= 0) {
+            close(forest->nodes[index].channel);
+            forest->nodes[index].channel = -1;
+        }
+    }
+    int cleanup_failed = 0;
+    for (size_t position = forest->process_count; position > 0;
+         position -= 1) {
+        continuum_brokered_forest_node *node = &forest->nodes[position - 1];
+        int intended = continuum_broker_process_matches(
+            node->replacement_process_id,
+            node->expected_replacement_parent_id,
+            node->start_seconds,
+            node->start_microseconds,
+            0);
+        int traced_to_controller = continuum_broker_process_matches(
+            node->replacement_process_id,
+            getpid(),
+            node->start_seconds,
+            node->start_microseconds,
+            0);
+        if (!intended && !traced_to_controller) {
+            if (!continuum_broker_forest_exact_identity_is_absent(node)) {
+                if (node->commit_task == MACH_PORT_NULL
+                    || task_terminate(node->commit_task) != KERN_SUCCESS) {
+                    cleanup_failed = 1;
+                }
+            }
+            continue;
+        }
+        if (traced_to_controller) {
+            if (!continuum_broker_kill_and_reap_traced_child(
+                    node->replacement_process_id, deadline)) {
+                cleanup_failed = 1;
+            }
+        } else {
+            if (node->commit_task != MACH_PORT_NULL) {
+                kern_return_t terminated = task_terminate(node->commit_task);
+                if (terminated != KERN_SUCCESS
+                    && kill(node->replacement_process_id, SIGKILL) != 0
+                    && errno != ESRCH) {
+                    cleanup_failed = 1;
+                }
+            } else if (kill(node->replacement_process_id, SIGKILL) != 0
+                && errno != ESRCH) {
+                cleanup_failed = 1;
+            }
+        }
+    }
+
+    int every_identity_absent = 0;
+    while (clock_gettime_nsec_np(CLOCK_MONOTONIC) < deadline) {
+        every_identity_absent = 1;
+        for (size_t index = 0; index < forest->process_count; index += 1) {
+            continuum_brokered_forest_node *node = &forest->nodes[index];
+            if (node->is_root) {
+                pid_t waited = waitpid(
+                    node->replacement_process_id, NULL, WNOHANG);
+                if (waited < 0 && errno != EINTR && errno != ECHILD) {
+                    cleanup_failed = 1;
+                }
+            }
+            if (!continuum_broker_forest_exact_identity_is_absent(node)) {
+                every_identity_absent = 0;
+            }
+        }
+        if (every_identity_absent) break;
+        usleep(1000);
+    }
+    if (!every_identity_absent || cleanup_failed) {
+        return CONTINUUM_STATUS_ROLLBACK_FAILED;
+    }
+    for (size_t index = 0; index < forest->process_count; index += 1) {
+        if (forest->nodes[index].commit_task != MACH_PORT_NULL) {
+            mach_port_deallocate(
+                mach_task_self(), forest->nodes[index].commit_task);
+            forest->nodes[index].commit_task = MACH_PORT_NULL;
+        }
+    }
+    free(forest);
+    return CONTINUUM_STATUS_OK;
 }
 
 static continuum_status continuum_broker_send_empty_command(
@@ -3832,6 +4734,145 @@ static continuum_status continuum_wait_for_child_signal_stop(
     }
 }
 
+#if defined(__arm64__)
+static continuum_status continuum_write_arm64_entry_instruction(
+    mach_port_t task,
+    mach_vm_address_t address,
+    uint32_t instruction,
+    vm_prot_t *inout_original_protection,
+    int *out_memory_changed
+) {
+    if (task == MACH_PORT_NULL || address == 0
+        || (address & UINT64_C(3)) != 0
+        || inout_original_protection == NULL
+        || out_memory_changed == NULL) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    *out_memory_changed = 0;
+
+    mach_vm_address_t region_address = address;
+    mach_vm_size_t region_length = 0;
+    vm_region_submap_info_data_64_t region_info;
+    natural_t depth = 0;
+    kern_return_t result;
+    for (;;) {
+        memset(&region_info, 0, sizeof(region_info));
+        mach_msg_type_number_t region_info_count =
+            VM_REGION_SUBMAP_INFO_COUNT_64;
+        result = mach_vm_region_recurse(
+            task,
+            &region_address,
+            &region_length,
+            &depth,
+            (vm_region_recurse_info_t)&region_info,
+            &region_info_count
+        );
+        if (result != KERN_SUCCESS || !region_info.is_submap) {
+            break;
+        }
+        depth += 1;
+    }
+    uint64_t region_end = 0;
+    if (result != KERN_SUCCESS) {
+        return CONTINUUM_STATUS_MACH_ERROR;
+    }
+    if (region_address > address || region_length < sizeof(instruction)
+        || !continuum_add_u64(region_address, region_length, &region_end)
+        || address > region_end - sizeof(instruction)
+        || (region_info.protection & VM_PROT_READ) == 0) {
+        return CONTINUUM_STATUS_REGION_UNMAPPED;
+    }
+
+    vm_prot_t current_protection = region_info.protection;
+    if (*inout_original_protection == VM_PROT_NONE) {
+        *inout_original_protection = current_protection;
+    }
+    vm_prot_t original_protection = *inout_original_protection;
+    int protection_changed =
+        (current_protection & VM_PROT_ALL)
+            != (VM_PROT_READ | VM_PROT_WRITE);
+    int must_restore_original_protection =
+        (current_protection & VM_PROT_ALL)
+            != (original_protection & VM_PROT_ALL);
+    if (protection_changed
+        || must_restore_original_protection) {
+        result = mach_vm_protect(
+            task,
+            address,
+            sizeof(instruction),
+            FALSE,
+            VM_PROT_READ | VM_PROT_WRITE
+        );
+        if (result != KERN_SUCCESS) {
+            result = mach_vm_protect(
+                task,
+                address,
+                sizeof(instruction),
+                FALSE,
+                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY
+            );
+        }
+        if (result != KERN_SUCCESS) {
+            return CONTINUUM_STATUS_REGION_PROTECTION_CHANGED;
+        }
+    }
+
+    continuum_status status = CONTINUUM_STATUS_OK;
+    result = mach_vm_write(
+        task,
+        address,
+        (vm_offset_t)(uintptr_t)&instruction,
+        (mach_msg_type_number_t)sizeof(instruction)
+    );
+    if (result != KERN_SUCCESS) {
+        status = CONTINUUM_STATUS_SHORT_WRITE;
+    } else {
+        *out_memory_changed = 1;
+        vm_machine_attribute_val_t cache_operation =
+            MATTR_VAL_CACHE_FLUSH;
+        result = vm_machine_attribute(
+            task,
+            (vm_address_t)address,
+            (vm_size_t)sizeof(instruction),
+            MATTR_CACHE,
+            &cache_operation
+        );
+        if (result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_MACH_ERROR;
+        }
+    }
+
+    if (status == CONTINUUM_STATUS_OK) {
+        uint32_t verified_instruction = 0;
+        continuum_status read_status = continuum_read_task_bytes(
+            task,
+            address,
+            sizeof(verified_instruction),
+            &verified_instruction
+        );
+        if (read_status != CONTINUUM_STATUS_OK) {
+            status = read_status;
+        } else if (verified_instruction != instruction) {
+            status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+    }
+
+    if (protection_changed || must_restore_original_protection) {
+        result = mach_vm_protect(
+            task,
+            address,
+            sizeof(instruction),
+            FALSE,
+            original_protection
+        );
+        if (result != KERN_SUCCESS) {
+            status = CONTINUUM_STATUS_REGION_PROTECTION_CHANGED;
+        }
+    }
+    return status;
+}
+#endif
+
 static continuum_status continuum_advance_bootstrap_stopped_process_to_entry(
     int32_t process_id,
     uint32_t timeout_milliseconds,
@@ -3914,39 +4955,24 @@ static continuum_status continuum_advance_bootstrap_stopped_process_to_entry(
             : CONTINUUM_STATUS_THREAD_STATE_FAILED;
     }
 
-    arm_debug_state64_t debug_state;
-    memset(&debug_state, 0, sizeof(debug_state));
-    mach_msg_type_number_t debug_count = ARM_DEBUG_STATE64_COUNT;
-    result = thread_get_state(
-        threads[0],
-        ARM_DEBUG_STATE64,
-        (thread_state_t)&debug_state,
-        &debug_count
+    uint32_t original_instruction = 0;
+    status = continuum_read_task_bytes(
+        task,
+        entry_address,
+        sizeof(original_instruction),
+        &original_instruction
     );
-    size_t breakpoint_slot = 16;
-    if (result == KERN_SUCCESS) {
-        for (size_t slot = 0; slot < 16; slot += 1) {
-            if ((debug_state.__bcr[slot] & UINT64_C(1)) == 0) {
-                breakpoint_slot = slot;
-                break;
-            }
-        }
-    }
-    if (result != KERN_SUCCESS || breakpoint_slot == 16) {
-        status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
-    } else {
-        debug_state.__bvr[breakpoint_slot] =
-            entry_address & UINT64_C(0xFFFFFFFFFFFFFFFC);
-        debug_state.__bcr[breakpoint_slot] = UINT64_C(0x1E5);
-        result = thread_set_state(
-            threads[0],
-            ARM_DEBUG_STATE64,
-            (thread_state_t)&debug_state,
-            ARM_DEBUG_STATE64_COUNT
+    int breakpoint_memory_changed = 0;
+    vm_prot_t original_entry_protection = VM_PROT_NONE;
+    if (status == CONTINUUM_STATUS_OK) {
+        const uint32_t arm64_brk_zero = UINT32_C(0xD4200000);
+        status = continuum_write_arm64_entry_instruction(
+            task,
+            entry_address,
+            arm64_brk_zero,
+            &original_entry_protection,
+            &breakpoint_memory_changed
         );
-        if (result != KERN_SUCCESS) {
-            status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
-        }
     }
 
     if (status == CONTINUUM_STATUS_OK && broker_channel >= 0) {
@@ -3968,19 +4994,6 @@ static continuum_status continuum_advance_bootstrap_stopped_process_to_entry(
     }
 
     if (status == CONTINUUM_STATUS_OK) {
-        debug_state.__bvr[breakpoint_slot] = 0;
-        debug_state.__bcr[breakpoint_slot] = 0;
-        result = thread_set_state(
-            threads[0],
-            ARM_DEBUG_STATE64,
-            (thread_state_t)&debug_state,
-            ARM_DEBUG_STATE64_COUNT
-        );
-        if (result != KERN_SUCCESS) {
-            status = CONTINUUM_STATUS_THREAD_STATE_FAILED;
-        }
-    }
-    if (status == CONTINUUM_STATUS_OK) {
         arm_thread_state64_t general_state;
         memset(&general_state, 0, sizeof(general_state));
         mach_msg_type_number_t general_count = ARM_THREAD_STATE64_COUNT;
@@ -3990,9 +5003,39 @@ static continuum_status continuum_advance_bootstrap_stopped_process_to_entry(
             (thread_state_t)&general_state,
             &general_count
         );
-        if (result != KERN_SUCCESS
-            || arm_thread_state64_get_pc(general_state) != entry_address) {
+        arm_exception_state64_t exception_state;
+        memset(&exception_state, 0, sizeof(exception_state));
+        mach_msg_type_number_t exception_count =
+            ARM_EXCEPTION_STATE64_COUNT;
+        kern_return_t exception_result = thread_get_state(
+            threads[0],
+            ARM_EXCEPTION_STATE64,
+            (thread_state_t)&exception_state,
+            &exception_count
+        );
+        const uint32_t arm64_brk_exception_class = UINT32_C(0x3C);
+        if (result != KERN_SUCCESS || exception_result != KERN_SUCCESS
+            || arm_thread_state64_get_pc(general_state) != entry_address
+            || ((exception_state.__esr >> 26) & UINT32_C(0x3F))
+                != arm64_brk_exception_class) {
             status = CONTINUUM_STATUS_VALIDATION_FAILED;
+        }
+    }
+    if (breakpoint_memory_changed) {
+        int original_memory_restored = 0;
+        continuum_status restore_status =
+            continuum_write_arm64_entry_instruction(
+                task,
+                entry_address,
+                original_instruction,
+                &original_entry_protection,
+                &original_memory_restored
+            );
+        if (restore_status != CONTINUUM_STATUS_OK
+            || !original_memory_restored) {
+            status = restore_status == CONTINUUM_STATUS_OK
+                ? CONTINUUM_STATUS_VALIDATION_FAILED
+                : restore_status;
         }
     }
     if (status == CONTINUUM_STATUS_OK && broker_channel >= 0) {
@@ -7131,6 +8174,78 @@ continuum_status continuum_brokered_pair_authorize_remote_session(
     session->brokered_expected_parent_process_id = expected_parent;
     session->brokered_start_seconds = start_seconds;
     session->brokered_start_microseconds = start_microseconds;
+    return CONTINUUM_STATUS_OK;
+}
+
+continuum_status continuum_brokered_forest_authorize_remote_session(
+    continuum_brokered_forest *forest,
+    continuum_remote_session *session,
+    int32_t captured_process_id
+) {
+    if (forest == NULL || session == NULL
+        || forest->state != CONTINUUM_BROKER_PAIR_ENTRY_STOPPED
+        || session->has_brokered_stop_authorization) {
+        return CONTINUUM_STATUS_INVALID_ARGUMENT;
+    }
+    ssize_t index = continuum_broker_forest_find_captured(
+        forest, captured_process_id);
+    if (index < 0) return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    continuum_brokered_forest_node *node = &forest->nodes[index];
+    if (session->identity.process_id != node->replacement_process_id
+        || session->identity.start_seconds != node->start_seconds
+        || session->identity.start_microseconds != node->start_microseconds
+        || !continuum_broker_process_matches(
+            node->replacement_process_id,
+            node->expected_replacement_parent_id,
+            node->start_seconds,
+            node->start_microseconds,
+            1)) {
+        return CONTINUUM_STATUS_PROCESS_IDENTITY_CHANGED;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    int attach_result = ptrace(
+        PT_ATTACH, node->replacement_process_id, NULL, 0);
+#pragma clang diagnostic pop
+    if (attach_result != 0) return CONTINUUM_STATUS_ACCESS_DENIED;
+    uint64_t deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC)
+        + UINT64_C(5000000000);
+    for (;;) {
+        struct proc_bsdinfo process_info;
+        memset(&process_info, 0, sizeof(process_info));
+        int copied = proc_pidinfo(
+            node->replacement_process_id,
+            PROC_PIDTBSDINFO,
+            0,
+            &process_info,
+            (int)sizeof(process_info));
+        if (copied == (int)sizeof(process_info)
+            && process_info.pbi_ppid == (uint32_t)getpid()
+            && process_info.pbi_status == SSTOP
+            && process_info.pbi_start_tvsec == node->start_seconds
+            && process_info.pbi_start_tvusec == node->start_microseconds) {
+            break;
+        }
+        if (copied != (int)sizeof(process_info)
+            || clock_gettime_nsec_np(CLOCK_MONOTONIC) >= deadline) {
+            continuum_broker_kill_and_reap_traced_child(
+                node->replacement_process_id,
+                clock_gettime_nsec_np(CLOCK_MONOTONIC)
+                    + UINT64_C(1000000000));
+            return copied == (int)sizeof(process_info)
+                ? CONTINUUM_STATUS_SUSPEND_FAILED
+                : CONTINUUM_STATUS_TARGET_EXITED;
+        }
+        usleep(1000);
+    }
+    session->replacement_stop_kind =
+        CONTINUUM_REPLACEMENT_STOP_DIRECT_PTRACE;
+    session->has_brokered_stop_authorization = 1;
+    session->owns_ptrace_attachment = 1;
+    session->brokered_expected_parent_process_id =
+        node->expected_replacement_parent_id;
+    session->brokered_start_seconds = node->start_seconds;
+    session->brokered_start_microseconds = node->start_microseconds;
     return CONTINUUM_STATUS_OK;
 }
 

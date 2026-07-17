@@ -876,6 +876,21 @@ static int run_server(target_state *target) {
 
 int main(int argc, char **argv) {
     self_executable = argv[0];
+    if (argc > 5 && strcmp(argv[1], "--continuum-forest-proof") == 0) {
+        int read_descriptor = atoi(argv[2]);
+        int write_descriptor = atoi(argv[3]);
+        int value = atoi(argv[5]);
+        int marker = open(
+            argv[4], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (marker < 0 || close(marker) != 0) return EXIT_FAILURE;
+        uint8_t byte = (uint8_t)value;
+        if (read_descriptor >= 0
+            && read(read_descriptor, &byte, 1) != 1) return EXIT_FAILURE;
+        byte += 1;
+        if (write_descriptor >= 0
+            && write(write_descriptor, &byte, 1) != 1) return EXIT_FAILURE;
+        return EXIT_SUCCESS;
+    }
     if (argc > 3
         && strcmp(argv[1], "--continuum-pipe-forest-child") == 0) {
         return run_pipe_forest_child(argv[2], argv[3]);

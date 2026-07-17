@@ -3426,6 +3426,394 @@ final class ContinuumRuntimeTests: XCTestCase {
         )
     }
 
+    func testBrokeredForestPreservesDeepMultiRootTopologyTransactionally() throws {
+        let productsURL = Bundle(for: ContinuumRuntimeTests.self).bundleURL
+            .deletingLastPathComponent()
+        let targetURL = productsURL.appendingPathComponent(
+            "ContinuumExternalTarget"
+        )
+        let bootstrapURL = productsURL.appendingPathComponent(
+            "libContinuumBootstrap.dylib"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bootstrapURL.path))
+
+        let proofRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("continuum-forest-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: proofRoot,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: proofRoot) }
+
+        var input = [Int32](repeating: -1, count: 2)
+        var first = [Int32](repeating: -1, count: 2)
+        var second = [Int32](repeating: -1, count: 2)
+        var output = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(pipe(&input), 0)
+        XCTAssertEqual(pipe(&first), 0)
+        XCTAssertEqual(pipe(&second), 0)
+        XCTAssertEqual(pipe(&output), 0)
+        let allDescriptors = input + first + second + output
+        defer { allDescriptors.forEach { if $0 >= 0 { Darwin.close($0) } } }
+
+        struct ProcessDefinition {
+            let process: Int32
+            let parent: Int32
+            let session: Int32
+            let group: Int32
+            let readSource: Int32
+            let writeSource: Int32
+            let marker: URL
+        }
+        let rootA: Int32 = 50_001
+        let a1: Int32 = 50_002
+        let a1a: Int32 = 50_003
+        let a2: Int32 = 50_004
+        let rootB: Int32 = 50_005
+        let b1: Int32 = 50_006
+        let definitions = [
+            ProcessDefinition(
+                process: a1a, parent: a1, session: rootA, group: a1,
+                readSource: second[0], writeSource: output[1],
+                marker: proofRoot.appendingPathComponent("a1a")
+            ),
+            ProcessDefinition(
+                process: a2, parent: rootA, session: rootA, group: a1,
+                readSource: -1, writeSource: -1,
+                marker: proofRoot.appendingPathComponent("a2")
+            ),
+            ProcessDefinition(
+                process: a1, parent: rootA, session: rootA, group: a1,
+                readSource: first[0], writeSource: second[1],
+                marker: proofRoot.appendingPathComponent("a1")
+            ),
+            ProcessDefinition(
+                process: rootB, parent: 1, session: rootB, group: rootB,
+                readSource: -1, writeSource: -1,
+                marker: proofRoot.appendingPathComponent("root-b")
+            ),
+            ProcessDefinition(
+                process: b1, parent: rootB, session: rootB, group: rootB,
+                readSource: -1, writeSource: -1,
+                marker: proofRoot.appendingPathComponent("b1")
+            ),
+            ProcessDefinition(
+                process: rootA, parent: 1, session: rootA, group: rootA,
+                readSource: input[0], writeSource: first[1],
+                marker: proofRoot.appendingPathComponent("root-a")
+            ),
+        ]
+
+        var strings: [UnsafeMutablePointer<CChar>] = []
+        var pointerArrays: [
+            UnsafeMutablePointer<UnsafePointer<CChar>?>
+        ] = []
+        var remapArrays: [
+            UnsafeMutablePointer<continuum_spawn_descriptor_remap>
+        ] = []
+        defer {
+            strings.forEach { free($0) }
+            pointerArrays.forEach { $0.deallocate() }
+            remapArrays.forEach { $0.deallocate() }
+        }
+        func string(_ value: String) -> UnsafePointer<CChar> {
+            let copy = strdup(value)!
+            strings.append(copy)
+            return UnsafePointer(copy)
+        }
+        func pointers(_ values: [String])
+            -> UnsafePointer<UnsafePointer<CChar>?> {
+            let result = UnsafeMutablePointer<UnsafePointer<CChar>?>
+                .allocate(capacity: values.count + 1)
+            pointerArrays.append(result)
+            for (index, value) in values.enumerated() {
+                result[index] = string(value)
+            }
+            result[values.count] = nil
+            return UnsafePointer(result)
+        }
+        func specifications(
+            invalidLeaf: Bool
+        ) -> [continuum_brokered_process_spec] {
+            definitions.map { definition in
+                let readTarget: Int32 = 300
+                let writeTarget: Int32 = 301
+                var remaps: [continuum_spawn_descriptor_remap] = []
+                if definition.readSource >= 0 {
+                    remaps.append(continuum_spawn_descriptor_remap(
+                        source_descriptor: definition.readSource,
+                        target_descriptor: readTarget
+                    ))
+                }
+                if definition.writeSource >= 0 {
+                    remaps.append(continuum_spawn_descriptor_remap(
+                        source_descriptor: definition.writeSource,
+                        target_descriptor: writeTarget
+                    ))
+                }
+                var spec = continuum_brokered_process_spec()
+                spec.structure_size = UInt32(
+                    MemoryLayout<continuum_brokered_process_spec>.size
+                )
+                spec.captured_process_id = definition.process
+                spec.captured_parent_process_id = definition.parent
+                spec.captured_process_group_id = definition.group
+                spec.foreground_process_group_id = definition.session
+                spec.executable_path = string(
+                    invalidLeaf && definition.process == a1a
+                    ? "/private/tmp/continuum-missing-forest-target"
+                    : targetURL.path
+                )
+                spec.arguments = pointers([
+                    "ContinuumExternalTarget",
+                    "--continuum-forest-proof",
+                    definition.readSource >= 0 ? "\(readTarget)" : "-1",
+                    definition.writeSource >= 0 ? "\(writeTarget)" : "-1",
+                    definition.marker.path,
+                    "64",
+                ])
+                spec.environment = pointers([
+                    "PATH=/usr/bin:/bin",
+                    "CONTINUUM_BOOTSTRAP_STOP=1",
+                ])
+                spec.working_directory = string("/private/tmp")
+                if !remaps.isEmpty {
+                    let storage = UnsafeMutablePointer<
+                        continuum_spawn_descriptor_remap
+                    >.allocate(capacity: remaps.count)
+                    remaps.withUnsafeBufferPointer {
+                        storage.initialize(from: $0.baseAddress!, count: $0.count)
+                    }
+                    remapArrays.append(storage)
+                    spec.descriptor_remaps = UnsafePointer(storage)
+                    spec.descriptor_remap_count = remaps.count
+                }
+                let root = definition.process == rootA
+                    || definition.process == rootB
+                spec.topology = continuum_spawn_process_topology(
+                    structure_size: UInt32(
+                        MemoryLayout<continuum_spawn_process_topology>.size
+                    ),
+                    create_session: root ? 1 : 0,
+                    process_group_policy:
+                        definition.group == definition.process
+                        ? CONTINUUM_SPAWN_PROCESS_GROUP_CREATE
+                        : CONTINUUM_SPAWN_PROCESS_GROUP_JOIN,
+                    process_group_id:
+                        definition.group == definition.process
+                        ? 0 : definition.group,
+                    controlling_terminal_descriptor: -1
+                )
+                spec.disable_aslr = 0
+                return spec
+            }
+        }
+
+        var failedForest: OpaquePointer?
+        let failing = specifications(invalidLeaf: true)
+        let failureStatus = failing.withUnsafeBufferPointer { processBuffer in
+            bootstrapURL.path.withCString { bootstrap in
+                continuum_brokered_forest_prepare(
+                    bootstrap,
+                    processBuffer.baseAddress,
+                    processBuffer.count,
+                    &failedForest
+                )
+            }
+        }
+        XCTAssertEqual(failureStatus, CONTINUUM_STATUS_SPAWN_FAILED)
+        XCTAssertNil(failedForest)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: proofRoot.path),
+            []
+        )
+
+        var abortedForest: OpaquePointer?
+        let abortSpecs = specifications(invalidLeaf: false)
+        XCTAssertEqual(
+            abortSpecs.withUnsafeBufferPointer { processBuffer in
+                bootstrapURL.path.withCString { bootstrap in
+                    continuum_brokered_forest_prepare(
+                        bootstrap,
+                        processBuffer.baseAddress,
+                        processBuffer.count,
+                        &abortedForest
+                    )
+                }
+            },
+            CONTINUUM_STATUS_OK
+        )
+        guard let abortedForest else {
+            return XCTFail("Expected an abortable forest")
+        }
+        var ownsAbortedForest = true
+        defer {
+            if ownsAbortedForest {
+                ownsAbortedForest = continuum_brokered_forest_abort(
+                    abortedForest,
+                    3_000
+                ) != CONTINUUM_STATUS_OK
+            }
+            XCTAssertFalse(ownsAbortedForest)
+        }
+        var abortedIdentities = Array(
+            repeating: continuum_brokered_process_identity(),
+            count: definitions.count
+        )
+        var abortedIdentityCount = 0
+        XCTAssertEqual(
+            abortedIdentities.withUnsafeMutableBufferPointer {
+                continuum_brokered_forest_process_identities(
+                    abortedForest,
+                    $0.baseAddress,
+                    $0.count,
+                    &abortedIdentityCount
+                )
+            },
+            CONTINUUM_STATUS_OK
+        )
+        let abortStatus = continuum_brokered_forest_abort(
+            abortedForest,
+            3_000
+        )
+        guard abortStatus == CONTINUUM_STATUS_OK else {
+            return XCTFail("Could not abort forest: \(abortStatus)")
+        }
+        ownsAbortedForest = false
+        XCTAssertEqual(abortedIdentityCount, definitions.count)
+        for identity in abortedIdentities {
+            errno = 0
+            XCTAssertEqual(kill(identity.replacement_process_id, 0), -1)
+            XCTAssertEqual(errno, ESRCH)
+        }
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: proofRoot.path),
+            []
+        )
+
+        var forest: OpaquePointer?
+        let specs = specifications(invalidLeaf: false)
+        let prepareStatus = specs.withUnsafeBufferPointer { processBuffer in
+            bootstrapURL.path.withCString { bootstrap in
+                continuum_brokered_forest_prepare(
+                    bootstrap,
+                    processBuffer.baseAddress,
+                    processBuffer.count,
+                    &forest
+                )
+            }
+        }
+        XCTAssertEqual(prepareStatus, CONTINUUM_STATUS_OK)
+        guard let forest else { return XCTFail("Expected prepared forest") }
+        var ownsForest = true
+        defer {
+            if ownsForest {
+                ownsForest = continuum_brokered_forest_abort(
+                    forest,
+                    3_000
+                ) != CONTINUUM_STATUS_OK
+            }
+            XCTAssertFalse(ownsForest)
+        }
+        var identities = Array(
+            repeating: continuum_brokered_process_identity(),
+            count: definitions.count
+        )
+        var identityCount = 0
+        XCTAssertEqual(
+            identities.withUnsafeMutableBufferPointer {
+                continuum_brokered_forest_process_identities(
+                    forest, $0.baseAddress, $0.count, &identityCount
+                )
+            },
+            CONTINUUM_STATUS_OK
+        )
+        XCTAssertEqual(identityCount, definitions.count)
+        let replacement = Dictionary(uniqueKeysWithValues:
+            identities.map {
+                ($0.captured_process_id, $0.replacement_process_id)
+            })
+        func parent(of process: Int32) -> Int32 {
+            var information = proc_bsdinfo()
+            let copied = withUnsafeMutablePointer(to: &information) {
+                proc_pidinfo(
+                    process,
+                    PROC_PIDTBSDINFO,
+                    0,
+                    $0,
+                    Int32(MemoryLayout<proc_bsdinfo>.size)
+                )
+            }
+            return copied == MemoryLayout<proc_bsdinfo>.size
+                ? Int32(information.pbi_ppid) : -1
+        }
+        XCTAssertEqual(
+            Set(replacement.values).count,
+            definitions.count
+        )
+        XCTAssertTrue(replacement.values.allSatisfy {
+            !definitions.map(\.process).contains($0)
+        })
+        for definition in definitions {
+            guard let process = replacement[definition.process] else {
+                return XCTFail("Missing replacement")
+            }
+            let expectedParent = replacement[definition.parent] ?? getpid()
+            XCTAssertEqual(parent(of: process), expectedParent)
+            XCTAssertEqual(getsid(process), replacement[definition.session])
+            XCTAssertEqual(getpgid(process), replacement[definition.group])
+        }
+        let advanceStatus = continuum_brokered_forest_advance_to_entry_stops(
+            forest,
+            15_000
+        )
+        guard advanceStatus == CONTINUUM_STATUS_OK else {
+            ownsForest = false
+            return XCTFail("Could not advance forest: \(advanceStatus)")
+        }
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: proofRoot.path),
+            []
+        )
+        XCTAssertEqual(
+            continuum_brokered_forest_begin_commit(forest),
+            CONTINUUM_STATUS_OK
+        )
+        var startingByte: UInt8 = 64
+        XCTAssertEqual(Darwin.write(input[1], &startingByte, 1), 1)
+        for identity in identities.reversed() {
+            XCTAssertEqual(kill(identity.replacement_process_id, SIGCONT), 0)
+            XCTAssertEqual(
+                continuum_brokered_forest_note_released_process(
+                    forest,
+                    identity.replacement_process_id
+                ),
+                CONTINUUM_STATUS_OK
+            )
+        }
+        XCTAssertEqual(
+            continuum_brokered_forest_finish(forest),
+            CONTINUUM_STATUS_OK
+        )
+        ownsForest = false
+        var finalByte: UInt8 = 0
+        XCTAssertEqual(Darwin.read(output[0], &finalByte, 1), 1)
+        XCTAssertEqual(finalByte, 67)
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let markers = try FileManager.default.contentsOfDirectory(
+                atPath: proofRoot.path
+            )
+            if markers.count == definitions.count { break }
+            usleep(10_000)
+        }
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: proofRoot.path).count,
+            definitions.count
+        )
+    }
+
     func testEveryRuntimeStatusHasAUsefulString() {
         let statuses: [continuum_status] = [
             CONTINUUM_STATUS_OK,

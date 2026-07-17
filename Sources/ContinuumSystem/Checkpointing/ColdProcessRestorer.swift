@@ -199,6 +199,11 @@ public actor ColdProcessRestorer {
         let members: [ColdProcessForestMember]
         let terminalPresentationSessionIdentifiers: [UUID]
         let brokeredPair: OpaquePointer?
+        let brokeredForest: OpaquePointer?
+    }
+
+    private struct PendingBrokeredForestCleanup: @unchecked Sendable {
+        let handle: OpaquePointer
     }
 
     private struct PreparedPresentationMaster {
@@ -229,9 +234,9 @@ public actor ColdProcessRestorer {
         let environment: [String]
     }
 
-    private struct BrokerSessionAuthorization: @unchecked Sendable {
-        let pair: OpaquePointer
-        let role: continuum_brokered_process_role
+    private enum BrokerSessionAuthorization: @unchecked Sendable {
+        case pair(OpaquePointer, continuum_brokered_process_role)
+        case forest(OpaquePointer, Int32)
     }
 
     private struct ColdFileTransactionJournal: Codable, Sendable {
@@ -256,6 +261,7 @@ public actor ColdProcessRestorer {
     private let terminalPresentationRegistry: TerminalPresentationSessionRegistry?
     private var preparedReplacements: [UUID: PreparedReplacement] = [:]
     private var preparedForests: [UUID: PreparedForest] = [:]
+    private var pendingBrokeredForestCleanups: [PendingBrokeredForestCleanup] = []
 
     public init(
         bootstrapLibraryURL: URL? = nil,
@@ -281,11 +287,19 @@ public actor ColdProcessRestorer {
     deinit {
         let brokeredPreparationIdentifiers = Set(
             preparedForests.values
-                .filter { $0.brokeredPair != nil }
+                .filter {
+                    $0.brokeredPair != nil || $0.brokeredForest != nil
+                }
                 .flatMap(\.preparationIdentifiers)
         )
         for pair in preparedForests.values.compactMap(\.brokeredPair) {
             _ = continuum_brokered_pair_abort(pair, 5_000)
+        }
+        for forest in preparedForests.values.compactMap(\.brokeredForest) {
+            _ = continuum_brokered_forest_abort(forest, 5_000)
+        }
+        for pending in pendingBrokeredForestCleanups {
+            _ = continuum_brokered_forest_abort(pending.handle, 5_000)
         }
         for (identifier, replacement) in preparedReplacements {
             if !brokeredPreparationIdentifiers.contains(identifier) {
@@ -300,6 +314,7 @@ public actor ColdProcessRestorer {
         from snapshotID: SnapshotID,
         repository: any SnapshotRepository
     ) async throws -> ColdProcessForestPreparation {
+        retryPendingBrokeredForestCleanups()
         let manifest = try await repository.artifact(
             for: snapshotID,
             logicalName: "durable-checkpoint-v3.json"
@@ -369,6 +384,7 @@ public actor ColdProcessRestorer {
         var preparationIdentifiers: [UUID] = []
         var members: [ColdProcessForestMember] = []
         var brokeredPair: OpaquePointer?
+        var brokeredForest: OpaquePointer?
         do {
             let orderedMembers = try Self.parentFirstMembers(image.members)
             if orderedMembers.count == 2 {
@@ -436,9 +452,16 @@ public actor ColdProcessRestorer {
                     )
                 ))
             } else {
-                throw ContinuumError.restoreUnavailable(
-                    "Cold restore currently preserves exact parentage for one root and one direct child. Deeper process forests are not certified yet."
+                let prepared = try await prepareBrokeredForest(
+                    orderedMembers: orderedMembers,
+                    image: image,
+                    snapshotID: snapshotID,
+                    repository: repository,
+                    descriptorGraph: descriptorGraph
                 )
+                preparationIdentifiers = prepared.preparationIdentifiers
+                members = prepared.members
+                brokeredForest = prepared.forest
             }
         } catch {
             for preparationIdentifier in preparationIdentifiers.reversed() {
@@ -458,8 +481,11 @@ public actor ColdProcessRestorer {
             if let brokeredPair {
                 _ = continuum_brokered_pair_abort(brokeredPair, 5_000)
             }
+            if let brokeredForest {
+                _ = continuum_brokered_forest_abort(brokeredForest, 5_000)
+            }
             for preparationIdentifier in preparationIdentifiers.reversed() {
-                if brokeredPair == nil {
+                if brokeredPair == nil && brokeredForest == nil {
                     try? discard(preparationIdentifier)
                 } else {
                     try? discardBrokerAbortedReplacement(preparationIdentifier)
@@ -481,7 +507,8 @@ public actor ColdProcessRestorer {
             terminalPresentationSessionIdentifiers: terminalPresentations.map(
                 \.sessionIdentifier
             ),
-            brokeredPair: brokeredPair
+            brokeredPair: brokeredPair,
+            brokeredForest: brokeredForest
         )
         return ColdProcessForestPreparation(
             id: forestID,
@@ -728,9 +755,9 @@ public actor ColdProcessRestorer {
                 prelaunchedProcessIdentifier: rootReplacement,
                 prelaunchedBootstrapDescriptor:
                     rootLaunchPreparation.descriptor,
-                brokerAuthorization: BrokerSessionAuthorization(
-                    pair: pair,
-                    role: CONTINUUM_BROKERED_PROCESS_ROOT
+                brokerAuthorization: .pair(
+                    pair,
+                    CONTINUUM_BROKERED_PROCESS_ROOT
                 )
             )
             preparationIdentifiers.append(rootPreparation.id)
@@ -749,9 +776,9 @@ public actor ColdProcessRestorer {
                 prelaunchedProcessIdentifier: childReplacement,
                 prelaunchedBootstrapDescriptor:
                     childLaunchPreparation.descriptor,
-                brokerAuthorization: BrokerSessionAuthorization(
-                    pair: pair,
-                    role: CONTINUUM_BROKERED_PROCESS_CHILD
+                brokerAuthorization: .pair(
+                    pair,
+                    CONTINUUM_BROKERED_PROCESS_CHILD
                 )
             )
             preparationIdentifiers.append(childPreparation.id)
@@ -779,6 +806,311 @@ public actor ColdProcessRestorer {
             )
         } catch {
             _ = continuum_brokered_pair_abort(pair, 5_000)
+            for identifier in preparationIdentifiers.reversed() {
+                try? discardBrokerAbortedReplacement(identifier)
+            }
+            throw error
+        }
+    }
+
+    private func prepareBrokeredForest(
+        orderedMembers: [DurableProcessImage],
+        image: DurableCheckpointImage,
+        snapshotID: SnapshotID,
+        repository: any SnapshotRepository,
+        descriptorGraph: PreparedDescriptorGraph
+    ) async throws -> (
+        preparationIdentifiers: [UUID],
+        members: [ColdProcessForestMember],
+        forest: OpaquePointer
+    ) {
+        guard let bootstrapLibraryPath else {
+            throw ContinuumError.restoreUnavailable(
+                "The process-forest launch broker is unavailable."
+            )
+        }
+        let capturedIdentifiers = Set(
+            orderedMembers.map(\.processIdentifier)
+        )
+        let roots = orderedMembers.filter {
+            !capturedIdentifiers.contains($0.parentProcessIdentifier)
+        }
+        guard !roots.isEmpty else {
+            throw ContinuumError.restoreUnavailable(
+                "The captured process forest has no root."
+            )
+        }
+        let rootBySession = Dictionary(
+            uniqueKeysWithValues: roots.compactMap { root -> (Int32, Int32)? in
+                guard let topology = root.topology,
+                      topology.sessionIdentifier == root.processIdentifier,
+                      topology.processGroupIdentifier == root.processIdentifier
+                else { return nil }
+                return (topology.sessionIdentifier, root.processIdentifier)
+            }
+        )
+        guard rootBySession.count == roots.count else {
+            throw ContinuumError.restoreUnavailable(
+                "Every restored forest root must lead its captured session and process group."
+            )
+        }
+
+        var launchPreparations: [Int32: BrokerLaunchPreparation] = [:]
+        for process in orderedMembers {
+            guard let launch = process.launchContract,
+                  let topology = process.topology,
+                  capturedIdentifiers.contains(topology.processGroupIdentifier),
+                  rootBySession[topology.sessionIdentifier] != nil else {
+                throw ContinuumError.restoreUnavailable(
+                    "A forest member is missing a mappable launch or kernel-topology contract."
+                )
+            }
+            launchPreparations[process.processIdentifier] =
+                try makeBrokerLaunchPreparation(
+                    launch: launch,
+                    remaps: descriptorGraph.remapsByCapturedProcess[
+                        process.processIdentifier
+                    ] ?? [],
+                    resourceHandles: Self.bootstrapResourceHandles(
+                        in: image,
+                        processIdentifier: process.processIdentifier
+                    )
+                )
+        }
+        var descriptorsOwned = Set(launchPreparations.keys)
+        defer {
+            for identifier in descriptorsOwned {
+                if let descriptor = launchPreparations[identifier]?.descriptor {
+                    Darwin.close(descriptor)
+                }
+            }
+        }
+
+        var allocatedStrings: [UnsafeMutablePointer<CChar>] = []
+        var allocatedArrays: [UnsafeMutablePointer<UnsafePointer<CChar>?>] = []
+        var allocatedRemaps: [
+            UnsafeMutablePointer<continuum_spawn_descriptor_remap>
+        ] = []
+        defer {
+            allocatedStrings.forEach { free($0) }
+            allocatedArrays.forEach { $0.deallocate() }
+            allocatedRemaps.forEach { $0.deallocate() }
+        }
+        func copiedString(_ value: String) throws -> UnsafePointer<CChar> {
+            guard let copy = strdup(value) else {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum ran out of memory while encoding a launch contract."
+                )
+            }
+            allocatedStrings.append(copy)
+            return UnsafePointer(copy)
+        }
+        func copiedArray(
+            _ values: [String]
+        ) throws -> UnsafePointer<UnsafePointer<CChar>?> {
+            let result = UnsafeMutablePointer<UnsafePointer<CChar>?>
+                .allocate(capacity: values.count + 1)
+            allocatedArrays.append(result)
+            for (index, value) in values.enumerated() {
+                result[index] = try copiedString(value)
+            }
+            result[values.count] = nil
+            return UnsafePointer(result)
+        }
+
+        var specs: [continuum_brokered_process_spec] = []
+        specs.reserveCapacity(orderedMembers.count)
+        for process in orderedMembers {
+            guard let launch = process.launchContract,
+                  let topology = process.topology,
+                  let preparation = launchPreparations[
+                    process.processIdentifier
+                  ] else {
+                throw ContinuumError.restoreUnavailable(
+                    "A forest launch contract disappeared during preparation."
+                )
+            }
+            let isRoot = !capturedIdentifiers.contains(
+                process.parentProcessIdentifier
+            )
+            let rootPTYSlaves = (image.ptyDescriptors ?? []).filter {
+                $0.processIdentifier == process.processIdentifier
+                    && $0.role == .slave
+            }
+            let controllingTerminalDescriptor = isRoot
+                ? rootPTYSlaves.map(\.fileDescriptor).sorted().first ?? -1
+                : -1
+            var spec = continuum_brokered_process_spec()
+            spec.structure_size = UInt32(
+                MemoryLayout<continuum_brokered_process_spec>.size
+            )
+            spec.captured_process_id = process.processIdentifier
+            spec.captured_parent_process_id = process.parentProcessIdentifier
+            spec.captured_process_group_id =
+                topology.processGroupIdentifier
+            spec.foreground_process_group_id =
+                topology.foregroundProcessGroupIdentifier
+            spec.executable_path = try copiedString(launch.executablePath)
+            spec.arguments = try copiedArray(launch.arguments)
+            spec.environment = try copiedArray(preparation.environment)
+            spec.working_directory = try copiedString(
+                launch.workingDirectory
+            )
+            if !preparation.remaps.isEmpty {
+                let remaps = UnsafeMutablePointer<
+                    continuum_spawn_descriptor_remap
+                >.allocate(capacity: preparation.remaps.count)
+                remaps.initialize(
+                    from: preparation.remaps,
+                    count: preparation.remaps.count
+                )
+                allocatedRemaps.append(remaps)
+                spec.descriptor_remaps = UnsafePointer(remaps)
+            }
+            spec.descriptor_remap_count = preparation.remaps.count
+            spec.topology = continuum_spawn_process_topology(
+                structure_size: UInt32(
+                    MemoryLayout<continuum_spawn_process_topology>.size
+                ),
+                create_session: isRoot ? 1 : 0,
+                process_group_policy:
+                    topology.processGroupIdentifier == process.processIdentifier
+                    ? CONTINUUM_SPAWN_PROCESS_GROUP_CREATE
+                    : CONTINUUM_SPAWN_PROCESS_GROUP_JOIN,
+                process_group_id:
+                    topology.processGroupIdentifier == process.processIdentifier
+                    ? 0 : topology.processGroupIdentifier,
+                controlling_terminal_descriptor:
+                    controllingTerminalDescriptor
+            )
+            spec.disable_aslr = launch.addressSpacePolicy
+                    == .continuumDeterministic ? 1 : 0
+            specs.append(spec)
+        }
+        var forest: OpaquePointer?
+        let prepareStatus = specs.withUnsafeBufferPointer { processSpecs in
+            bootstrapLibraryPath.withCString {
+                continuum_brokered_forest_prepare(
+                    $0,
+                    processSpecs.baseAddress,
+                    processSpecs.count,
+                    &forest
+                )
+            }
+        }
+        if prepareStatus != CONTINUUM_STATUS_OK, let failedForest = forest {
+            if continuum_brokered_forest_abort(failedForest, 5_000)
+                != CONTINUUM_STATUS_OK {
+                pendingBrokeredForestCleanups.append(
+                    PendingBrokeredForestCleanup(handle: failedForest)
+                )
+            }
+        }
+        try requireRuntimeOK(
+            prepareStatus,
+            operation: "prepare the exact process-forest launch broker"
+        )
+        guard let forest else {
+            throw ContinuumError.restoreUnavailable(
+                "The launch broker returned no prepared process forest."
+            )
+        }
+
+        var identities = Array(
+            repeating: continuum_brokered_process_identity(),
+            count: orderedMembers.count
+        )
+        var identityCount = 0
+        let identityStatus = identities.withUnsafeMutableBufferPointer {
+            continuum_brokered_forest_process_identities(
+                forest,
+                $0.baseAddress,
+                $0.count,
+                &identityCount
+            )
+        }
+        guard identityStatus == CONTINUUM_STATUS_OK,
+              identityCount == orderedMembers.count else {
+            _ = continuum_brokered_forest_abort(forest, 5_000)
+            try requireRuntimeOK(
+                identityStatus,
+                operation: "read the brokered forest identities"
+            )
+            throw ContinuumError.restoreUnavailable(
+                "The launch broker returned an incomplete forest mapping."
+            )
+        }
+        let replacements = Dictionary(
+            uniqueKeysWithValues: identities.prefix(identityCount).map {
+                ($0.captured_process_id, $0.replacement_process_id)
+            }
+        )
+        let replacementParents = Dictionary(
+            uniqueKeysWithValues: identities.prefix(identityCount).map {
+                ($0.captured_process_id, $0.replacement_parent_process_id)
+            }
+        )
+        let advanceStatus = continuum_brokered_forest_advance_to_entry_stops(
+            forest,
+            15_000
+        )
+        guard advanceStatus == CONTINUUM_STATUS_OK else {
+            // Advance consumes the failed forest after authenticated cleanup.
+            try requireRuntimeOK(
+                advanceStatus,
+                operation: "advance the process forest to entry stops"
+            )
+            throw ContinuumError.restoreUnavailable(
+                "The process forest did not reach its exact entry stops."
+            )
+        }
+
+        var preparationIdentifiers: [UUID] = []
+        var preparedMembers: [ColdProcessForestMember] = []
+        do {
+            for process in orderedMembers {
+                guard let replacement = replacements[process.processIdentifier],
+                      let replacementParent = replacementParents[
+                        process.processIdentifier
+                      ],
+                      let launchPreparation = launchPreparations[
+                        process.processIdentifier
+                      ] else {
+                    throw ContinuumError.integrityFailure(
+                        "The replacement forest lost a process mapping."
+                    )
+                }
+                let overlay = try memberOverlay(
+                    process,
+                    image: image,
+                    snapshotID: snapshotID,
+                    repository: repository
+                )
+                descriptorsOwned.remove(process.processIdentifier)
+                let preparation = try await prepareRootProcess(
+                    from: snapshotID,
+                    repository: overlay,
+                    descriptorRemaps: launchPreparation.remaps,
+                    prelaunchedProcessIdentifier: replacement,
+                    prelaunchedBootstrapDescriptor:
+                        launchPreparation.descriptor,
+                    brokerAuthorization: .forest(
+                        forest,
+                        process.processIdentifier
+                    )
+                )
+                preparationIdentifiers.append(preparation.id)
+                preparedMembers.append(ColdProcessForestMember(
+                    capturedProcessIdentifier: process.processIdentifier,
+                    capturedParentProcessIdentifier:
+                        process.parentProcessIdentifier,
+                    replacementProcessIdentifier: replacement,
+                    replacementParentProcessIdentifier: replacementParent
+                ))
+            }
+            return (preparationIdentifiers, preparedMembers, forest)
+        } catch {
+            _ = continuum_brokered_forest_abort(forest, 5_000)
             for identifier in preparationIdentifiers.reversed() {
                 try? discardBrokerAbortedReplacement(identifier)
             }
@@ -897,7 +1229,8 @@ public actor ColdProcessRestorer {
     }
 
     public func discardProcessForest(_ forestID: UUID) async throws {
-        guard let forest = preparedForests.removeValue(forKey: forestID) else {
+        retryPendingBrokeredForestCleanups()
+        guard let forest = preparedForests[forestID] else {
             return
         }
         var firstError: Error?
@@ -909,9 +1242,22 @@ public actor ColdProcessRestorer {
                 )
             }
         }
+        if let brokeredForest = forest.brokeredForest {
+            let status = continuum_brokered_forest_abort(
+                brokeredForest,
+                5_000
+            )
+            guard status == CONTINUUM_STATUS_OK else {
+                throw ContinuumError.restoreUnavailable(
+                    "Continuum could not abort the brokered replacement forest."
+                )
+            }
+        }
+        preparedForests.removeValue(forKey: forestID)
         for preparationIdentifier in forest.preparationIdentifiers.reversed() {
             do {
-                if forest.brokeredPair == nil {
+                if forest.brokeredPair == nil
+                    && forest.brokeredForest == nil {
                     try discard(preparationIdentifier)
                 } else {
                     try discardBrokerAbortedReplacement(preparationIdentifier)
@@ -930,6 +1276,13 @@ public actor ColdProcessRestorer {
         if let firstError { throw firstError }
     }
 
+    private func retryPendingBrokeredForestCleanups() {
+        pendingBrokeredForestCleanups.removeAll { pending in
+            continuum_brokered_forest_abort(pending.handle, 5_000)
+                == CONTINUUM_STATUS_OK
+        }
+    }
+
     public func commitProcessForest(
         _ forestID: UUID
     ) async throws -> ColdProcessForestCommit {
@@ -940,6 +1293,12 @@ public actor ColdProcessRestorer {
         }
         var committedProcessIdentifiers: [Int32] = []
         do {
+            if let brokeredForest = forest.brokeredForest {
+                try requireRuntimeOK(
+                    continuum_brokered_forest_begin_commit(brokeredForest),
+                    operation: "hold the reconstructed forest transaction"
+                )
+            }
             for preparationIdentifier in forest.preparationIdentifiers.reversed() {
                 let committed = try commit(preparationIdentifier)
                 committedProcessIdentifiers.append(committed.processIdentifier)
@@ -952,6 +1311,15 @@ public actor ColdProcessRestorer {
                         operation: "record the brokered replacement release"
                     )
                 }
+                if let brokeredForest = forest.brokeredForest {
+                    try requireRuntimeOK(
+                        continuum_brokered_forest_note_released_process(
+                            brokeredForest,
+                            committed.processIdentifier
+                        ),
+                        operation: "record the brokered forest replacement release"
+                    )
+                }
             }
             for sessionIdentifier in forest.terminalPresentationSessionIdentifiers {
                 try await terminalPresentationRegistry?.promote(sessionIdentifier)
@@ -962,16 +1330,28 @@ public actor ColdProcessRestorer {
                     operation: "finish the brokered replacement forest"
                 )
             }
+            if let brokeredForest = forest.brokeredForest {
+                try requireRuntimeOK(
+                    continuum_brokered_forest_finish(brokeredForest),
+                    operation: "finish the brokered replacement forest"
+                )
+            }
         } catch {
             if let pair = forest.brokeredPair {
                 _ = continuum_brokered_pair_abort(pair, 5_000)
+            } else if let brokeredForest = forest.brokeredForest {
+                _ = continuum_brokered_forest_abort(
+                    brokeredForest,
+                    5_000
+                )
             } else {
                 for processIdentifier in committedProcessIdentifiers {
                     _ = Self.killAndReap(processIdentifier)
                 }
             }
             for preparationIdentifier in forest.preparationIdentifiers.reversed() {
-                if forest.brokeredPair == nil {
+                if forest.brokeredPair == nil
+                    && forest.brokeredForest == nil {
                     try? discard(preparationIdentifier)
                 } else {
                     try? discardBrokerAbortedReplacement(preparationIdentifier)
@@ -1308,12 +1688,25 @@ public actor ColdProcessRestorer {
             )
         }
         if let brokerAuthorization {
+            let authorizationStatus: continuum_status
+            switch brokerAuthorization {
+            case let .pair(pair, role):
+                authorizationStatus =
+                    continuum_brokered_pair_authorize_remote_session(
+                        pair,
+                        session,
+                        role
+                    )
+            case let .forest(forest, capturedProcessIdentifier):
+                authorizationStatus =
+                    continuum_brokered_forest_authorize_remote_session(
+                        forest,
+                        session,
+                        capturedProcessIdentifier
+                    )
+            }
             try requireRuntimeOK(
-                continuum_brokered_pair_authorize_remote_session(
-                    brokerAuthorization.pair,
-                    session,
-                    brokerAuthorization.role
-                ),
+                authorizationStatus,
                 operation: "authorize the brokered replacement stop"
             )
         }

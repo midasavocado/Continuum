@@ -116,6 +116,7 @@ typedef struct continuum_spawn_process_topology {
 typedef struct continuum_brokered_process_spec {
     uint32_t structure_size;
     int32_t captured_process_id;
+    int32_t captured_parent_process_id;
     int32_t captured_process_group_id;
     int32_t foreground_process_group_id;
     const char *executable_path;
@@ -129,6 +130,73 @@ typedef struct continuum_brokered_process_spec {
 } continuum_brokered_process_spec;
 
 typedef struct continuum_brokered_pair continuum_brokered_pair;
+typedef struct continuum_brokered_forest continuum_brokered_forest;
+
+typedef struct continuum_brokered_process_identity {
+    int32_t captured_process_id;
+    int32_t replacement_process_id;
+    int32_t replacement_parent_process_id;
+    int32_t replacement_session_id;
+    int32_t replacement_process_group_id;
+} continuum_brokered_process_identity;
+
+/// Prepares a bounded process forest behind authenticated constructor gates.
+/// Roots are inferred when their captured parent is absent from `processes`.
+/// Every non-root is launched by its actual replacement parent, preserving
+/// exact internal PPIDs without allowing target code to execute. Ordinary
+/// failures return no forest. If rollback itself fails, the function returns
+/// `CONTINUUM_STATUS_ROLLBACK_FAILED` and transfers the retained cleanup
+/// capability through `out_forest`; the caller must retry `abort`.
+continuum_status continuum_brokered_forest_prepare(
+    const char *bootstrap_library_path,
+    const continuum_brokered_process_spec *processes,
+    size_t process_count,
+    continuum_brokered_forest **out_forest
+);
+
+continuum_status continuum_brokered_forest_process_identities(
+    const continuum_brokered_forest *forest,
+    continuum_brokered_process_identity *identities,
+    size_t identity_capacity,
+    size_t *out_identity_count
+);
+
+/// Advances descendants first, detaches every ptrace handoff descendants
+/// first, then validates the complete stopped PPID/SID/PGID map. A failure
+/// performs authenticated cleanup and consumes the forest capability.
+continuum_status continuum_brokered_forest_advance_to_entry_stops(
+    continuum_brokered_forest *forest,
+    uint32_t timeout_milliseconds
+);
+
+continuum_status continuum_brokered_forest_authorize_remote_session(
+    continuum_brokered_forest *forest,
+    continuum_remote_session *session,
+    int32_t captured_process_id
+);
+
+continuum_status continuum_brokered_forest_note_released_process(
+    continuum_brokered_forest *forest,
+    int32_t replacement_process_id
+);
+
+/// Adds one authenticated task-suspend hold to every stopped member. This
+/// lets per-session ptrace detach complete without any target instruction
+/// running. `finish` removes every hold only after all members are recorded.
+continuum_status continuum_brokered_forest_begin_commit(
+    continuum_brokered_forest *forest
+);
+
+continuum_status continuum_brokered_forest_finish(
+    continuum_brokered_forest *forest
+);
+
+/// Aborts descendants before their parents. Success consumes the forest.
+/// Failure retains it so the caller can retry authenticated cleanup.
+continuum_status continuum_brokered_forest_abort(
+    continuum_brokered_forest *forest,
+    uint32_t timeout_milliseconds
+);
 
 typedef enum continuum_brokered_process_role {
     CONTINUUM_BROKERED_PROCESS_ROOT = 1,

@@ -53,7 +53,7 @@ extern char **environ;
 
 enum {
     CONTINUUM_BROKER_MAGIC = 0x4342524b,
-    CONTINUUM_BROKER_VERSION = 1,
+    CONTINUUM_BROKER_VERSION = 2,
     CONTINUUM_BROKER_SETUP = 1,
     CONTINUUM_BROKER_SPAWN_CHILD = 2,
     CONTINUUM_BROKER_RELEASE = 3,
@@ -70,6 +70,12 @@ enum {
     CONTINUUM_BROKER_CHILD_ENTRY_REACHED = 14,
     CONTINUUM_BROKER_CHILD_DETACH = 15,
     CONTINUUM_BROKER_CHILD_DETACHED = 16,
+    CONTINUUM_BROKER_FOREST_RELEASE = 17,
+    CONTINUUM_BROKER_FOREST_RELEASED = 18,
+    CONTINUUM_BROKER_FOREST_SET_FOREGROUND = 19,
+    CONTINUUM_BROKER_FOREST_FOREGROUND_SET = 20,
+    CONTINUUM_BROKER_FOREST_SET_PROCESS_GROUP = 21,
+    CONTINUUM_BROKER_FOREST_PROCESS_GROUP_SET = 22,
     CONTINUUM_BROKER_MAX_REMAPS = 64,
     CONTINUUM_BROKER_MAX_ARGUMENTS = 64,
     CONTINUUM_BROKER_MAX_ENVIRONMENT = 256,
@@ -135,6 +141,7 @@ typedef struct continuum_broker_setup {
     int32_t foreground_process_group_id;
     int32_t controlling_terminal_descriptor;
     uint32_t remap_count;
+    uint32_t forest_mode;
 } continuum_broker_setup;
 
 typedef struct continuum_broker_child {
@@ -419,6 +426,285 @@ static void continuum_broker_free_environment(char **environment) {
     free(environment);
 }
 
+static int continuum_bootstrap_run_forest_node(
+    int channel,
+    const continuum_broker_setup *setup,
+    continuum_broker_reply *reply
+) {
+    pid_t children[64];
+    size_t child_count = 0;
+    memset(children, 0, sizeof(children));
+    for (;;) {
+        continuum_broker_header header;
+        if (!continuum_broker_read_all(channel, &header, sizeof(header))
+            || header.magic != CONTINUUM_BROKER_MAGIC
+            || header.version != CONTINUUM_BROKER_VERSION) return -1;
+        if (header.type == CONTINUUM_BROKER_ABORT
+            && header.payload_length == 0) {
+            for (size_t index = child_count; index > 0; index -= 1) {
+                if (kill(children[index - 1], SIGKILL) != 0
+                    && errno != ESRCH) _exit(EXIT_FAILURE);
+                while (waitpid(children[index - 1], NULL, 0) < 0
+                    && errno == EINTR) {}
+            }
+            _exit(EXIT_FAILURE);
+        }
+        if (header.type == CONTINUUM_BROKER_FOREST_RELEASE
+            && header.payload_length == 0) {
+            reply->process_id = getpid();
+            reply->parent_process_id = getppid();
+            if (!continuum_broker_send_reply(
+                    channel, CONTINUUM_BROKER_FOREST_RELEASED, reply)) {
+                return -1;
+            }
+            close(channel);
+            return 0;
+        }
+        if (header.type == CONTINUUM_BROKER_FOREST_SET_FOREGROUND
+            && header.payload_length == sizeof(int32_t)) {
+            int32_t foreground = 0;
+            int error = 0;
+            if (!continuum_broker_read_all(
+                    channel, &foreground, sizeof(foreground))) return -1;
+            if (setup->controlling_terminal_descriptor < 0
+                || foreground <= 0
+                || tcsetpgrp(
+                    setup->controlling_terminal_descriptor,
+                    foreground) != 0) {
+                error = errno == 0 ? EINVAL : errno;
+            }
+            continuum_broker_reply foreground_reply = *reply;
+            foreground_reply.error_code = error;
+            if (!continuum_broker_send_reply(
+                    channel,
+                    error == 0
+                        ? CONTINUUM_BROKER_FOREST_FOREGROUND_SET
+                        : CONTINUUM_BROKER_FAILED,
+                    &foreground_reply)) return -1;
+            continue;
+        }
+        if (header.type == CONTINUUM_BROKER_FOREST_SET_PROCESS_GROUP
+            && header.payload_length == sizeof(int32_t)) {
+            int32_t process_group = 0;
+            int error = 0;
+            if (!continuum_broker_read_all(
+                    channel, &process_group, sizeof(process_group))) {
+                return -1;
+            }
+            if (process_group <= 0 || setpgid(0, process_group) != 0) {
+                error = errno == 0 ? EINVAL : errno;
+            }
+            continuum_broker_reply group_reply = *reply;
+            group_reply.process_group_id = getpgrp();
+            group_reply.error_code = error;
+            if (!continuum_broker_send_reply(
+                    channel,
+                    error == 0
+                        ? CONTINUUM_BROKER_FOREST_PROCESS_GROUP_SET
+                        : CONTINUUM_BROKER_FAILED,
+                    &group_reply)) return -1;
+            *reply = group_reply;
+            continue;
+        }
+        if (header.type != CONTINUUM_BROKER_SPAWN_CHILD
+            || child_count >= 64
+            || header.payload_length < sizeof(continuum_broker_child)
+            || header.payload_length > sizeof(continuum_broker_child)
+                + CONTINUUM_BROKER_MAX_STRING_BYTES
+                + sizeof(int32_t) * CONTINUUM_BROKER_MAX_REMAPS) {
+            return -1;
+        }
+        uint8_t *payload = malloc(header.payload_length);
+        if (payload == NULL
+            || !continuum_broker_read_all(
+                channel, payload, header.payload_length)) {
+            free(payload);
+            return -1;
+        }
+        continuum_broker_child child;
+        memcpy(&child, payload, sizeof(child));
+        if (child.argument_count == 0
+            || child.argument_count > CONTINUUM_BROKER_MAX_ARGUMENTS
+            || child.environment_count > CONTINUUM_BROKER_MAX_ENVIRONMENT
+            || child.remap_count > CONTINUUM_BROKER_MAX_REMAPS
+            || child.string_bytes > CONTINUUM_BROKER_MAX_STRING_BYTES
+            || child.executable_length == 0 || child.directory_length == 0
+            || child.bootstrap_length == 0 || child.process_group_policy > 2
+            || child.captured_process_id <= 0
+            || child.captured_process_group_id <= 0) {
+            free(payload);
+            return -1;
+        }
+        const uint8_t *cursor = payload + sizeof(child);
+        const uint8_t *limit = payload + header.payload_length;
+        char **argv = continuum_broker_decode_strings(
+            &cursor, limit, child.argument_count);
+        char **env = continuum_broker_decode_strings(
+            &cursor, limit, child.environment_count);
+        if (argv == NULL || env == NULL || (size_t)(limit - cursor)
+            < child.executable_length + child.directory_length
+                + child.bootstrap_length
+                + sizeof(int32_t) * child.remap_count) {
+            free(argv); free(env); free(payload);
+            return -1;
+        }
+        char *executable = (char *)cursor;
+        cursor += child.executable_length;
+        char *directory = (char *)cursor;
+        cursor += child.directory_length;
+        char *bootstrap = (char *)cursor;
+        cursor += child.bootstrap_length;
+        int32_t *child_targets = (int32_t *)cursor;
+        if (executable[child.executable_length - 1] != '\0'
+            || directory[child.directory_length - 1] != '\0'
+            || bootstrap[child.bootstrap_length - 1] != '\0') {
+            free(argv); free(env); free(payload);
+            return -1;
+        }
+        int forwarded[CONTINUUM_BROKER_MAX_REMAPS];
+        if (!continuum_broker_receive_fds(
+                channel, forwarded, child.remap_count)) {
+            free(argv); free(env); free(payload);
+            return -1;
+        }
+        int child_pair[2] = {-1, -1};
+        pid_t child_pid = 0;
+        int spawn_error = socketpair(AF_UNIX, SOCK_STREAM, 0, child_pair);
+        if (spawn_error != 0) spawn_error = errno;
+        if (spawn_error == 0) {
+            int highest = child_pair[0];
+            for (size_t index = 0; index < child.remap_count; index += 1) {
+                if (child_targets[index] > highest) {
+                    highest = child_targets[index];
+                }
+            }
+            int safe = fcntl(
+                child_pair[1], F_DUPFD_CLOEXEC, highest + 1);
+            if (safe < 0) {
+                spawn_error = errno;
+            } else {
+                close(child_pair[1]);
+                child_pair[1] = safe;
+            }
+        }
+        char **child_environment = spawn_error == 0
+            ? continuum_broker_child_environment(
+                env, bootstrap, child_pair[1]) : NULL;
+        posix_spawn_file_actions_t actions;
+        posix_spawnattr_t attributes;
+        int actions_initialized = 0;
+        int attributes_initialized = 0;
+        if (spawn_error == 0 && child_environment == NULL) {
+            spawn_error = ENOMEM;
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawn_file_actions_init(&actions);
+            actions_initialized = spawn_error == 0;
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawn_file_actions_addchdir_np(
+                &actions, directory);
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawn_file_actions_addinherit_np(
+                &actions, child_pair[1]);
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawnattr_init(&attributes);
+            attributes_initialized = spawn_error == 0;
+        }
+        if (spawn_error == 0) {
+            short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+            if (child.disable_aslr) flags |= 0x0100;
+            spawn_error = posix_spawnattr_setflags(&attributes, flags);
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawn(
+                &child_pid, executable, &actions, &attributes,
+                argv, child_environment);
+        }
+        if (child_environment != NULL) {
+            continuum_broker_free_environment(child_environment);
+        }
+        if (attributes_initialized) posix_spawnattr_destroy(&attributes);
+        if (actions_initialized) posix_spawn_file_actions_destroy(&actions);
+        if (child_pair[1] >= 0) close(child_pair[1]);
+        continuum_broker_setup child_setup = {
+            .create_session = 0,
+            .process_group_policy = child.process_group_policy,
+            .process_group_id = child.process_group_id,
+            .captured_process_id = child.captured_process_id,
+            .captured_process_group_id = child.captured_process_group_id,
+            .foreground_process_group_id = setup->foreground_process_group_id,
+            .controlling_terminal_descriptor = -1,
+            .remap_count = child.remap_count,
+            .forest_mode = 1,
+        };
+        continuum_broker_header setup_header = {
+            .magic = CONTINUUM_BROKER_MAGIC,
+            .version = CONTINUUM_BROKER_VERSION,
+            .type = CONTINUUM_BROKER_SETUP,
+            .payload_length = sizeof(child_setup)
+                + sizeof(int32_t) * child.remap_count,
+        };
+        if (spawn_error == 0
+            && (!continuum_broker_write_all(
+                    child_pair[0], &setup_header, sizeof(setup_header))
+                || !continuum_broker_write_all(
+                    child_pair[0], &child_setup, sizeof(child_setup))
+                || !continuum_broker_write_all(
+                    child_pair[0], child_targets,
+                    sizeof(int32_t) * child.remap_count)
+                || !continuum_broker_send_fds(
+                    child_pair[0], forwarded, child.remap_count))) {
+            spawn_error = EIO;
+        }
+        for (size_t index = 0; index < child.remap_count; index += 1) {
+            close(forwarded[index]);
+        }
+        free(argv); free(env); free(payload);
+        continuum_broker_header child_reply_header;
+        continuum_broker_reply child_reply;
+        if (spawn_error == 0
+            && (!continuum_broker_read_all(
+                    child_pair[0], &child_reply_header,
+                    sizeof(child_reply_header))
+                || child_reply_header.magic != CONTINUUM_BROKER_MAGIC
+                || child_reply_header.version != CONTINUUM_BROKER_VERSION
+                || child_reply_header.type != CONTINUUM_BROKER_READY
+                || child_reply_header.payload_length != sizeof(child_reply)
+                || !continuum_broker_read_all(
+                    child_pair[0], &child_reply, sizeof(child_reply))
+                || child_reply.error_code != 0
+                || child_reply.process_id != child_pid
+                || child_reply.parent_process_id != getpid())) {
+            spawn_error = EIO;
+        }
+        if (spawn_error != 0) {
+            if (child_pid > 0) {
+                kill(child_pid, SIGKILL);
+                waitpid(child_pid, NULL, 0);
+            }
+            if (child_pair[0] >= 0) close(child_pair[0]);
+            continuum_broker_reply failed = *reply;
+            failed.error_code = spawn_error;
+            (void)continuum_broker_send_reply(
+                channel, CONTINUUM_BROKER_FAILED, &failed);
+            return -1;
+        }
+        children[child_count++] = child_pid;
+        if (!continuum_broker_send_reply(
+                channel, CONTINUUM_BROKER_CHILD_READY, &child_reply)
+            || !continuum_broker_send_fds(channel, child_pair, 1)) {
+            kill(child_pid, SIGKILL);
+            waitpid(child_pid, NULL, 0);
+            close(child_pair[0]);
+            return -1;
+        }
+        close(child_pair[0]);
+    }
+}
+
 static int continuum_bootstrap_run_broker(int channel, int is_child) {
     uid_t peer_uid = (uid_t)-1;
     gid_t peer_gid = (gid_t)-1;
@@ -441,6 +727,7 @@ static int continuum_bootstrap_run_broker(int channel, int is_child) {
         return -1;
     }
     if (setup.create_session > 1 || setup.process_group_policy > 2
+        || setup.forest_mode > 1
         || setup.controlling_terminal_descriptor < -1
         || setup.remap_count > CONTINUUM_BROKER_MAX_REMAPS
         || setup.captured_process_id <= 0
@@ -462,6 +749,9 @@ static int continuum_bootstrap_run_broker(int channel, int is_child) {
     if (error != 0 || !continuum_broker_send_reply(channel,
             error == 0 ? CONTINUUM_BROKER_READY : CONTINUUM_BROKER_FAILED, &reply)) {
         return -1;
+    }
+    if (setup.forest_mode) {
+        return continuum_bootstrap_run_forest_node(channel, &setup, &reply);
     }
     if (is_child) {
         if (!continuum_broker_read_all(channel, &header, sizeof(header))
