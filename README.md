@@ -6,6 +6,30 @@ Continuum is a native macOS research prototype for safe, branching app snapshots
 
 Continuum requires macOS 15 or later. The cooperative signed proof works through explicit development entitlements and verifies that it never changes SIP state. Testing unmodified third-party processes on this development Mac currently relies on the user's SIP-disabled configuration; that is not a consumer distribution plan or proof of universal compatibility.
 
+## OpenAI Build Week 2026 submission
+
+Continuum was built interactively with **Codex powered by GPT-5.6**. I set the product contract—real process exit, RAM-only restoration, no virtual machine, no file rollback, general mechanisms instead of app-specific tricks, and no fake success states. Codex and GPT-5.6 implemented and debugged the SwiftUI app, Swift orchestration, C and Objective-C runtime, Mach task handling, signing workflow, storage, and proof harnesses.
+
+The collaboration was test-driven rather than prompt-and-polish. We repeatedly captured real processes, killed them, launched replacements, and used the first failed invariant to choose the next narrow change. Broader approaches were reverted when they could not survive a genuine PID replacement.
+
+This branch is the frozen, reproducible hackathon demonstration revision. It proves the controlled AppKit cold-restore scope described above; it does **not** claim arbitrary third-party apps, sockets, Mach/XPC queues, GPU state, or reboot persistence.
+
+### Fast judge path
+
+Build and launch the native app:
+
+```bash
+./script/build_and_run.sh --verify
+```
+
+Run the decisive signed GUI proof:
+
+```bash
+./script/run_gui_cold_proof.sh
+```
+
+The proof prints the exited original PID, the different replacement PID, every restored value, the fresh functional WindowServer result, and the unchanged-file invariant. It requires an Apple Development signing identity. See [the latest reproduced output](docs/DEMO_EVIDENCE.md).
+
 ## What v0.3 implements
 
 - A native SwiftUI consumer shell with resumable onboarding, plain-language limits, real opt-in Accessibility and Screen Recording request actions, storage selection, and a self-contained rewind demo.
